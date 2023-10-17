@@ -4,29 +4,23 @@ use std::os::macos::fs::MetadataExt;
 use std::os::unix::prelude::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::{bail, Result};
 use log::{debug, error, info, trace, warn};
 use mmap_fixed_fixed::{MapOption, MemoryMap};
 
-pub struct SharedCache {
-    pub reservation: MemoryMap,
-    pub slide: usize,
-    pub mappings: Vec<MemoryMap>,
-}
+use crate::dyld_cache_format::*;
 
 // Clone + Send are required as transitive requirements from Loader.
 // It should be safe to move this cache object between threads,
 // and the struct itself should not be modified after initialization.
 // However, modifications to the mapped cache memory (e.g. writing to globals in an image) would be reflected in all "copies".
-impl Clone for SharedCache {
-    fn clone(&self) -> Self {
-        Self {
-            reservation: self.reservation,
-            slide: self.slide,
-            mappings: self.mappings,
-        }
-    }
+#[derive(Clone)]
+pub struct SharedCache {
+    pub reservation: Rc<MemoryMap>,
+    pub slide: usize,
+    pub mappings: Vec<Rc<MemoryMap>>,
 }
 
 unsafe impl Send for SharedCache {}
@@ -51,14 +45,14 @@ impl SharedCache {
         )?;
         let slide = (reservation.data() as u64 - cache_header.sharedRegionStart) as usize;
 
-        let cache = Self {
-            reservation,
+        let mut cache = Self {
+            reservation: Rc::new(reservation),
             slide,
             mappings: vec![],
         };
         cache.map_single_cache(cache_path, 0)?;
 
-        let dyndata = MemoryMap::new(
+        let dyndata_mapping = MemoryMap::new(
             std::mem::size_of::<dyld_cache_dynamic_data_header>(),
             &[
                 MapOption::MapReadable,
@@ -70,15 +64,16 @@ impl SharedCache {
                 }),
             ],
         )?;
-        cache.mappings.push(dyndata);
 
-        let dyndata: *mut dyld_cache_dynamic_data_header = dyndata.data() as _;
+        let dyndata: *mut dyld_cache_dynamic_data_header = dyndata_mapping.data() as _;
         let stat = std::fs::metadata(cache_path)?;
         unsafe {
             (*dyndata).magic = std::mem::transmute(*DYLD_SHARED_CACHE_DYNAMIC_DATA_MAGIC);
             (*dyndata).fsId = stat.st_dev();
             (*dyndata).fsObjId = stat.st_ino();
         }
+
+        cache.mappings.push(Rc::new(dyndata_mapping));
 
         Ok(cache)
     }
@@ -123,7 +118,6 @@ impl SharedCache {
                     MapOption::MapOffset(mapping_info.fileOffset as _),
                 ],
             )?;
-            self.mappings.push(mapping);
 
             if mapping_info.slideInfoFileSize > 0 {
                 let slide_version: u32 = {
@@ -133,10 +127,16 @@ impl SharedCache {
                 };
                 match slide_version {
                     3 => {
-                        let slide_info: dyld_cache_slide_info3 = {
+                        let slide_info: &dyld_cache_slide_info3 = {
                             let mut buf = [0; std::mem::size_of::<dyld_cache_slide_info3>()];
                             cache.read_exact_at(&mut buf, mapping_info.slideInfoFileOffset)?;
-                            unsafe { *(&buf as *const _ as *const dyld_cache_slide_info3) }
+                            unsafe {
+                                // dyld_cache_slide_info3 has a variable length array at the end,
+                                // so doesn't derive copy. Have to transmute to a ref directly.
+                                std::mem::transmute(
+                                    &buf as *const _ as *const dyld_cache_slide_info3,
+                                )
+                            }
                         };
                         for (i, &delta) in unsafe {
                             slide_info
@@ -146,6 +146,7 @@ impl SharedCache {
                         .iter()
                         .enumerate()
                         {
+                            let mut delta = delta;
                             if delta == DYLD_CACHE_SLIDE_V3_PAGE_ATTR_NO_REBASE as _ {
                                 continue;
                             }
@@ -154,22 +155,24 @@ impl SharedCache {
                                 unsafe { mapping.data().add(i * slide_info.page_size as usize) };
                             let mut loc: *mut dyld_cache_slide_pointer3 = page_start as _;
                             loop {
-                                loc = unsafe { loc.add(delta as _) };
-                                let mut locref: &dyld_cache_slide_pointer3 = unsafe { &mut *loc };
-                                delta = locref.plain.offsetToNextPointer() as _;
-                                if locref.auth.authenticated() != 0 {
-                                    locref.raw = locref.auth.offsetFromSharedCacheBase()
-                                        + self.slide as u64
-                                        + slide_info.auth_value_add;
-                                } else {
-                                    let value51: u64 = locref.plain.pointerValue();
-                                    let top8 = value51 & 0x0007F80000000000;
-                                    let bottom43 = value51 & 0x000007FFFFFFFFFF;
-                                    let target_value = (top8 << 13) | bottom43;
-                                    locref.raw = target_value + self.slide as u64;
-                                }
-                                if delta == 0 {
-                                    break;
+                                unsafe {
+                                    loc = loc.add(delta as _);
+                                    let locref: &mut dyld_cache_slide_pointer3 = &mut *loc;
+                                    delta = locref.plain.offsetToNextPointer() as _;
+                                    if locref.auth.authenticated() != 0 {
+                                        locref.raw = locref.auth.offsetFromSharedCacheBase()
+                                            + self.slide as u64
+                                            + slide_info.auth_value_add;
+                                    } else {
+                                        let value51: u64 = locref.plain.pointerValue();
+                                        let top8 = value51 & 0x0007F80000000000;
+                                        let bottom43 = value51 & 0x000007FFFFFFFFFF;
+                                        let target_value = (top8 << 13) | bottom43;
+                                        locref.raw = target_value + self.slide as u64;
+                                    }
+                                    if delta == 0 {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -181,9 +184,11 @@ impl SharedCache {
             } else {
                 info!("no slide info for mapping {:x}?", mapping_info.address);
             }
+
+            self.mappings.push(Rc::new(mapping));
         }
 
-        let subcaches: &[dyld_subcache_entry] = unsafe {
+        let subcaches: &[dyld_subcache_entry] = {
             let mut buf = vec![
                 0;
                 std::mem::size_of::<dyld_subcache_entry>()
@@ -207,5 +212,3 @@ impl SharedCache {
         Ok(())
     }
 }
-
-include!(concat!(env!("OUT_DIR"), "/dyld.rs"));

@@ -18,6 +18,6 @@ fn main() {
         .header("src/third_party/dyld_cache_format.h")
         .generate()
         .expect("Unable to generate dyld bindings")
-        .write_to_file(out_dir.join("dyld.rs"))
+        .write_to_file(out_dir.join("dyld_cache_format.rs"))
         .expect("Couldn't write dyld bindings");
 }

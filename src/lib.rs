@@ -1,9 +1,7 @@
-use log::{debug, error, info, trace, warn};
-use mmap_fixed_fixed::{MapOption, MemoryMap};
 use std::fs::File;
 use std::io::Cursor;
 use std::io::Read;
-use std::os::unix::prelude::FileExt;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -18,9 +16,14 @@ use hyperpom::memory::*;
 use hyperpom::tracer::*;
 use hyperpom::utils::*;
 use hyperpom::*;
-use mach_object::{LoadCommand, MachCommand, MachHeader, OFile, CPU_TYPE_ARM64, MH_EXECUTE};
+
+use anyhow::bail;
+use log::{debug, error, info, trace, warn};
+use mach_object::{LoadCommand, MachCommand, MachHeader, OFile};
+use mmap_fixed_fixed::{MapOption, MemoryMap};
 
 mod dyld;
+mod dyld_cache_format;
 
 // TODO: these could equally be in localdata and avoid the RwLock.
 #[derive(Clone, Default)]
@@ -61,6 +64,8 @@ pub struct AppBoxLoader {
     environment: Vec<String>,
 
     shared_cache: dyld::SharedCache,
+    // Address of the loaded mach-o header.
+    mh: u64,
 
     // Entry point of the executable.
     entry_point: u64,
@@ -68,22 +73,20 @@ pub struct AppBoxLoader {
     stack_pointer: u64,
     // Address of thread local storage.
     tls: u64,
-    // Base address of the shared cache.
-    shared_cache_base: u64,
 }
 
 impl AppBoxLoader {
-    pub fn new(executable: &Path, argv: &Vec<String>, envp: &Vec<String>) -> Result<Self> {
+    pub fn new(executable: &Path, argv: &Vec<String>, envp: &Vec<String>) -> anyhow::Result<Self> {
         // TODO: parse macho, check for arm64 and error accordingly
         Ok(Self {
             executable: executable.to_path_buf(),
             arguments: argv.clone(),
             environment: envp.clone(),
             shared_cache: dyld::SharedCache::new_system_cache()?,
+            mh: 0,
             entry_point: 0,
             stack_pointer: 0,
             tls: 0,
-            shared_cache_base: 0,
         })
     }
 
@@ -97,8 +100,12 @@ impl AppBoxLoader {
             .map_1to1(mapping.data() as _, mapping.len(), av::MemPerms::RWX)
     }
 
-    fn load_macho(&mut self, executor: &mut Executor<Self, LocalData, GlobalData>) -> Result<()> {
-        let executable_file = File::open(self.executable).unwrap();
+    fn load_macho(
+        &mut self,
+        executor: &mut Executor<Self, LocalData, GlobalData>,
+        path: &Path,
+    ) -> anyhow::Result<()> {
+        let mut executable_file = File::open(path).unwrap();
         let mut executable = Vec::new();
         let size = executable_file.read_to_end(&mut executable).unwrap();
 
@@ -107,85 +114,139 @@ impl AppBoxLoader {
         let (mach_header, mach_commands) = match OFile::parse(&mut cur).unwrap() {
             OFile::MachFile { header, commands } => match header {
                 MachHeader {
-                    cputype: CPU_TYPE_ARM64,
-                    filetype: MH_EXECUTE,
+                    cputype: mach_object::CPU_TYPE_ARM64,
+                    filetype: mach_object::MH_EXECUTE,
                     ..
                 } => Ok((header, commands)),
-                _ => return Err("not an arm64 executable".to_string()),
+                _ => bail!("not an arm64 executable"),
             },
-            OFile::FatFile { magic, files } => files
+            OFile::FatFile { files, .. } => files
                 .iter()
-                .find_map(|&(arch, file)| match (arch.cputype, file) {
-                    (CPU_TYPE_ARM64, OFile::MachFile { header, commands }) => {
-                        Some(Ok((header, commands)))
+                .find_map(|(arch, file)| match (arch.cputype, file) {
+                    (mach_object::CPU_TYPE_ARM64, OFile::MachFile { header, commands }) => {
+                        Some(Ok((header.clone(), commands.clone())))
                     }
                     _ => None,
                 })
-                .unwrap_or(Err("no arm64 slice")),
-            _ => Err("not a mach file".to_string()),
+                .unwrap_or(Err(anyhow::anyhow!("no arm64 slice"))),
+            _ => bail!("not a mach file"),
         }?;
 
+        let segment_ranges: Vec<(u64, u64)> = mach_commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                MachCommand(
+                    LoadCommand::Segment64 {
+                        segname,
+                        vmaddr,
+                        vmsize,
+                        ..
+                    },
+                    _,
+                ) if segname != "__PAGEZERO" => {
+                    Some((*vmaddr as u64, *vmaddr as u64 + *vmsize as u64))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let minaddr = segment_ranges
+            .iter()
+            .map(|&(start, _)| start)
+            .min()
+            .unwrap();
+        let maxaddr = segment_ranges.iter().map(|&(_, end)| end).max().unwrap();
+        let va_size = maxaddr - minaddr;
+
+        let reservation = if (mach_header.filetype == mach_object::MH_EXECUTE
+            && mach_header.flags & mach_object::MH_PIE != 0)
+            || mach_header.filetype == mach_object::MH_DYLIB
+        {
+            MemoryMap::new(
+                va_size as usize,
+                &[MapOption::MapReadable, MapOption::MapWritable],
+            )?
+        } else {
+            MemoryMap::new(
+                va_size as usize,
+                &[
+                    MapOption::MapReadable,
+                    MapOption::MapWritable,
+                    MapOption::MapAddr(minaddr as _),
+                ],
+            )?
+        };
+        let slide = reservation.data() as u64 - minaddr;
+
+        let mut entrypoint: Option<u64> = None;
         for MachCommand(cmd, _cmdsize) in mach_commands {
             match cmd {
                 LoadCommand::Segment64 {
                     vmaddr,
-                    vmsize,
                     fileoff,
                     filesize,
-                    maxprot,
-                    initprot,
                     ..
                 } => {
-                    let maxprot = convert_prot(maxprot);
-                    let initprot = convert_prot(initprot);
-                    let useprot = if initprot.intersects(nix::sys::mman::ProtFlags::PROT_EXEC) {
-                        maxprot
-                    } else {
-                        initprot
-                    };
-
                     if vmaddr == 0 {
+                        // __PAGEZERO
                         continue;
                     }
-                    if filesize < vmsize {}
 
                     if filesize > 0 {
                         debug!("mapping {} bytes at 0x{:x}", filesize, vmaddr);
-                        unsafe {
-                            nix::sys::mman::mmap(
-                                std::num::NonZeroUsize::new(vmaddr),
-                                std::num::NonZeroUsize::new_unchecked(filesize),
-                                useprot,
-                                nix::sys::mman::MapFlags::MAP_PRIVATE
-                                    | nix::sys::mman::MapFlags::MAP_FIXED,
-                                executable_file.as_raw_fd(),
-                                fileoff as i64, // TODO: plus fat offset
-                            )
-                            .unwrap();
-                        };
-                        regions.push((vmaddr, filesize, useprot));
+                        let mapping = MemoryMap::new(
+                            filesize as usize,
+                            &[
+                                MapOption::MapReadable,
+                                MapOption::MapWritable,
+                                MapOption::MapAddr(unsafe {
+                                    reservation
+                                        .data()
+                                        .offset(vmaddr as isize - minaddr as isize)
+                                        as _
+                                }),
+                                MapOption::MapFd(executable_file.as_raw_fd()),
+                                MapOption::MapOffset(fileoff as _),
+                            ],
+                        )?;
+                        self.map_1to1(executor, &mapping)?;
+
+                        if fileoff == 0 && mach_header.filetype == mach_object::MH_EXECUTE {
+                            self.mh = mapping.data() as _;
+                        }
                     }
                 }
                 LoadCommand::UnixThread { state, .. } => {
                     if let mach_object::ThreadState::Arm64 { __pc, .. } = state {
-                        self.entry_point = __pc;
+                        entrypoint = Some(__pc + slide);
                     } else {
-                        return Err("LC_UNIX_THREAD not arm64".to_string());
+                        bail!("LC_UNIX_THREAD not arm64");
                     }
                 }
+                LoadCommand::EntryPoint { stacksize, .. } => {
+                    // XXX: entryoff ignored here?
+                }
                 LoadCommand::LoadDyLinker(path) => {
-                    // dyld is in the shared cache, nothing to do here.
-                    // TODO: is this correct?
-                    dbg!(path);
+                    self.load_macho(executor, &PathBuf::from(path.as_str()))?;
                 }
                 _ => {}
             }
         }
 
+        // load is re-entrant with LoadDyLinker when coming from a MH_EXECUTE mach-o.
+        // Since the dylinker will be fully loaded first (as part of processing the LC_LOAD_DYLINKER),
+        // it will take precedence over the main executable.
+        if self.entry_point == 0 {
+            self.entry_point = entrypoint.unwrap();
+        }
+
         Ok(())
     }
 
-    fn setup_stack(&mut self, executor: &mut Executor<Self, LocalData, GlobalData>) -> Result<()> {
+    fn setup_stack(
+        &mut self,
+        executor: &mut Executor<Self, LocalData, GlobalData>,
+    ) -> anyhow::Result<()> {
         // MOXiI: Vol 1, Listing 7-1
         /*
          * C runtime startup for interface to the dynamic linker.
@@ -237,9 +298,9 @@ impl AppBoxLoader {
             self.executable.to_str().unwrap()
         )];
 
-        let total_len = self.arguments.iter().map(|s| s.len() + 1).sum()
-            + self.environment.iter().map(|s| s.len() + 1).sum()
-            + applep.iter().map(|s| s.len() + 1).sum();
+        let total_len = self.arguments.iter().map(|s| s.len() + 1).sum::<usize>()
+            + self.environment.iter().map(|s| s.len() + 1).sum::<usize>()
+            + applep.iter().map(|s| s.len() + 1).sum::<usize>();
         let strings = MemoryMap::new(total_len, &[MapOption::MapReadable, MapOption::MapWritable])?;
         trace!("strings = {:?}", strings.data());
         self.map_1to1(executor, &strings)?;
@@ -260,28 +321,29 @@ impl AppBoxLoader {
         // Pointer to where the first pointer will be stored.
         // TODO: it would be nice to use a vec-like thing here so we don't have to keep adjusting the slice.
         let mut stack_ptrs: &mut [*const u8] =
-            unsafe { std::mem::transmute(stack.data()) }[stack_size_in_ptrs - stack_top_offset..];
+            unsafe { std::slice::from_raw_parts_mut(stack.data() as _, stack_size_in_ptrs) };
+        stack_ptrs = &mut stack_ptrs[stack_size_in_ptrs - stack_top_offset..];
         self.stack_pointer = stack_ptrs.as_ptr() as u64;
 
         stack_ptrs[0] = 0 as _; // TODO: mh
         stack_ptrs[1] = self.arguments.len() as _;
         stack_ptrs = &mut stack_ptrs[2..];
 
-        for (i, &arg) in self.arguments.iter().enumerate() {
+        for (i, arg) in self.arguments.iter().enumerate() {
             stack_ptrs[i] = strings_ptr.as_ptr();
             strings_ptr[0..arg.len()].copy_from_slice(arg.as_bytes());
             strings_ptr = &mut strings_ptr[arg.len() + 1..];
         }
         stack_ptrs = &mut stack_ptrs[self.arguments.len()..];
 
-        for (i, &env) in self.environment.iter().enumerate() {
+        for (i, env) in self.environment.iter().enumerate() {
             stack_ptrs[i] = strings_ptr.as_ptr();
             strings_ptr[0..env.len()].copy_from_slice(env.as_bytes());
             strings_ptr = &mut strings_ptr[env.len() + 1..];
         }
         stack_ptrs = &mut stack_ptrs[self.environment.len()..];
 
-        for (i, &apple) in applep.iter().enumerate() {
+        for (i, apple) in applep.iter().enumerate() {
             stack_ptrs[i] = strings_ptr.as_ptr();
             strings_ptr[0..apple.len()].copy_from_slice(apple.as_bytes());
             strings_ptr = &mut strings_ptr[apple.len() + 1..];
@@ -297,16 +359,19 @@ impl Loader for AppBoxLoader {
 
     // Creates the mapping needed for the binary and writes the instructions into it.
     fn map(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<()> {
-        let tls = MemoryMap::new(0x10000, &[MapOption::MapReadable, MapOption::MapWritable])?;
+        let tls = MemoryMap::new(0x10000, &[MapOption::MapReadable, MapOption::MapWritable])
+            .map_err(|e| hyperpom::error::MemoryError::Generic(e.to_string()))?;
         self.map_1to1(executor, &tls)?;
         self.tls = tls.data() as _;
         trace!("tls_page = {:x}", self.tls);
 
-        self.load_macho(executor)?;
-        self.setup_stack(executor)?;
+        self.load_macho(executor, &self.executable.clone())
+            .map_err(|e| hyperpom::error::MemoryError::Generic(e.to_string()))?;
+        self.setup_stack(executor)
+            .map_err(|e| hyperpom::error::MemoryError::Generic(e.to_string()))?;
 
-        for mapping in self.shared_cache.mappings {
-            self.map_1to1(executor, &mapping)?;
+        for mapping in self.shared_cache.mappings.clone().iter() {
+            self.map_1to1(executor, mapping)?;
         }
 
         trace!("map done");
@@ -329,11 +394,14 @@ impl Loader for AppBoxLoader {
 
     fn hooks(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<()> {
         // TODO: fix up applep so we don't need this
-        executor.add_custom_hook(self.shared_cache_base + 0x3f9df8, pthread_hook);
+        executor.add_custom_hook(
+            self.shared_cache.base_address() as u64 + 0x3f9df8,
+            pthread_hook,
+        );
         // TODO: figure out where the actual call to set restartable ranges is
         // and intercept that syscall instead
         executor.add_custom_hook(
-            self.shared_cache_base + 0x5e554,
+            self.shared_cache.base_address() as u64 + 0x5e554,
             objc_restartable_ranges_hook,
         );
 
@@ -388,9 +456,11 @@ impl Loader for AppBoxLoader {
         &self,
         vcpu: &mut av::Vcpu,
         vma: &mut VirtMemAllocator,
-        ldata: &mut Self::LD,
+        _ldata: &mut Self::LD,
         _gdata: &std::sync::RwLock<Self::GD>,
     ) -> Result<ExitKind> {
         // TODO: expose as trap callback?
+        trace!("ELR_EL1: {:#x}", vcpu.get_sys_reg(av::SysReg::ELR_EL1)?);
+        Ok(ExitKind::Continue)
     }
 }
