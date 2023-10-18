@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::Cursor;
 use std::io::Read;
@@ -22,19 +23,86 @@ use log::{debug, error, info, trace, warn};
 use mach_object::{LoadCommand, MachCommand, MachHeader, OFile};
 use mmap_fixed_fixed::{MapOption, MemoryMap};
 
+mod commpage;
 mod dyld;
 mod dyld_cache_format;
 
-// TODO: these could equally be in localdata and avoid the RwLock.
+pub struct AppBox<Handler: AppBoxTrapHandler> {
+    // Required to enable virtualization for this process.
+    _vm: av::VirtualMachine,
+    handler: Handler,
+
+    pub executable: PathBuf,
+    pub argv: Vec<String>,
+    pub envp: Vec<String>,
+}
+
+impl<Handler: AppBoxTrapHandler> AppBox<Handler> {
+    pub fn new(
+        executable: &Path,
+        argv: &Vec<String>,
+        envp: &Vec<String>,
+        handler: Handler,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            _vm: av::VirtualMachine::new()?,
+            handler,
+            executable: executable.to_path_buf(),
+            argv: argv.clone(),
+            envp: envp.clone(),
+        })
+    }
+
+    pub fn run(&mut self) -> Result<ExitKind> {
+        // dynamically allocated physical memory must be <0x1000_0000, which is where our 1:1 mappings begins
+        let config = hyperpom::config::ExecConfig::builder(0x1000_0000)
+            .coverage(false)
+            .build();
+
+        let ldata = LocalData::default();
+        let gdata = GlobalData::default();
+        let mut executor = hyperpom::core::Executor::<_, _, _>::new(
+            config,
+            AppBoxLoader::new(&self.executable, &self.argv, &self.envp, self.handler)
+                .map_err(|e| hyperpom::error::LoaderError::Generic(e.to_string()))?,
+            ldata,
+            gdata,
+        )
+        .expect("could not create executor");
+
+        executor.init().expect("could not init executor");
+        executor
+            .vcpu
+            .set_reg(hyperpom::applevisor::Reg::LR, 0xdeadf000)
+            .unwrap();
+
+        executor.run(None)
+    }
+}
+
+pub trait AppBoxTrapHandler: Clone + Send {
+    fn trap_handler(
+        &mut self,
+        vcpu: &mut av::Vcpu,
+        vma: &mut VirtMemAllocator,
+        load_info: &LoadInfo,
+    ) -> Result<ExitKind>;
+}
+
 #[derive(Clone, Default)]
-pub struct GlobalData {
-    // Base address of the shared cache, required to be here in a Data struct so hooks can access it.
+pub struct LoadInfo {
     pub shared_cache_base: u64,
 }
 
-// Empty local data.
+// Empty global data.
 #[derive(Clone, Default)]
-pub struct LocalData;
+pub struct GlobalData;
+
+// Local data with load info.
+#[derive(Clone, Default)]
+pub struct LocalData {
+    pub load_info: LoadInfo,
+}
 
 fn pthread_hook(args: &mut hooks::HookArgs<LocalData, GlobalData>) -> Result<ExitKind> {
     debug!("pthread token == 0 hook");
@@ -47,15 +115,12 @@ fn objc_restartable_ranges_hook(
     args: &mut hooks::HookArgs<LocalData, GlobalData>,
 ) -> Result<ExitKind> {
     debug!("objc task_restartable_ranges_register hook");
-    args.vcpu.set_reg(
-        av::Reg::PC,
-        args.gdata.read().unwrap().shared_cache_base + 0x5e570,
-    )?;
+    args.vcpu.set_reg(av::Reg::PC, 0x1337)?; // TODO
     Ok(ExitKind::Continue)
 }
 
 #[derive(Clone)]
-pub struct AppBoxLoader {
+pub struct AppBoxLoader<Handler: AppBoxTrapHandler> {
     // Path to the executable.
     executable: PathBuf,
     // Arguments to pass to the executable, including argv[0].
@@ -63,6 +128,7 @@ pub struct AppBoxLoader {
     // Envvars to pass to the executable.
     environment: Vec<String>,
 
+    // The loaded shared cache.
     shared_cache: dyld::SharedCache,
     // Address of the loaded mach-o header.
     mh: u64,
@@ -73,11 +139,19 @@ pub struct AppBoxLoader {
     stack_pointer: u64,
     // Address of thread local storage.
     tls: u64,
+
+    handler: Handler,
 }
 
-impl AppBoxLoader {
-    pub fn new(executable: &Path, argv: &Vec<String>, envp: &Vec<String>) -> anyhow::Result<Self> {
-        // TODO: parse macho, check for arm64 and error accordingly
+impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
+    pub fn new(
+        executable: &Path,
+        argv: &Vec<String>,
+        envp: &Vec<String>,
+        handler: Handler,
+    ) -> anyhow::Result<Self> {
+        // TODO: parse macho, check for arm64 and error accordingly.
+        // Basically do the macho parsing from load_macho here.
         Ok(Self {
             executable: executable.to_path_buf(),
             arguments: argv.clone(),
@@ -87,6 +161,7 @@ impl AppBoxLoader {
             entry_point: 0,
             stack_pointer: 0,
             tls: 0,
+            handler: handler,
         })
     }
 
@@ -351,9 +426,86 @@ impl AppBoxLoader {
 
         Ok(())
     }
+
+    fn setup_commpage(
+        &mut self,
+        executor: &mut Executor<Self, LocalData, GlobalData>,
+    ) -> Result<()> {
+        // TODO: these need to point to the same backing page
+        executor.vma.map(
+            commpage::_COMM_PAGE64_BASE_ADDRESS as _,
+            0x1000,
+            av::MemPerms::RW,
+        )?;
+        executor.vma.map(
+            commpage::_COMM_PAGE64_RO_ADDRESS as _,
+            0x1000,
+            av::MemPerms::R,
+        )?;
+
+        // Setup the r/w commpage...
+        executor
+            .vma
+            .write(commpage::_COMM_PAGE64_BASE_ADDRESS, b"commpage 64-bit")?;
+        executor.vma.write_word(
+            commpage::_COMM_PAGE64_BASE_ADDRESS + commpage::_COMM_PAGE_VERSION,
+            commpage::_COMM_PAGE_THIS_VERSION as _,
+        )?;
+
+        executor.vma.write_byte(
+            commpage::_COMM_PAGE64_BASE_ADDRESS + commpage::_COMM_PAGE_NCPUS,
+            1,
+        )?;
+        executor.vma.write_byte(
+            commpage::_COMM_PAGE64_BASE_ADDRESS + commpage::_COMM_PAGE_ACTIVE_CPUS,
+            1,
+        )?;
+        executor.vma.write_byte(
+            commpage::_COMM_PAGE64_BASE_ADDRESS + commpage::_COMM_PAGE_PHYSICAL_CPUS,
+            1,
+        )?;
+        executor.vma.write_byte(
+            commpage::_COMM_PAGE64_BASE_ADDRESS + commpage::_COMM_PAGE_LOGICAL_CPUS,
+            1,
+        )?;
+
+        executor.vma.write_byte(
+            commpage::_COMM_PAGE64_BASE_ADDRESS + commpage::_COMM_PAGE_USER_PAGE_SHIFT_64,
+            12, // PAGE_SIZE = 0x1000
+        )?;
+        executor.vma.write_byte(
+            commpage::_COMM_PAGE64_BASE_ADDRESS + commpage::_COMM_PAGE_KERNEL_PAGE_SHIFT,
+            12,
+        )?;
+
+        executor.vma.write_dword(
+            commpage::_COMM_PAGE64_BASE_ADDRESS + commpage::_COMM_PAGE_CPU_CAPABILITIES,
+            commpage::kUP,
+        )?;
+        executor.vma.write_qword(
+            commpage::_COMM_PAGE64_BASE_ADDRESS + commpage::_COMM_PAGE_CPU_CAPABILITIES64,
+            commpage::kUP as _,
+        )?;
+
+        executor.vma.write_qword(
+            commpage::_COMM_PAGE64_BASE_ADDRESS + commpage::_COMM_PAGE_MEMORY_SIZE,
+            1 * 1024 * 1024 * 1024, // TODO: no idea if correct
+        )?;
+
+        // ... then copy it to the RO page.
+        let mut page = [0; 0x1000];
+        executor
+            .vma
+            .read(commpage::_COMM_PAGE64_BASE_ADDRESS, &mut page)?;
+        executor
+            .vma
+            .write(commpage::_COMM_PAGE64_RO_ADDRESS, &page)?;
+
+        Ok(())
+    }
 }
 
-impl Loader for AppBoxLoader {
+impl<Handler: AppBoxTrapHandler> Loader for AppBoxLoader<Handler> {
     type LD = LocalData;
     type GD = GlobalData;
 
@@ -369,10 +521,13 @@ impl Loader for AppBoxLoader {
             .map_err(|e| hyperpom::error::MemoryError::Generic(e.to_string()))?;
         self.setup_stack(executor)
             .map_err(|e| hyperpom::error::MemoryError::Generic(e.to_string()))?;
+        self.setup_commpage(executor)?;
 
         for mapping in self.shared_cache.mappings.clone().iter() {
             self.map_1to1(executor, mapping)?;
         }
+
+        executor.ldata.load_info.shared_cache_base = self.shared_cache.base_address() as _;
 
         trace!("map done");
         Ok(())
@@ -456,11 +611,9 @@ impl Loader for AppBoxLoader {
         &self,
         vcpu: &mut av::Vcpu,
         vma: &mut VirtMemAllocator,
-        _ldata: &mut Self::LD,
+        ldata: &mut Self::LD,
         _gdata: &std::sync::RwLock<Self::GD>,
     ) -> Result<ExitKind> {
-        // TODO: expose as trap callback?
-        trace!("ELR_EL1: {:#x}", vcpu.get_sys_reg(av::SysReg::ELR_EL1)?);
-        Ok(ExitKind::Continue)
+        self.handler.trap_handler(vcpu, vma, &ldata.load_info)
     }
 }
