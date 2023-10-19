@@ -275,13 +275,15 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
             || mach_header.filetype == mach_object::MH_DYLINKER
         {
             trace!("mach-o va range 0x{:x}-0x{:x}, PIE", minaddr, maxaddr);
-            MemoryMap::new(
+            self.new_mapping(
+                executor,
                 va_size as usize,
                 &[MapOption::MapReadable, MapOption::MapWritable],
             )?
         } else {
             trace!("mach-o va range 0x{:x}-0x{:x}, static", minaddr, maxaddr);
-            MemoryMap::new(
+            self.new_mapping(
+                executor,
                 va_size as usize,
                 &[
                     MapOption::MapReadable,
@@ -331,9 +333,6 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
                             unsafe { std::slice::from_raw_parts_mut(mapping.data(), filesize) },
                             arch_file_offset + fileoff as u64,
                         )?;
-                        trace!("{:p}: {:x}", mapping.data(), unsafe {
-                            *(mapping.data() as *const u32)
-                        });
 
                         if fileoff == 0 && mach_header.filetype == mach_object::MH_EXECUTE {
                             trace!("setting mh to {:p}", mapping.data());
@@ -369,7 +368,6 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
                 path.display()
             );
             self.entry_point = entrypoint.unwrap();
-            dbg!(executor.vma.read_dword(self.entry_point)?);
         }
 
         Ok(())
@@ -611,16 +609,16 @@ impl<Handler: AppBoxTrapHandler> Loader for AppBoxLoader<Handler> {
 
     fn hooks(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<()> {
         // TODO: fix up applep so we don't need this
-        executor.add_custom_hook(
-            self.shared_cache.base_address() as u64 + 0x3f9df8,
-            pthread_hook,
-        );
+        // executor.add_custom_hook(
+        //     self.shared_cache.base_address() as u64 + 0x3f9df8,
+        //     pthread_hook,
+        // );
         // TODO: figure out where the actual call to set restartable ranges is
         // and intercept that syscall instead
-        executor.add_custom_hook(
-            self.shared_cache.base_address() as u64 + 0x5e554,
-            objc_restartable_ranges_hook,
-        );
+        // executor.add_custom_hook(
+        //     self.shared_cache.base_address() as u64 + 0x5e554,
+        //     objc_restartable_ranges_hook,
+        // );
 
         Ok(())
     }
