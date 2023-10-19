@@ -18,12 +18,28 @@ use crate::dyld_cache_format::*;
 // However, modifications to the mapped cache memory (e.g. writing to globals in an image) would be reflected in all "copies".
 #[derive(Clone)]
 pub struct SharedCache {
+    // MemoryMaps are wrapped in an Rc as MemoryMap doesn't implement Clone.
     pub reservation: Rc<MemoryMap>,
     pub slide: usize,
     pub mappings: Vec<Rc<MemoryMap>>,
 }
 
 unsafe impl Send for SharedCache {}
+
+fn read_at<T: Copy>(file: &File, offset: u64) -> Result<T> {
+    let mut buf: Vec<u8> = vec![0; std::mem::size_of::<T>()];
+    file.read_exact_at(&mut buf, offset)?;
+    Ok(unsafe { *(buf.as_ptr() as *const T) })
+}
+
+fn read_vec_at<T: Clone>(file: &File, offset: u64, count: usize) -> Result<Vec<T>> {
+    let mut vec: Vec<T> = unsafe { vec![std::mem::zeroed(); count] };
+    let buf: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(vec.as_mut_ptr() as _, count * std::mem::size_of::<T>())
+    };
+    file.read_exact_at(buf, offset)?;
+    Ok(vec)
+}
 
 impl SharedCache {
     pub fn new_system_cache() -> Result<Self> {
@@ -33,17 +49,20 @@ impl SharedCache {
     }
 
     pub fn new(cache_path: &Path) -> Result<Self> {
+        debug!("loading shared cache {}", cache_path.display());
+
         let cache = File::open(cache_path)?;
-        let cache_header: dyld_cache_header = {
-            let mut buf = [0; std::mem::size_of::<dyld_cache_header>()];
-            cache.read_exact_at(&mut buf, 0)?;
-            unsafe { *(&buf as *const _ as *const dyld_cache_header) }
-        };
+        let cache_header: dyld_cache_header = read_at(&cache, 0)?;
         let reservation = MemoryMap::new(
             cache_header.sharedRegionSize as usize,
             &[MapOption::MapReadable, MapOption::MapWritable],
         )?;
         let slide = (reservation.data() as u64 - cache_header.sharedRegionStart) as usize;
+        trace!(
+            "main cache at {:p}, slide 0x{:x}",
+            reservation.data(),
+            slide
+        );
 
         let mut cache = Self {
             reservation: Rc::new(reservation),
@@ -75,6 +94,8 @@ impl SharedCache {
 
         cache.mappings.push(Rc::new(dyndata_mapping));
 
+        debug!("shared cache loaded");
+
         Ok(cache)
     }
 
@@ -83,30 +104,21 @@ impl SharedCache {
     }
 
     fn map_single_cache(&mut self, path: &Path, cache_offset: usize) -> Result<()> {
+        trace!("mapping single cache {}", path.display());
         let cache = File::open(path)?;
-        let cache_header: dyld_cache_header = {
-            let mut buf = [0; std::mem::size_of::<dyld_cache_header>()];
-            cache.read_exact_at(&mut buf, 0)?;
-            unsafe { *(&buf as *const _ as *const dyld_cache_header) }
-        };
-        let mappings: &[dyld_cache_mapping_and_slide_info] = {
-            let mut buf = vec![
-                0;
-                std::mem::size_of::<dyld_cache_mapping_and_slide_info>()
-                    * cache_header.mappingWithSlideCount as usize
-            ];
-            cache.read_exact_at(&mut buf, cache_header.mappingWithSlideOffset as _)?;
-            unsafe {
-                std::slice::from_raw_parts(
-                    buf.as_ptr() as _,
-                    cache_header.mappingWithSlideCount as usize,
-                )
-            }
-            .clone()
-        };
+        let cache_header: dyld_cache_header = read_at(&cache, 0)?;
+        let mappings: Vec<dyld_cache_mapping_and_slide_info> = read_vec_at(
+            &cache,
+            cache_header.mappingWithSlideOffset as _,
+            cache_header.mappingWithSlideCount as _,
+        )?;
         for mapping_info in mappings {
             let map_addr = mapping_info.address + self.slide as u64 + cache_offset as u64;
-            debug!("mapping cache {:x} -> {:x}", mapping_info.address, map_addr);
+            trace!(
+                "mapping in cache 0x{:x} -> 0x{:x}",
+                mapping_info.address,
+                map_addr
+            );
 
             let mapping = MemoryMap::new(
                 mapping_info.size as usize,
@@ -120,23 +132,34 @@ impl SharedCache {
             )?;
 
             if mapping_info.slideInfoFileSize > 0 {
-                let slide_version: u32 = {
-                    let mut buf = [0; std::mem::size_of::<u32>()];
-                    cache.read_exact_at(&mut buf, mapping_info.slideInfoFileOffset)?;
-                    unsafe { *(&buf as *const _ as *const u32) }
-                };
+                let slide_version: u32 = read_at(&cache, mapping_info.slideInfoFileOffset)?;
                 match slide_version {
                     3 => {
-                        let slide_info: &dyld_cache_slide_info3 = {
-                            let mut buf = [0; std::mem::size_of::<dyld_cache_slide_info3>()];
+                        // TODO: bad bad bad.
+                        // This is a hack to get around the fact that the slide info has a
+                        // flexible array member at the end, which means the struct is not
+                        // Copy and can't be simply derefed.
+                        // Have to create a vec with the actual data (including the flexible
+                        // array), bring that up to keep it alive, then cast the vec contents
+                        // (again).
+                        let sib = {
+                            // Read the struct...
+                            let mut buf: Vec<u8> =
+                                vec![0; std::mem::size_of::<dyld_cache_slide_info3>()];
                             cache.read_exact_at(&mut buf, mapping_info.slideInfoFileOffset)?;
-                            unsafe {
-                                // dyld_cache_slide_info3 has a variable length array at the end,
-                                // so doesn't derive copy. Have to transmute to a ref directly.
-                                std::mem::transmute(
-                                    &buf as *const _ as *const dyld_cache_slide_info3,
-                                )
-                            }
+                            let info = unsafe {
+                                &*(buf.as_ptr() as *const _ as *const dyld_cache_slide_info3)
+                            };
+                            // ... then add on the size for the flexible array...
+                            buf.reserve(
+                                info.page_starts_count as usize * std::mem::size_of::<u16>(),
+                            );
+                            // ... and re-read all, including the array.
+                            cache.read_exact_at(&mut buf, mapping_info.slideInfoFileOffset)?;
+                            buf
+                        };
+                        let slide_info: &dyld_cache_slide_info3 = unsafe {
+                            &*(sib.as_ptr() as *const _ as *const dyld_cache_slide_info3)
                         };
                         for (i, &delta) in unsafe {
                             slide_info
@@ -182,27 +205,17 @@ impl SharedCache {
                     }
                 }
             } else {
-                info!("no slide info for mapping {:x}?", mapping_info.address);
+                trace!("no slide info for mapping 0x{:x}", mapping_info.address);
             }
 
             self.mappings.push(Rc::new(mapping));
         }
 
-        let subcaches: &[dyld_subcache_entry] = {
-            let mut buf = vec![
-                0;
-                std::mem::size_of::<dyld_subcache_entry>()
-                    * cache_header.subCacheArrayCount as usize
-            ];
-            cache.read_exact_at(&mut buf, cache_header.subCacheArrayOffset as _)?;
-            unsafe {
-                std::slice::from_raw_parts(
-                    buf.as_ptr() as _,
-                    cache_header.subCacheArrayCount as usize,
-                )
-            }
-            .clone()
-        };
+        let subcaches: Vec<dyld_subcache_entry> = read_vec_at(
+            &cache,
+            cache_header.subCacheArrayOffset as _,
+            cache_header.subCacheArrayCount as _,
+        )?;
 
         for (i, subcache) in subcaches.iter().enumerate() {
             let subcache_path = path.with_extension(format!("{:02}", i + 1));
