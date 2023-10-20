@@ -496,7 +496,6 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
     ) -> Result<()> {
         debug!("setting up commpage");
 
-        // TODO: these need to point to the same backing page
         executor.vma.map(
             commpage::_COMM_PAGE64_BASE_ADDRESS as _,
             0x1000,
@@ -508,7 +507,6 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
             av::MemPerms::R,
         )?;
 
-        // Setup the r/w commpage...
         executor
             .vma
             .write(commpage::_COMM_PAGE64_BASE_ADDRESS, b"commpage 64-bit")?;
@@ -528,13 +526,14 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
             .vma
             .write_byte(commpage::_COMM_PAGE_LOGICAL_CPUS, 1)?;
 
+        // N.B. These are in the RO page
         executor.vma.write_byte(
             commpage::_COMM_PAGE_USER_PAGE_SHIFT_64,
-            12, // PAGE_SIZE = 0x1000
+            14, // PAGE_SIZE = 0x4000
         )?;
         executor
             .vma
-            .write_byte(commpage::_COMM_PAGE_KERNEL_PAGE_SHIFT, 12)?;
+            .write_byte(commpage::_COMM_PAGE_KERNEL_PAGE_SHIFT, 14)?;
 
         executor
             .vma
@@ -547,15 +546,6 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
             commpage::_COMM_PAGE_MEMORY_SIZE,
             1 * 1024 * 1024 * 1024, // TODO: no idea if correct
         )?;
-
-        // ... then copy it to the RO page.
-        let mut page = [0; 0x1000];
-        executor
-            .vma
-            .read(commpage::_COMM_PAGE64_BASE_ADDRESS, &mut page)?;
-        executor
-            .vma
-            .write(commpage::_COMM_PAGE64_RO_ADDRESS, &page)?;
 
         Ok(())
     }

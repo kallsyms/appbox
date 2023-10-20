@@ -69,7 +69,7 @@ impl SharedCache {
             slide,
             mappings: vec![],
         };
-        cache.map_single_cache(cache_path, 0)?;
+        cache.map_single_cache(cache_path)?;
 
         let dyndata_mapping = MemoryMap::new(
             std::mem::size_of::<dyld_cache_dynamic_data_header>(),
@@ -103,7 +103,7 @@ impl SharedCache {
         self.reservation.data()
     }
 
-    fn map_single_cache(&mut self, path: &Path, cache_offset: usize) -> Result<()> {
+    fn map_single_cache(&mut self, path: &Path) -> Result<()> {
         trace!("mapping single cache {}", path.display());
         let cache = File::open(path)?;
         let cache_header: dyld_cache_header = read_at(&cache, 0)?;
@@ -113,7 +113,7 @@ impl SharedCache {
             cache_header.mappingWithSlideCount as _,
         )?;
         for mapping_info in mappings {
-            let map_addr = mapping_info.address + self.slide as u64 + cache_offset as u64;
+            let map_addr = mapping_info.address + self.slide as u64;
             trace!(
                 "mapping in cache 0x{:x} -> 0x{:x}",
                 mapping_info.address,
@@ -140,27 +140,17 @@ impl SharedCache {
                         // flexible array member at the end, which means the struct is not
                         // Copy and can't be simply derefed.
                         // Have to create a vec with the actual data (including the flexible
-                        // array), bring that up to keep it alive, then cast the vec contents
-                        // (again).
+                        // array), bring that up to keep it alive, then cast the vec contents.
                         let sib = {
-                            // Read the struct...
-                            let mut buf: Vec<u8> =
-                                vec![0; std::mem::size_of::<dyld_cache_slide_info3>()];
-                            cache.read_exact_at(&mut buf, mapping_info.slideInfoFileOffset)?;
-                            let info = unsafe {
-                                &*(buf.as_ptr() as *const _ as *const dyld_cache_slide_info3)
-                            };
-                            // ... then add on the size for the flexible array...
-                            buf.reserve(
-                                info.page_starts_count as usize * std::mem::size_of::<u16>(),
-                            );
-                            // ... and re-read all, including the array.
+                            let mut buf: Vec<u8> = vec![0; mapping_info.slideInfoFileSize as usize];
                             cache.read_exact_at(&mut buf, mapping_info.slideInfoFileOffset)?;
                             buf
                         };
                         let slide_info: &dyld_cache_slide_info3 = unsafe {
                             &*(sib.as_ptr() as *const _ as *const dyld_cache_slide_info3)
                         };
+
+                        // https://github.com/apple-oss-distributions/dyld/blob/18d3cb0f6b46707fee6d315cccccf7af8a8dbe57/cache-builder/dyld_cache_format.h#L339
                         for (i, &delta) in unsafe {
                             slide_info
                                 .page_starts
@@ -219,7 +209,7 @@ impl SharedCache {
 
         for (i, subcache) in subcaches.iter().enumerate() {
             let subcache_path = path.with_extension(format!("{:02}", i + 1));
-            self.map_single_cache(&subcache_path, subcache.cacheVMOffset as _)?;
+            self.map_single_cache(&subcache_path)?;
         }
 
         Ok(())
