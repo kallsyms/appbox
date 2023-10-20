@@ -121,8 +121,9 @@ fn pthread_hook(args: &mut hooks::HookArgs<LocalData, GlobalData>) -> Result<Exi
 fn objc_restartable_ranges_hook(
     args: &mut hooks::HookArgs<LocalData, GlobalData>,
 ) -> Result<ExitKind> {
-    debug!("objc task_restartable_ranges_register hook");
-    args.vcpu.set_reg(av::Reg::PC, 0x1337)?; // TODO
+    let pc = args.vcpu.get_reg(av::Reg::PC).unwrap();
+    debug!("objc task_restartable_ranges_register hook: PC=0x{:x}", pc);
+    args.vcpu.set_reg(av::Reg::PC, pc + (0x5e570 - 0x5e554))?; // This is good for macOS 13.5.1.
     Ok(ExitKind::Continue)
 }
 
@@ -425,10 +426,7 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
         // TODO: produce stack_guard, e.g. stack_guard=0xcdd5c48c061b00fd (must contain 00 somewhere!)
         // TODO: produce malloc_entropy, e.g. malloc_entropy=0x9536cc569d9595cf,0x831942e402da316b
         // TODO: produce main_stack?
-        let applep = vec![format!(
-            "executable_path={}",
-            self.executable.to_str().unwrap()
-        )];
+        let applep = vec![self.executable.to_str().unwrap().to_string()];
 
         let total_len = self.arguments.iter().map(|s| s.len() + 1).sum::<usize>()
             + self.environment.iter().map(|s| s.len() + 1).sum::<usize>()
@@ -586,29 +584,31 @@ impl<Handler: AppBoxTrapHandler> Loader for AppBoxLoader<Handler> {
     fn pre_exec(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<ExitKind> {
         debug!("Entry point: {:x}", self.entry_point);
         debug!("Stack pointer: {:x}", self.stack_pointer);
-        debug!("TLS: {:x}", self.tls);
+        // TODO: pthread_init writes to tpidrro_el0 - 0xe0.
+        // How is TLS actually mapped?
+        debug!("TLS: {:x}", self.tls + 0x8000);
         executor.vcpu.set_reg(av::Reg::PC, self.entry_point)?;
         executor
             .vcpu
             .set_sys_reg(av::SysReg::SP_EL0, self.stack_pointer)?;
         executor
             .vcpu
-            .set_sys_reg(av::SysReg::TPIDRRO_EL0, self.tls)?;
+            .set_sys_reg(av::SysReg::TPIDRRO_EL0, self.tls + 0x8000)?;
         Ok(ExitKind::Continue)
     }
 
     fn hooks(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<()> {
         // TODO: fix up applep so we don't need this
-        // executor.add_custom_hook(
-        //     self.shared_cache.base_address() as u64 + 0x3f9df8,
-        //     pthread_hook,
-        // );
+        executor.add_custom_hook(
+            self.shared_cache.base_address() as u64 + 0x3f9df8,
+            pthread_hook,
+        );
         // TODO: figure out where the actual call to set restartable ranges is
         // and intercept that syscall instead
-        // executor.add_custom_hook(
-        //     self.shared_cache.base_address() as u64 + 0x5e554,
-        //     objc_restartable_ranges_hook,
-        // );
+        executor.add_custom_hook(
+            self.shared_cache.base_address() as u64 + 0x5e554,
+            objc_restartable_ranges_hook,
+        );
 
         Ok(())
     }
