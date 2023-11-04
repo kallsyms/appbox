@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::fs::File;
 use std::io::Cursor;
 use std::io::Read;
-use std::os::fd::AsRawFd;
 use std::os::unix::prelude::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -21,7 +20,7 @@ use hyperpom::utils::*;
 use hyperpom::*;
 
 use anyhow::bail;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, trace};
 use mach_object::{LoadCommand, MachCommand, MachHeader, OFile};
 use mmap_fixed_fixed::{MapOption, MemoryMap};
 

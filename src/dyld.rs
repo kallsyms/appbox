@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::{bail, Result};
-use log::{debug, error, info, trace, warn};
+use log::{debug, trace};
 use mmap_fixed_fixed::{MapOption, MemoryMap};
 
 use crate::dyld_cache_format::*;
@@ -135,10 +135,9 @@ impl SharedCache {
                 let slide_version: u32 = read_at(&cache, mapping_info.slideInfoFileOffset)?;
                 match slide_version {
                     3 => {
-                        // TODO: bad bad bad.
-                        // This is a hack to get around the fact that the slide info has a
-                        // flexible array member at the end, which means the struct is not
-                        // Copy and can't be simply derefed.
+                        // This is to get around the fact that the slide info has a flexible array
+                        // member at the end, which means the struct is not Copy and can't be
+                        // simply derefed.
                         // Have to create a vec with the actual data (including the flexible
                         // array), bring that up to keep it alive, then cast the vec contents.
                         let sib = {
@@ -207,7 +206,7 @@ impl SharedCache {
             cache_header.subCacheArrayCount as _,
         )?;
 
-        for (i, subcache) in subcaches.iter().enumerate() {
+        for (i, _) in subcaches.iter().enumerate() {
             let subcache_path = path.with_extension(format!("{:02}", i + 1));
             self.map_single_cache(&subcache_path)?;
         }
