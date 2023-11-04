@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-hyperpom = {path = "../../../hyperpom"}
+hyperpom = {git = "https://github.com/kallsyms/hyperpom.git"}
 env_logger = "0.10.0"
 log = "0.4.17"
 nix = "0.26.2"
