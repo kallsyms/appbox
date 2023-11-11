@@ -162,7 +162,7 @@ impl SharedCache {
                             if delta == DYLD_CACHE_SLIDE_V3_PAGE_ATTR_NO_REBASE as _ {
                                 continue;
                             }
-                            delta = delta / std::mem::size_of::<u64>() as u16;
+                            delta /= std::mem::size_of::<u64>() as u16;
                             let page_start: *mut u8 =
                                 unsafe { mapping.data().add(i * slide_info.page_size as usize) };
                             let mut loc: *mut dyld_cache_slide_pointer3 = page_start as _;

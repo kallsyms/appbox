@@ -41,16 +41,16 @@ pub struct AppBox<Handler: AppBoxTrapHandler> {
 impl<Handler: AppBoxTrapHandler> AppBox<Handler> {
     pub fn new(
         executable: &Path,
-        argv: &Vec<String>,
-        envp: &Vec<String>,
+        argv: &[String],
+        envp: &[String],
         handler: RefCell<Handler>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             _vm: av::VirtualMachine::new()?,
             handler,
             executable: executable.to_path_buf(),
-            argv: argv.clone(),
-            envp: envp.clone(),
+            argv: argv.to_owned(),
+            envp: envp.to_owned(),
         })
     }
 
@@ -61,7 +61,7 @@ impl<Handler: AppBoxTrapHandler> AppBox<Handler> {
             .build();
 
         let ldata = LocalData::default();
-        let gdata = GlobalData::default();
+        let gdata = GlobalData{};
         let mut executor = hyperpom::core::Executor::<_, _, _>::new(
             config,
             AppBoxLoader::new(
@@ -163,16 +163,16 @@ pub struct AppBoxLoader<Handler: AppBoxTrapHandler> {
 impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
     pub fn new(
         executable: &Path,
-        argv: &Vec<String>,
-        envp: &Vec<String>,
+        argv: &[String],
+        envp: &[String],
         handler: RefCell<Handler>,
     ) -> anyhow::Result<Self> {
         // TODO: parse macho, check for arm64 and error accordingly.
         // Basically do the macho parsing from load_macho here.
         Ok(Self {
             executable: executable.to_path_buf(),
-            arguments: argv.clone(),
-            environment: envp.clone(),
+            arguments: argv.to_owned(),
+            environment: envp.to_owned(),
             shared_cache: dyld::SharedCache::new_system_cache()?,
             mh: 0,
             mappings: vec![],
@@ -347,7 +347,7 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
                         bail!("LC_UNIX_THREAD not arm64");
                     }
                 }
-                LoadCommand::EntryPoint { stacksize, .. } => {
+                LoadCommand::EntryPoint { .. } => {
                     // XXX: entryoff ignored here?
                     // TODO
                 }
@@ -653,7 +653,7 @@ impl<Handler: AppBoxTrapHandler> Loader for AppBoxLoader<Handler> {
 
         error!("SAME EL Fault!");
         error!("{}", vcpu);
-        return Ok(ExitKind::Crash("Unhandled fault".to_string()));
+        Ok(ExitKind::Crash("Unhandled fault".to_string()))
     }
 
     fn exception_handler_sync_lowerel_aarch64(
