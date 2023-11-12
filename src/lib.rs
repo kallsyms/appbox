@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::fs::File;
 use std::io::Cursor;
 use std::io::Read;
@@ -6,6 +5,8 @@ use std::os::unix::prelude::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use hyperpom::applevisor as av;
 use hyperpom::core::*;
@@ -28,10 +29,23 @@ mod commpage;
 mod dyld;
 mod dyld_cache_format;
 
+pub trait AppBoxTrapHandler: Send {
+    fn trap_handler(
+        &mut self,
+        vcpu: &mut av::Vcpu,
+        vma: &mut VirtMemAllocator,
+        load_info: &LoadInfo,
+    ) -> Result<ExitKind>;
+}
+
 pub struct AppBox<Handler: AppBoxTrapHandler> {
     // Required to enable virtualization for this process.
     _vm: av::VirtualMachine,
-    handler: RefCell<Handler>,
+    // Need a mutable reference to the Handler passed in at construction.
+    // Can't be a simple &mut because &muts aren't Clone (which the Loader must be).
+    // It would probably be sufficient to make this a newtype on Arc<Handler>,
+    // but maybe we'll have multiple vCPUs or something idk.
+    handler: Arc<Mutex<Handler>>,
 
     pub executable: PathBuf,
     pub argv: Vec<String>,
@@ -43,7 +57,7 @@ impl<Handler: AppBoxTrapHandler> AppBox<Handler> {
         executable: &Path,
         argv: &[String],
         envp: &[String],
-        handler: RefCell<Handler>,
+        handler: Arc<Mutex<Handler>>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             _vm: av::VirtualMachine::new()?,
@@ -61,7 +75,7 @@ impl<Handler: AppBoxTrapHandler> AppBox<Handler> {
             .build();
 
         let ldata = LocalData::default();
-        let gdata = GlobalData{};
+        let gdata = GlobalData {};
         let mut executor = hyperpom::core::Executor::<_, _, _>::new(
             config,
             AppBoxLoader::new(
@@ -84,15 +98,6 @@ impl<Handler: AppBoxTrapHandler> AppBox<Handler> {
 
         executor.run(None)
     }
-}
-
-pub trait AppBoxTrapHandler: Clone + Send {
-    fn trap_handler(
-        &mut self,
-        vcpu: &mut av::Vcpu,
-        vma: &mut VirtMemAllocator,
-        load_info: &LoadInfo,
-    ) -> Result<ExitKind>;
 }
 
 #[derive(Clone, Default)]
@@ -130,7 +135,6 @@ fn objc_restartable_ranges_hook(
 struct Mmap(Rc<MemoryMap>);
 unsafe impl Send for Mmap {}
 
-#[derive(Clone)]
 pub struct AppBoxLoader<Handler: AppBoxTrapHandler> {
     // Path to the executable.
     executable: PathBuf,
@@ -145,7 +149,7 @@ pub struct AppBoxLoader<Handler: AppBoxTrapHandler> {
     mh: u64,
 
     // Vec of all mappings made by the loader (incl. stack, commpage, etc.).
-    // N.B. Needs to use a separate type which is Send.
+    // N.B. Needs to use a newtype which is Send.
     mappings: Vec<Mmap>,
 
     // Below stored as u64 instead of *mut/const u8 as raw pointers aren't Send.
@@ -154,10 +158,25 @@ pub struct AppBoxLoader<Handler: AppBoxTrapHandler> {
     entry_point: u64,
     // Starting stack pointer.
     stack_pointer: u64,
-    // Address of thread local storage.
-    tls: u64,
 
-    handler: RefCell<Handler>,
+    handler: Arc<Mutex<Handler>>,
+}
+
+// Can't derive(Clone) due to https://github.com/rust-lang/rust/issues/26925.
+impl<Handler: AppBoxTrapHandler> Clone for AppBoxLoader<Handler> {
+    fn clone(&self) -> Self {
+        Self {
+            executable: self.executable.clone(),
+            arguments: self.arguments.clone(),
+            environment: self.environment.clone(),
+            shared_cache: self.shared_cache.clone(),
+            mh: self.mh,
+            mappings: self.mappings.clone(),
+            entry_point: self.entry_point,
+            stack_pointer: self.stack_pointer,
+            handler: self.handler.clone(),
+        }
+    }
 }
 
 impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
@@ -165,7 +184,7 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
         executable: &Path,
         argv: &[String],
         envp: &[String],
-        handler: RefCell<Handler>,
+        handler: Arc<Mutex<Handler>>,
     ) -> anyhow::Result<Self> {
         // TODO: parse macho, check for arm64 and error accordingly.
         // Basically do the macho parsing from load_macho here.
@@ -178,7 +197,6 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
             mappings: vec![],
             entry_point: 0,
             stack_pointer: 0,
-            tls: 0,
             handler,
         })
     }
@@ -553,16 +571,6 @@ impl<Handler: AppBoxTrapHandler> Loader for AppBoxLoader<Handler> {
     type GD = GlobalData;
 
     fn map(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<()> {
-        let tls = self
-            .new_mapping(
-                executor,
-                0x10000,
-                &[MapOption::MapReadable, MapOption::MapWritable],
-            )
-            .map_err(|e| hyperpom::error::MemoryError::Generic(e.to_string()))?;
-        self.tls = tls.data() as _;
-        trace!("tls_page = 0x{:x}", self.tls);
-
         self.load_macho(executor, &self.executable.clone())
             .map_err(|e| hyperpom::error::MemoryError::Generic(e.to_string()))?;
         self.setup_stack(executor)
@@ -583,16 +591,10 @@ impl<Handler: AppBoxTrapHandler> Loader for AppBoxLoader<Handler> {
     fn pre_exec(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<ExitKind> {
         debug!("Entry point: {:x}", self.entry_point);
         debug!("Stack pointer: {:x}", self.stack_pointer);
-        // TODO: pthread_init writes to tpidrro_el0 - 0xe0.
-        // How is TLS actually mapped?
-        debug!("TLS: {:x}", self.tls + 0x8000);
         executor.vcpu.set_reg(av::Reg::PC, self.entry_point)?;
         executor
             .vcpu
             .set_sys_reg(av::SysReg::SP_EL0, self.stack_pointer)?;
-        executor
-            .vcpu
-            .set_sys_reg(av::SysReg::TPIDRRO_EL0, self.tls + 0x8000)?;
         Ok(ExitKind::Continue)
     }
 
@@ -664,7 +666,8 @@ impl<Handler: AppBoxTrapHandler> Loader for AppBoxLoader<Handler> {
         _gdata: &std::sync::RwLock<Self::GD>,
     ) -> Result<ExitKind> {
         self.handler
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .trap_handler(vcpu, vma, &ldata.load_info)
     }
 }
