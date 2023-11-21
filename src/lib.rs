@@ -96,7 +96,18 @@ impl<Handler: AppBoxTrapHandler> AppBox<Handler> {
             .set_reg(hyperpom::applevisor::Reg::LR, 0xdeadf000)
             .unwrap();
 
-        executor.run(None)
+        let result = executor.run(None);
+        if result.is_err() {
+            debug!("pc: 0x{:x}", executor.vcpu.get_reg(av::Reg::PC).unwrap());
+            debug!("lr: 0x{:x}", executor.vcpu.get_reg(av::Reg::LR).unwrap());
+            for stack_off in 0..0x100 {
+                let stack_val = executor
+                    .vma
+                    .read_qword(executor.vcpu.get_sys_reg(av::SysReg::SP_EL0)? + stack_off * 8)?;
+                debug!("stack[0x{:x}] = 0x{:x}", stack_off * 8, stack_val);
+            }
+        }
+        result
     }
 }
 
@@ -113,13 +124,6 @@ pub struct GlobalData;
 #[derive(Clone, Default)]
 pub struct LocalData {
     pub load_info: LoadInfo,
-}
-
-fn pthread_hook(args: &mut hooks::HookArgs<LocalData, GlobalData>) -> Result<ExitKind> {
-    debug!("pthread token == 0 hook");
-    args.vcpu
-        .set_reg(av::Reg::PC, args.vcpu.get_reg(av::Reg::PC).unwrap() + 4)?;
-    Ok(ExitKind::Continue)
 }
 
 fn objc_restartable_ranges_hook(
@@ -453,12 +457,23 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
          *
          *      Where arg[i] and env[i] point into the STRING AREA
          */
-
-        // From darling loader:
-        // TODO: produce stack_guard, e.g. stack_guard=0xcdd5c48c061b00fd (must contain 00 somewhere!)
-        // TODO: produce malloc_entropy, e.g. malloc_entropy=0x9536cc569d9595cf,0x831942e402da316b
-        // TODO: produce main_stack?
-        let applep = vec![self.executable.to_str().unwrap().to_string()];
+        let applep = vec![
+            // TODO: this should be absolute path
+            format!("executable_path={}", self.executable.to_str().unwrap()),
+            // Numbers are whatever a test program happened to be launched with.
+            //format!("pfz=0x{:x}", 0xfff7bc000u32),
+            //format!("stack_guard=0x{:x}", 0xfaf7ad82aef8002bu64),
+            //format!("malloc_entropy=0x{:x},0x{:x}", 0x90ccd126cb1ecd9u64, 0x51cba845df4738d5u64),
+            format!("ptr_munge=0x{:x}", 0x44a5acc71e7f7fa2u64),
+            //format!("main_stack=0x16fe00000,0x7fc000,0x16be00000,0x4000000"),
+            //format!("executable_file=0x1a01000010,0x6e441eb"),
+            //format!("dyld_file=0x1a01000010,0xfffffff000993c7"),
+            //format!("executable_cdhash=ebae22199a9f34b644cf95cfb9c1112a78d5f921"),
+            //format!("executable_boothash=099dd72229ca32cc646fbb086bd81fd465476d63"),
+            //format!("arm64e_abi=os"),
+            //format!("th_port=0x103"),
+        ];
+        trace!("applep = {:?}", applep);
 
         let total_len = self.arguments.iter().map(|s| s.len() + 1).sum::<usize>()
             + self.environment.iter().map(|s| s.len() + 1).sum::<usize>()
@@ -483,8 +498,7 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
         let stack_size_in_ptrs = stack.len() / std::mem::size_of::<*const u8>();
 
         // Number of pointers required at the top of the stack for the above described layout.
-        let stack_top_offset =
-            1 + 1 + self.arguments.len() + 1 + self.environment.len() + 1 + applep.len() + 1;
+        let stack_top_offset = 1 /*mh*/ + 1 /*argc*/ + self.arguments.len() + 1 + self.environment.len() + 1 + applep.len() + 1;
 
         // Pointer to where the first pointer will be stored.
         // TODO: it would be nice to use a vec-like thing here so we don't have to keep adjusting the slice.
@@ -502,14 +516,14 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
             strings_ptr[0..arg.len()].copy_from_slice(arg.as_bytes());
             strings_ptr = &mut strings_ptr[arg.len() + 1..];
         }
-        stack_ptrs = &mut stack_ptrs[self.arguments.len()..];
+        stack_ptrs = &mut stack_ptrs[self.arguments.len() + 1..];
 
         for (i, env) in self.environment.iter().enumerate() {
             stack_ptrs[i] = strings_ptr.as_ptr();
             strings_ptr[0..env.len()].copy_from_slice(env.as_bytes());
             strings_ptr = &mut strings_ptr[env.len() + 1..];
         }
-        stack_ptrs = &mut stack_ptrs[self.environment.len()..];
+        stack_ptrs = &mut stack_ptrs[self.environment.len() + 1..];
 
         for (i, apple) in applep.iter().enumerate() {
             stack_ptrs[i] = strings_ptr.as_ptr();
@@ -614,11 +628,6 @@ impl<Handler: AppBoxTrapHandler> Loader for AppBoxLoader<Handler> {
     }
 
     fn hooks(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<()> {
-        // TODO: fix up applep so we don't need this
-        executor.add_custom_hook(
-            self.shared_cache.base_address() as u64 + 0x3f9df8,
-            pthread_hook,
-        );
         // TODO: figure out where the actual call to set restartable ranges is
         // and intercept that syscall instead
         executor.add_custom_hook(
