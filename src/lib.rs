@@ -126,15 +126,6 @@ pub struct LocalData {
     pub load_info: LoadInfo,
 }
 
-fn objc_restartable_ranges_hook(
-    args: &mut hooks::HookArgs<LocalData, GlobalData>,
-) -> Result<ExitKind> {
-    let pc = args.vcpu.get_reg(av::Reg::PC).unwrap();
-    debug!("objc task_restartable_ranges_register hook: PC=0x{:x}", pc);
-    args.vcpu.set_reg(av::Reg::PC, pc + (0x5e570 - 0x5e554))?; // This is good for macOS 13.5.1.
-    Ok(ExitKind::Continue)
-}
-
 #[derive(Clone)]
 struct Mmap(Rc<MemoryMap>);
 unsafe impl Send for Mmap {}
@@ -628,13 +619,6 @@ impl<Handler: AppBoxTrapHandler> Loader for AppBoxLoader<Handler> {
     }
 
     fn hooks(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<()> {
-        // TODO: figure out where the actual call to set restartable ranges is
-        // and intercept that syscall instead
-        executor.add_custom_hook(
-            self.shared_cache.base_address() as u64 + 0x5e554,
-            objc_restartable_ranges_hook,
-        );
-
         Ok(())
     }
 
