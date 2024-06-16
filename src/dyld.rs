@@ -189,6 +189,51 @@ impl SharedCache {
                             }
                         }
                     }
+                    5 => {
+                        let sib = {
+                            let mut buf: Vec<u8> = vec![0; mapping_info.slideInfoFileSize as usize];
+                            cache.read_exact_at(&mut buf, mapping_info.slideInfoFileOffset)?;
+                            buf
+                        };
+                        let slide_info: &dyld_cache_slide_info5 = unsafe {
+                            &*(sib.as_ptr() as *const _ as *const dyld_cache_slide_info5)
+                        };
+                        for (i, &delta) in unsafe {
+                            slide_info
+                                .page_starts
+                                .as_slice(slide_info.page_starts_count as _)
+                        }
+                        .iter()
+                        .enumerate()
+                        {
+                            let mut delta = delta;
+                            if delta == DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE as _ {
+                                continue;
+                            }
+                            // https://github.com/apple-oss-distributions/dyld/blob/d552c40cd1de105f0ec95008e0e0c0972de43456/cache-builder/dyld_cache_format.h#L504
+                            delta /= std::mem::size_of::<u64>() as u16;
+                            let page_start: *mut u8 =
+                                unsafe { mapping.data().add(i * slide_info.page_size as usize) };
+                            let mut loc: *mut dyld_cache_slide_pointer5 = page_start as _;
+                            loop {
+                                unsafe {
+                                    loc = loc.add(delta as _);
+                                    let locref: &mut dyld_cache_slide_pointer5 = &mut *loc;
+                                    delta = locref.regular.next() as _;
+                                    let mut new_value = locref.regular.runtimeOffset()
+                                        + slide_info.value_add
+                                        + self.slide as u64;
+                                    if locref.auth.auth() == 0 {
+                                        new_value = new_value | (locref.regular.high8() << 56);
+                                    }
+                                    locref.raw = new_value;
+                                    if delta == 0 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     _ => {
                         bail!(format!("unsupported slide version {}", slide_version))
                     }
