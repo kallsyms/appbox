@@ -145,7 +145,7 @@ pub struct AppBoxLoader<Handler: AppBoxTrapHandler> {
 
     // Address to next be "allocated" by new_mapping.
     // Used to ensure that mappings are allocated at deterministic addresses.
-    map_fixed_last: usize,
+    map_fixed_next: usize,
     // Vec of all mappings made by the loader (incl. stack, commpage, etc.).
     // N.B. Needs to use a newtype which is Send.
     mappings: Vec<Mmap>,
@@ -169,7 +169,7 @@ impl<Handler: AppBoxTrapHandler> Clone for AppBoxLoader<Handler> {
             environment: self.environment.clone(),
             shared_cache: self.shared_cache.clone(),
             mh: self.mh,
-            map_fixed_last: self.map_fixed_last,
+            map_fixed_next: self.map_fixed_next,
             mappings: self.mappings.clone(),
             entry_point: self.entry_point,
             stack_pointer: self.stack_pointer,
@@ -193,7 +193,7 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
             environment: envp.to_owned(),
             shared_cache: dyld::SharedCache::new_system_cache()?,
             mh: 0,
-            map_fixed_last: 0x4_0000_0000, // Any address >= 0x4_0000_0000 should be fine.
+            map_fixed_next: 0x4_0000_0000, // Any address >= 0x4_0000_0000 should be fine.
             mappings: vec![],
             entry_point: 0,
             stack_pointer: 0,
@@ -226,10 +226,10 @@ impl<Handler: AppBoxTrapHandler> AppBoxLoader<Handler> {
             _ => false,
         });
         if !has_fixed {
-            options.push(MapOption::MapAddr(self.map_fixed_last as _));
+            options.push(MapOption::MapAddr(self.map_fixed_next as _));
         }
         let mapping = Rc::new(MemoryMap::new(size, &options)?);
-        self.map_fixed_last += mapping.len();
+        self.map_fixed_next += mapping.len();
         self.mappings.push(Mmap(mapping.clone()));
         self.map_1to1(executor, &mapping)?;
         Ok(mapping)
