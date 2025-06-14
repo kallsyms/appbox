@@ -60,9 +60,21 @@ fn handle_connection(
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut writer = stream;
 
-    // GDB remote protocol starts with an ack
-    trace!("GDB: Sending ack");
-    writer.write_all(b"+").unwrap();
+    let mut no_ack_mode = false;
+
+    let mut handshake = [0; 1];
+    if reader.read_exact(&mut handshake).is_err() {
+        trace!("GDB: Connection closed during handshake");
+        return;
+    }
+
+    if &handshake == b"+" {
+        trace!("GDB: Handshake successful, sending ack");
+        writer.write_all(b"+").unwrap();
+    } else {
+        trace!("GDB: Handshake failed");
+        return;
+    }
 
     loop {
         let mut packet = Vec::new();
@@ -98,11 +110,17 @@ fn handle_connection(
             let calculated_checksum = data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
 
             if calculated_checksum == received_checksum {
-                trace!("GDB: Checksum correct, sending ack");
-                writer.write_all(b"+").unwrap();
+                if !no_ack_mode {
+                    trace!("GDB: Checksum correct, sending ack");
+                    writer.write_all(b"+").unwrap();
+                }
                 let command_str = std::str::from_utf8(data).unwrap();
                 trace!("GDB: Received command: {}", command_str);
-                if command_str == "c" {
+                if command_str == "QStartNoAckMode" {
+                    trace!("GDB: Entering No-Ack mode");
+                    no_ack_mode = true;
+                    writer.write_all(b"$OK#00").unwrap();
+                } else if command_str == "c" {
                     command_sender.send(GdbCommand::Continue).unwrap();
                 } else if command_str.starts_with("Z0,") {
                     let parts: Vec<&str> = command_str[3..].split(',').collect();
