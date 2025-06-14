@@ -1,0 +1,11 @@
+[package]
+name = "example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+appbox = {path = "../"}
+clap = "4.5.40"
+clap-verbosity-flag = "3.0.3"
+hyperpom = { git = "https://github.com/kallsyms/hyperpom" }
+log = "0.4.27"

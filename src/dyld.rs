@@ -1,6 +1,5 @@
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::os::macos::fs::MetadataExt;
 use std::os::unix::prelude::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -71,28 +70,28 @@ impl SharedCache {
         };
         cache.map_single_cache(cache_path)?;
 
-        let dyndata_mapping = MemoryMap::new(
-            std::mem::size_of::<dyld_cache_dynamic_data_header>(),
-            &[
-                MapOption::MapReadable,
-                MapOption::MapWritable,
-                MapOption::MapAddr(unsafe {
-                    cache
-                        .base_address()
-                        .add(cache_header.dynamicDataOffset as _)
-                }),
-            ],
-        )?;
+        // let dyndata_mapping = MemoryMap::new(
+        //     std::mem::size_of::<dyld_cache_dynamic_data_header>(),
+        //     &[
+        //         MapOption::MapReadable,
+        //         MapOption::MapWritable,
+        //         MapOption::MapAddr(unsafe {
+        //             cache
+        //                 .base_address()
+        //                 .add(cache_header.dynamicDataOffset as _)
+        //         }),
+        //     ],
+        // )?;
 
-        let dyndata: *mut dyld_cache_dynamic_data_header = dyndata_mapping.data() as _;
-        let stat = std::fs::metadata(cache_path)?;
-        unsafe {
-            (*dyndata).magic = std::mem::transmute(*DYLD_SHARED_CACHE_DYNAMIC_DATA_MAGIC);
-            (*dyndata).fsId = stat.st_dev();
-            (*dyndata).fsObjId = stat.st_ino();
-        }
+        // let dyndata: *mut dyld_cache_dynamic_data_header = dyndata_mapping.data() as _;
+        // let stat = std::fs::metadata(cache_path)?;
+        // unsafe {
+        //     (*dyndata).magic = std::mem::transmute(*DYLD_SHARED_CACHE_DYNAMIC_DATA_MAGIC);
+        //     (*dyndata).fsId = stat.st_dev();
+        //     (*dyndata).fsObjId = stat.st_ino();
+        // }
 
-        cache.mappings.push(Rc::new(dyndata_mapping));
+        // cache.mappings.push(Rc::new(dyndata_mapping));
 
         debug!("shared cache loaded");
 

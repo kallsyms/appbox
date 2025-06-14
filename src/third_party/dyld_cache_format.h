@@ -1,4 +1,4 @@
-// https://github.com/apple-oss-distributions/dyld/blob/d552c40cd1de105f0ec95008e0e0c0972de43456/cache-builder/dyld_cache_format.h#L339
+// https://raw.githubusercontent.com/apple-oss-distributions/dyld/93bd81f9d7fcf004fcebcb66ec78983882b41e71/include/mach-o/dyld_cache_format.h
 /* -*- mode: C++; c-basic-offset: 4; tab-width: 4 -*-
  *
  * Copyright (c) 2006-2015 Apple Inc. All rights reserved.
@@ -26,7 +26,6 @@
 #define __DYLD_CACHE_FORMAT__
 
 #include <stdint.h>
-#include <uuid/uuid.h>
 
 #include <mach-o/fixup-chains.h>
 
@@ -66,7 +65,8 @@ struct dyld_cache_header
         simulator : 1,                      // for simulator of specified platform
         locallyBuiltCache : 1,              // 0 for B&I built cache, 1 for locally built cache
         builtFromChainedFixups : 1,         // some dylib in cache was built using chained fixups, so patch tables must be used for overrides
-        padding : 20;                       // TBD
+        newFormatTLVs : 1,                  // TLVs have been set by cache builder as new format (not needing runtime side table)
+        padding : 19;                       // TBD
     uint64_t sharedRegionStart;             // base load address of cache if not slid
     uint64_t sharedRegionSize;              // overall size required to map the cache and all subCaches, if any
     uint64_t maxSlide;                      // runtime slide of cache can be between zero and this value
@@ -86,27 +86,33 @@ struct dyld_cache_header
     uint64_t programsPBLSetPoolSize;        // size of pool of PrebuiltLoaderSet for each program
     uint64_t programTrieAddr;               // (unslid) address of trie mapping program path to PrebuiltLoaderSet
     uint32_t programTrieSize;
-    uint32_t osVersion;            // OS Version of dylibs in this cache for the main platform
-    uint32_t altPlatform;          // e.g. iOSMac on macOS
-    uint32_t altOsVersion;         // e.g. 14.0 for iOSMac
-    uint64_t swiftOptsOffset;      // VM offset from cache_header* to Swift optimizations header
-    uint64_t swiftOptsSize;        // size of Swift optimizations header
-    uint32_t subCacheArrayOffset;  // file offset to first dyld_subcache_entry
-    uint32_t subCacheArrayCount;   // number of subCache entries
-    uint8_t symbolFileUUID[16];    // unique value for the shared cache file containing unmapped local symbols
-    uint64_t rosettaReadOnlyAddr;  // (unslid) address of the start of where Rosetta can add read-only/executable data
-    uint64_t rosettaReadOnlySize;  // maximum size of the Rosetta read-only/executable region
-    uint64_t rosettaReadWriteAddr; // (unslid) address of the start of where Rosetta can add read-write data
-    uint64_t rosettaReadWriteSize; // maximum size of the Rosetta read-write region
-    uint32_t imagesOffset;         // file offset to first dyld_cache_image_info
-    uint32_t imagesCount;          // number of dyld_cache_image_info entries
-    uint32_t cacheSubType;         // 0 for development, 1 for production, when cacheType is multi-cache(2)
-    uint64_t objcOptsOffset;       // VM offset from cache_header* to ObjC optimizations header
-    uint64_t objcOptsSize;         // size of ObjC optimizations header
-    uint64_t cacheAtlasOffset;     // VM offset from cache_header* to embedded cache atlas for process introspection
-    uint64_t cacheAtlasSize;       // size of embedded cache atlas
-    uint64_t dynamicDataOffset;    // VM offset from cache_header* to the location of dyld_cache_dynamic_data_header
-    uint64_t dynamicDataMaxSize;   // maximum size of space reserved from dynamic data
+    uint32_t osVersion;               // OS Version of dylibs in this cache for the main platform
+    uint32_t altPlatform;             // e.g. iOSMac on macOS
+    uint32_t altOsVersion;            // e.g. 14.0 for iOSMac
+    uint64_t swiftOptsOffset;         // VM offset from cache_header* to Swift optimizations header
+    uint64_t swiftOptsSize;           // size of Swift optimizations header
+    uint32_t subCacheArrayOffset;     // file offset to first dyld_subcache_entry
+    uint32_t subCacheArrayCount;      // number of subCache entries
+    uint8_t symbolFileUUID[16];       // unique value for the shared cache file containing unmapped local symbols
+    uint64_t rosettaReadOnlyAddr;     // (unslid) address of the start of where Rosetta can add read-only/executable data
+    uint64_t rosettaReadOnlySize;     // maximum size of the Rosetta read-only/executable region
+    uint64_t rosettaReadWriteAddr;    // (unslid) address of the start of where Rosetta can add read-write data
+    uint64_t rosettaReadWriteSize;    // maximum size of the Rosetta read-write region
+    uint32_t imagesOffset;            // file offset to first dyld_cache_image_info
+    uint32_t imagesCount;             // number of dyld_cache_image_info entries
+    uint32_t cacheSubType;            // 0 for development, 1 for production, when cacheType is multi-cache(2)
+    uint64_t objcOptsOffset;          // VM offset from cache_header* to ObjC optimizations header
+    uint64_t objcOptsSize;            // size of ObjC optimizations header
+    uint64_t cacheAtlasOffset;        // VM offset from cache_header* to embedded cache atlas for process introspection
+    uint64_t cacheAtlasSize;          // size of embedded cache atlas
+    uint64_t dynamicDataOffset;       // VM offset from cache_header* to the location of dyld_cache_dynamic_data_header
+    uint64_t dynamicDataMaxSize;      // maximum size of space reserved from dynamic data
+    uint32_t tproMappingsOffset;      // file offset to first dyld_cache_tpro_mapping_info
+    uint32_t tproMappingsCount;       // number of dyld_cache_tpro_mapping_info entries
+    uint64_t functionVariantInfoAddr; // (unslid) address of dyld_cache_function_variant_info
+    uint64_t functionVariantInfoSize; // Size of all of the variant information pointed to via the dyld_cache_function_variant_info
+    uint64_t prewarmingDataOffset;    // file offset to dyld_prewarming_header
+    uint64_t prewarmingDataSize;      // byte size of prewarming data
 };
 
 // Uncomment this and check the build errors for the current mapping offset to check against when adding new fields.
@@ -129,6 +135,8 @@ enum
     DYLD_CACHE_MAPPING_CONST_DATA = 1 << 2U,
     DYLD_CACHE_MAPPING_TEXT_STUBS = 1 << 3U,
     DYLD_CACHE_DYNAMIC_CONFIG_DATA = 1 << 4U,
+    DYLD_CACHE_READ_ONLY_DATA = 1 << 5U,
+    DYLD_CACHE_MAPPING_CONST_TPRO_DATA = 1 << 6U,
 };
 
 struct dyld_cache_mapping_and_slide_info
@@ -141,6 +149,12 @@ struct dyld_cache_mapping_and_slide_info
     uint64_t flags;
     uint32_t maxProt;
     uint32_t initProt;
+};
+
+struct dyld_cache_tpro_mapping_info
+{
+    uint64_t unslidAddress;
+    uint64_t size;
 };
 
 struct dyld_cache_image_info
@@ -205,7 +219,7 @@ struct dyld_cache_accelerator_dof
 
 struct dyld_cache_image_text_info
 {
-    uuid_t uuid;
+    uint8_t uuid[16];
     uint64_t loadAddress; // unslid address of start of __TEXT
     uint32_t textSegmentSize;
     uint32_t pathOffset; // offset from start of cache file
@@ -569,13 +583,44 @@ struct dyld_subcache_entry
     char fileSuffix[32];    // The file name suffix of the subCache file e.g. ".25.data", ".03.development"
 };
 
-// This struct is a small piece of dynamic data that can be included in the shared region, and contains configuration
-// data about the shared cache in use by the process. It is located
-struct dyld_cache_dynamic_data_header
+struct dyld_cache_function_variant_entry
 {
-    char magic[16];   // e.g. "dyld_data    v0"
-    uint64_t fsId;    // The fsid_t of the shared cache being used by a process
-    uint64_t fsObjId; // The fs_obj_id_t of the shared cache being used by a process
+    uint64_t fixupLocVmAddr;             // location of pointer that needs to be re-bound (unslid)
+    uint64_t functionVariantTableVmAddr; // location of FunctionVariants in LINKEDIT (unslid)
+    uint64_t dylibHeaderVmAddr;          // location of mach_heaer of dylib that implements this function variant
+    uint32_t variantIndex : 12,          // index into FunctionVariants (target of this fixup)
+        pacAuth : 1,                     // PAC signed or not
+        pacAddress : 1,
+        pacKey : 2,
+        pacDiversity : 16;
+    uint16_t targetDylibIndex;             // which dylib has the function variant
+    uint16_t functionVariantTableSizeDiv4; // size of FunctionVariants in LINKEDIT (unslid) divided by 4
+};
+
+struct dyld_cache_function_variant_info
+{
+    uint32_t version; // == 1 for now
+    uint32_t count;   // number of elements in entries array
+    struct dyld_cache_function_variant_entry entries[0];
+};
+
+#define DYLD_CACHE_PREWARMING_DATA_PAGE_SIZE 0x4000 // 16k pages
+
+// Prewarming data entries for hot pages
+struct dyld_prewarming_entry
+{
+    uint64_t cacheVMOffset : 40; // up to 1TB caches
+    uint64_t numPages : 24;      // assumes 16k pages (DYLD_CACHE_PREWARMING_DATA_PAGE_SIZE)
+};
+
+// Prewarming data header for hot pages
+struct dyld_prewarming_header
+{
+    uint32_t version;
+    uint32_t count;
+
+    // Followed by an array of dyld_prewarming_entry
+    struct dyld_prewarming_entry entries[0];
 };
 
 // This is the  location of the macOS shared cache on macOS 11.0 and later
@@ -596,8 +641,6 @@ struct dyld_cache_dynamic_data_header
 #define DYLD_SHARED_CACHE_BASE_NAME "dyld_sim_shared_cache_"
 #endif
 #define DYLD_SHARED_CACHE_DEVELOPMENT_EXT ".development"
-
-#define DYLD_SHARED_CACHE_DYNAMIC_DATA_MAGIC "dyld_data    v0"
 
 static const char *cryptexPrefixes[] = {
     "/System/Volumes/Preboot/Cryptexes/OS/",
