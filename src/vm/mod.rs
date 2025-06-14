@@ -2,6 +2,8 @@ use self::hooks::Hooks;
 use anyhow::Result;
 use hyperpom::applevisor as av;
 use hyperpom::memory::{PhysMemAllocator, VirtMemAllocator};
+use mmap_fixed_fixed::MemoryMap;
+use std::rc::Rc;
 
 pub mod hooks;
 
@@ -10,6 +12,7 @@ pub struct VmManager {
     pub vcpu: av::Vcpu,
     pub vma: VirtMemAllocator,
     pub hooks: Hooks,
+    pub(crate) mappings: Vec<Rc<MemoryMap>>,
 }
 
 impl VmManager {
@@ -25,6 +28,7 @@ impl VmManager {
             vcpu,
             vma,
             hooks,
+            mappings: Vec::new(),
         })
     }
 }

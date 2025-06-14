@@ -39,11 +39,11 @@ fn main() -> Result<(), anyhow::Error> {
 
     let mut vm = VmManager::new()?;
 
-    let load_info = appbox::loader::load_macho(&mut vm, &PathBuf::from(args.executable))?;
+    let loader = appbox::loader::load_macho(&mut vm, &PathBuf::from(args.executable))?;
 
-    vm.vcpu.set_reg(av::Reg::PC, load_info.entry_point)?;
+    vm.vcpu.set_reg(av::Reg::PC, loader.entry_point)?;
     vm.vcpu
-        .set_sys_reg(av::SysReg::SP_EL0, load_info.stack_pointer)?;
+        .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)?;
 
     let (command_sender, command_receiver) = std::sync::mpsc::channel();
     let (response_sender, response_receiver) = std::sync::mpsc::channel();

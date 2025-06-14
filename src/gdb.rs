@@ -102,7 +102,7 @@ const TARGET_XML: &str = r#"<target version="1.0">
 fn send_packet(writer: &mut TcpStream, data: &str) {
     let checksum = data.bytes().fold(0u8, |acc, b| acc.wrapping_add(b));
     let response = format!("${}#{:02x}", data, checksum);
-    trace!("GDB: Sending packet: {}", response);
+    trace!("Sending packet: {}", response);
     writer.write_all(response.as_bytes()).unwrap();
 }
 
@@ -120,14 +120,14 @@ fn handle_connection(
     // GDB handshake
     let mut handshake = [0; 1];
     if reader.read_exact(&mut handshake).is_err() {
-        trace!("GDB: Connection closed during handshake");
+        trace!("Connection closed during handshake");
         return;
     }
     if &handshake != b"+" {
-        trace!("GDB: Handshake failed");
+        trace!("Handshake failed");
         return;
     }
-    trace!("GDB: Handshake successful, sending ack");
+    trace!("Handshake successful, sending ack");
     writer.write_all(b"+").unwrap();
 
     let mut buffer = Vec::new();
@@ -135,7 +135,7 @@ fn handle_connection(
         let mut read_buf = [0; 1024];
         match reader.read(&mut read_buf) {
             Ok(0) => {
-                trace!("GDB: Connection closed");
+                trace!("Connection closed");
                 break;
             }
             Ok(n) => {
@@ -156,12 +156,12 @@ fn handle_connection(
 
             match current_buffer[0] {
                 b'+' => {
-                    trace!("GDB: Received ack");
+                    trace!("Received ack");
                     processed_bytes += 1;
                     continue;
                 }
                 b'-' => {
-                    trace!("GDB: Received nack");
+                    trace!("Received nack");
                     processed_bytes += 1;
                     continue;
                 }
@@ -179,11 +179,11 @@ fn handle_connection(
 
                                 if calculated_checksum == received_checksum {
                                     if !no_ack_mode {
-                                        trace!("GDB: Checksum correct, sending ack");
+                                        trace!("Checksum correct, sending ack");
                                         writer.write_all(b"+").unwrap();
                                     }
                                     let command_str = std::str::from_utf8(packet_data).unwrap();
-                                    trace!("GDB: Received command: {}", command_str);
+                                    trace!("Received command: {}", command_str);
 
                                     let core_command = command_str.split(';').next().unwrap_or("");
 
@@ -193,7 +193,7 @@ fn handle_connection(
                                             "PacketSize=4000;swbreak+;hwbreak+;qXfer:features:read+;QStartNoAckMode+",
                                         );
                                     } else if command_str == "QStartNoAckMode" {
-                                        trace!("GDB: Entering No-Ack mode");
+                                        trace!("Entering No-Ack mode");
                                         no_ack_mode = true;
                                         send_packet(&mut writer, "OK");
                                     } else if command_str == "qC" {
@@ -360,12 +360,6 @@ fn handle_connection(
                                         || core_command == "QEnableErrorStrings"
                                     {
                                         send_packet(&mut writer, "OK");
-                                    } else if core_command == "vCont?"
-                                        || core_command == "jThreadsInfo"
-                                        || core_command == "qStructuredDataPlugins"
-                                        || core_command == "qShlibInfoAddr"
-                                    {
-                                        send_packet(&mut writer, "");
                                     } else if core_command == "c" {
                                         command_sender.send(GdbCommand::Continue).unwrap();
                                     } else if core_command.starts_with("Z0,") {
@@ -386,7 +380,7 @@ fn handle_connection(
                                                     .unwrap()
                                                 {
                                                     GdbResponse::Ok => {
-                                                        trace!("GDB: Sending OK");
+                                                        trace!("Sending OK");
                                                         send_packet(&mut writer, "OK");
                                                     }
                                                     GdbResponse::Error(e) => {
@@ -396,16 +390,19 @@ fn handle_connection(
                                                     _ => {}
                                                 }
                                             } else {
-                                                trace!("GDB: Malformed Z0 command");
+                                                trace!("Malformed Z0 command");
                                                 send_packet(&mut writer, "E01");
                                             }
                                         } else {
-                                            trace!("GDB: Malformed Z0 command");
+                                            trace!("Malformed Z0 command");
                                             send_packet(&mut writer, "E01");
                                         }
+                                    } else {
+                                        trace!("Unhandled GDB command: {}", core_command);
+                                        send_packet(&mut writer, "");
                                     }
                                 } else {
-                                    trace!("GDB: Checksum incorrect, sending nack");
+                                    trace!("Checksum incorrect, sending nack");
                                     writer.write_all(b"-").unwrap();
                                 }
                             }

@@ -11,31 +11,20 @@ use std::rc::Rc;
 
 use hyperpom::applevisor as av;
 
-pub struct LoadInfo {
-    pub entry_point: u64,
-    pub stack_pointer: u64,
-    pub shared_cache_base: u64,
-}
-
-pub fn load_macho(vm: &mut VmManager, executable: &Path) -> Result<LoadInfo> {
+pub fn load_macho(vm: &mut VmManager, executable: &Path) -> Result<Loader> {
     let mut loader = Loader::new(executable)?;
     loader.load_macho_recursive(vm, executable)?;
     loader.setup_stack(vm)?;
     loader.setup_commpage(vm)?;
 
-    Ok(LoadInfo {
-        entry_point: loader.entry_point,
-        stack_pointer: loader.stack_pointer,
-        shared_cache_base: 0, // Not supported yet
-    })
+    Ok(loader)
 }
 
-struct Loader {
+pub struct Loader {
     executable: PathBuf,
-    entry_point: u64,
-    stack_pointer: u64,
+    pub entry_point: u64,
+    pub stack_pointer: u64,
     map_fixed_next: usize,
-    mappings: Vec<Rc<MemoryMap>>,
     mh: u64,
 }
 
@@ -46,7 +35,6 @@ impl Loader {
             entry_point: 0,
             stack_pointer: 0,
             map_fixed_next: 0x4_0000_0000,
-            mappings: vec![],
             mh: 0,
         })
     }
@@ -64,12 +52,14 @@ impl Loader {
         }
         let mapping = Rc::new(MemoryMap::new(size, &options)?);
         self.map_fixed_next += mapping.len();
-        self.mappings.push(mapping.clone());
+        vm.mappings.push(mapping.clone());
         vm.vma
             .map_1to1(mapping.data() as _, mapping.len(), av::MemPerms::RWX)?;
         Ok(mapping)
     }
 
+    // Based on darling's mldr
+    // https://github.com/darlinghq/darling/blob/fbcd182dfbadab5076b6a41c21688d9c53a29cc4/src/startup/mldr/loader.c#L50
     fn load_macho_recursive(&mut self, vm: &mut VmManager, path: &Path) -> Result<()> {
         debug!("loading mach-o {}", path.display());
 
