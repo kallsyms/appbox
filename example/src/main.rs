@@ -1,6 +1,12 @@
-use appbox::VmManager;
 use clap::Parser;
+use log::{info, warn};
 use std::path::PathBuf;
+
+use appbox::applevisor as av;
+use appbox::hyperpom::crash::ExitKind;
+use appbox::hyperpom::error::ExceptionError;
+use appbox::hyperpom::exceptions::ExceptionClass;
+use appbox::vm::VmManager;
 
 #[derive(Parser)]
 pub struct Args {
@@ -11,6 +17,10 @@ pub struct Args {
     #[clap(long)]
     pub gdb_port: Option<u16>,
 
+    /// Wait for gdb connection before running
+    #[clap(long)]
+    pub gdb_wait: bool,
+
     /// Target executable
     #[clap(required = true)]
     pub executable: String,
@@ -20,32 +30,47 @@ pub struct Args {
     pub arguments: Vec<String>,
 }
 
-fn main() {
+fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
 
-    let mut vm = VmManager::new();
+    env_logger::Builder::new()
+        .filter_level(args.verbose.log_level_filter())
+        .init();
 
-    let load_info = loader::load_macho(&mut vm, executable)?;
+    let mut vm = VmManager::new()?;
 
-    let (command_sender, command_receiver) = std::sync::mpsc::channel();
-    let (response_sender, response_receiver) = std::sync::mpsc::channel();
-
-    if let Some(port) = gdb_port {
-        gdb::start_gdb_server(port, command_sender, response_receiver)?;
-    }
+    let load_info = appbox::loader::load_macho(&mut vm, &PathBuf::from(args.executable))?;
 
     vm.vcpu.set_reg(av::Reg::PC, load_info.entry_point)?;
     vm.vcpu
         .set_sys_reg(av::SysReg::SP_EL0, load_info.stack_pointer)?;
 
+    let (command_sender, command_receiver) = std::sync::mpsc::channel();
+    let (response_sender, response_receiver) = std::sync::mpsc::channel();
+
+    if let Some(port) = args.gdb_port {
+        appbox::gdb::start_gdb_server(port, command_sender, response_receiver, None)?;
+        if args.gdb_wait {
+            info!("Waiting for GDB connection...");
+            loop {
+                if let Ok(cmd) = command_receiver.recv() {
+                    if let appbox::gdb::GdbCommand::Continue = cmd {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     loop {
         vm.vcpu.run()?;
-        if let Ok(cmd) = command_receiver.try_recv() {
+        while let Ok(cmd) = command_receiver.try_recv() {
             match cmd {
-                gdb::GdbCommand::AddBreakpoint { addr, .. } => {
+                appbox::gdb::GdbCommand::AddBreakpoint { addr, .. } => {
                     vm.hooks.add_breakpoint(addr, &mut vm.vma).unwrap();
-                    response_sender.send(gdb::GdbResponse::Ok).unwrap();
+                    response_sender.send(appbox::gdb::GdbResponse::Ok).unwrap();
                 }
+                appbox::gdb::GdbCommand::Continue => break,
             }
         }
 
@@ -53,11 +78,20 @@ fn main() {
         let exit_info = vm.vcpu.get_exit_info();
         let exit = match exit_info.reason {
             av::ExitReason::EXCEPTION => {
-                match ExceptionClass::from(exit.exception.syndrome >> 26) {
-                    ExceptionClass::HvcA64 => Self::handle_hvc(executor),
-                    ExceptionClass::BrkA64 => vm.hooks.handle(&mut vm.vcpu, &mut vm.vma),
+                match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
+                    ExceptionClass::HvcA64 => {
+                        let pc = vm.vcpu.get_reg(av::Reg::PC)?;
+                        println!("HVC call at {:#x}", pc);
+                        ExitKind::Continue
+                    }
+                    ExceptionClass::BrkA64 => {
+                        let pc = vm.vcpu.get_reg(av::Reg::PC)?;
+                        println!("Breakpoint hit at {:#x}", pc);
+                        vm.hooks.handle(&mut vm.vcpu, &mut vm.vma)?;
+                        ExitKind::Continue
+                    }
                     _ => Err(ExceptionError::UnimplementedException(
-                        exit.exception.syndrome,
+                        exit_info.exception.syndrome,
                     ))?,
                 }
             }
@@ -65,13 +99,13 @@ fn main() {
             av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
             av::ExitReason::UNKNOWN => panic!(
                 "Vcpu exited unexpectedly at address {:#x}",
-                self.vcpu.get_reg(av::Reg::PC)?
+                vm.vcpu.get_reg(av::Reg::PC)?
             ),
         };
 
         match exit {
             ExitKind::Continue => continue,
-            _ => break Ok(exit),
+            _ => break,
         };
     }
 

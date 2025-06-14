@@ -4,3 +4,8 @@ pub mod dyld_cache_format;
 pub mod gdb;
 pub mod loader;
 pub mod vm;
+
+pub extern crate hyperpom;
+pub mod applevisor {
+    pub use hyperpom::applevisor::*;
+}
