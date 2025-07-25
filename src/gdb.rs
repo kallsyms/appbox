@@ -524,6 +524,154 @@ fn send_packet(writer: &mut TcpStream, data: &str) {
     writer.write_all(response.as_bytes()).unwrap();
 }
 
+fn process_gdb_command(
+    command_str: &str,
+    writer: &mut TcpStream,
+    command_sender: &Sender<GdbCommand>,
+    response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
+    no_ack_mode: &mut bool,
+) {
+    let core_command = command_str.split(';').next().unwrap_or("");
+
+    if core_command.starts_with("qSupported") {
+        handle_qsupported(writer);
+    } else if command_str == "QStartNoAckMode" {
+        *no_ack_mode = handle_qstartnoackmode(writer);
+    } else if command_str == "qC" {
+        handle_qc(writer);
+    } else if command_str.starts_with("qXfer:features:read:target.xml") {
+        handle_qxfer_features(writer);
+    } else if command_str == "?" {
+        handle_status_query(writer);
+    } else if command_str == "qHostInfo" {
+        handle_qhostinfo(writer);
+    } else if command_str == "qProcessInfo" {
+        handle_qprocessinfo(writer);
+    } else if core_command == "qfThreadInfo" {
+        handle_qfthreadinfo(writer);
+    } else if core_command == "qsThreadInfo" {
+        handle_qsthreadinfo(writer);
+    } else if core_command == "g" {
+        handle_all_registers(writer, command_sender, response_receiver);
+    } else if core_command.starts_with('P') {
+        handle_register_write(writer, core_command, command_sender, response_receiver);
+    } else if core_command.starts_with('p') {
+        handle_register_read(writer, core_command, command_sender, response_receiver);
+    } else if core_command.starts_with('m') {
+        handle_memory_read(writer, core_command, command_sender, response_receiver);
+    } else if core_command.starts_with('M') {
+        handle_memory_write(writer, core_command, command_sender, response_receiver);
+    } else if core_command.starts_with('x') {
+        send_packet(writer, GDB_ERROR);
+    } else if core_command == "c" {
+        command_sender.send(GdbCommand::Continue).unwrap();
+    } else if core_command == "s" {
+        command_sender.send(GdbCommand::Step).unwrap();
+    } else if core_command == "QThreadSuffixSupported"
+        || core_command == "QListThreadsInStopReply"
+        || core_command == "qVAttachOrWaitSupported"
+        || core_command == "QEnableErrorStrings"
+    {
+        handle_thread_suffix_commands(writer);
+    } else if core_command.starts_with("Z0,") {
+        handle_breakpoint(writer, core_command, command_sender, response_receiver);
+    } else {
+        trace!("Unhandled GDB command: {}", core_command);
+        handle_unknown_command(writer);
+    }
+}
+
+fn process_packet(
+    current_buffer: &[u8],
+    writer: &mut TcpStream,
+    command_sender: &Sender<GdbCommand>,
+    response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
+    no_ack_mode: &mut bool,
+) -> Option<usize> {
+    match current_buffer[0] {
+        b'+' => {
+            trace!("Received ack");
+            Some(1)
+        }
+        b'-' => {
+            trace!("Received nack");
+            Some(1)
+        }
+        b'$' => {
+            if let Some(end_pos) = current_buffer.iter().position(|&b| b == b'#') {
+                if end_pos + 2 < current_buffer.len() {
+                    let packet_end = end_pos + 3;
+                    let packet_data = &current_buffer[1..end_pos];
+                    let checksum_bytes = &current_buffer[end_pos + 1..packet_end];
+
+                    let checksum_str = std::str::from_utf8(checksum_bytes).unwrap();
+                    if let Ok(received_checksum) = u8::from_str_radix(checksum_str, 16) {
+                        let calculated_checksum =
+                            packet_data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+
+                        if calculated_checksum == received_checksum {
+                            if !*no_ack_mode {
+                                trace!("Checksum correct, sending ack");
+                                writer.write_all(b"+").unwrap();
+                            }
+                            let command_str = std::str::from_utf8(packet_data).unwrap();
+                            trace!("Received command: {}", command_str);
+
+                            process_gdb_command(
+                                command_str,
+                                writer,
+                                command_sender,
+                                response_receiver,
+                                no_ack_mode,
+                            );
+                        } else {
+                            trace!("Checksum incorrect, sending nack");
+                            writer.write_all(b"-").unwrap();
+                        }
+                    }
+                    Some(packet_end)
+                } else {
+                    // Incomplete packet
+                    None
+                }
+            } else {
+                // Incomplete packet
+                None
+            }
+        }
+        _ => {
+            // Invalid start of packet
+            Some(1)
+        }
+    }
+}
+
+fn read_and_buffer_data(
+    reader: &mut BufReader<TcpStream>,
+    buffer: &mut Vec<u8>,
+) -> Result<bool, std::io::Error> {
+    let mut read_buf = [0; 1024];
+    match reader.read(&mut read_buf) {
+        Ok(0) => {
+            trace!("Connection closed");
+            Ok(false) // Connection closed
+        }
+        Ok(n) => {
+            buffer.extend_from_slice(&read_buf[..n]);
+            Ok(true) // Data read successfully
+        }
+        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+            // No data available, sleep briefly and continue
+            thread::sleep(Duration::from_millis(10));
+            Err(e)
+        }
+        Err(e) => {
+            warn!("GDB read error: {}", e);
+            Err(e)
+        }
+    }
+}
+
 fn handle_connection(
     stream: TcpStream,
     command_sender: Sender<GdbCommand>,
@@ -562,22 +710,20 @@ fn handle_connection(
             }
         }
         
-        let mut read_buf = [0; 1024];
-        match reader.read(&mut read_buf) {
-            Ok(0) => {
-                trace!("Connection closed");
+        match read_and_buffer_data(&mut reader, &mut buffer) {
+            Ok(false) => {
+                // Connection closed
                 break;
             }
-            Ok(n) => {
-                buffer.extend_from_slice(&read_buf[..n]);
+            Ok(true) => {
+                // Data read successfully, continue to process packets
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // No data available, sleep briefly and continue to check notifications
-                thread::sleep(Duration::from_millis(10));
+                // No data available, continue to check notifications
                 continue;
             }
-            Err(e) => {
-                warn!("GDB read error: {}", e);
+            Err(_) => {
+                // Read error, close connection
                 break;
             }
         }
@@ -589,226 +735,17 @@ fn handle_connection(
                 break;
             }
 
-            match current_buffer[0] {
-                b'+' => {
-                    trace!("Received ack");
-                    processed_bytes += 1;
-                    continue;
-                }
-                b'-' => {
-                    trace!("Received nack");
-                    processed_bytes += 1;
-                    continue;
-                }
-                b'$' => {
-                    if let Some(end_pos) = current_buffer.iter().position(|&b| b == b'#') {
-                        if end_pos + 2 < current_buffer.len() {
-                            let packet_end = end_pos + 3;
-                            let packet_data = &current_buffer[1..end_pos];
-                            let checksum_bytes = &current_buffer[end_pos + 1..packet_end];
-
-                            let checksum_str = std::str::from_utf8(checksum_bytes).unwrap();
-                            if let Ok(received_checksum) = u8::from_str_radix(checksum_str, 16) {
-                                let calculated_checksum =
-                                    packet_data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-
-                                if calculated_checksum == received_checksum {
-                                    if !no_ack_mode {
-                                        trace!("Checksum correct, sending ack");
-                                        writer.write_all(b"+").unwrap();
-                                    }
-                                    let command_str = std::str::from_utf8(packet_data).unwrap();
-                                    trace!("Received command: {}", command_str);
-
-                                    let core_command = command_str.split(';').next().unwrap_or("");
-
-                                    if core_command.starts_with("qSupported") {
-                                        handle_qsupported(&mut writer);
-                                    } else if command_str == "QStartNoAckMode" {
-                                        no_ack_mode = handle_qstartnoackmode(&mut writer);
-                                    } else if command_str == "qC" {
-                                        handle_qc(&mut writer);
-                                    } else if command_str
-                                        .starts_with("qXfer:features:read:target.xml")
-                                    {
-                                        handle_qxfer_features(&mut writer);
-                                    } else if command_str == "?" {
-                                        handle_status_query(&mut writer);
-                                    } else if command_str == "qHostInfo" {
-                                        handle_qhostinfo(&mut writer);
-                                    } else if command_str == "qProcessInfo" {
-                                        handle_qprocessinfo(&mut writer);
-                                    } else if core_command == "qfThreadInfo" {
-                                        handle_qfthreadinfo(&mut writer);
-                                    } else if core_command == "qsThreadInfo" {
-                                        handle_qsthreadinfo(&mut writer);
-                                    } else if core_command == "g" {
-                                        handle_all_registers(
-                                            &mut writer,
-                                            &command_sender,
-                                            &response_receiver,
-                                        );
-                                    } else if core_command.starts_with('P') {
-                                        handle_register_write(
-                                            &mut writer,
-                                            core_command,
-                                            &command_sender,
-                                            &response_receiver,
-                                        );
-                                    } else if core_command.starts_with('p') {
-                                        handle_register_read(
-                                            &mut writer,
-                                            core_command,
-                                            &command_sender,
-                                            &response_receiver,
-                                        );
-                                    } else if core_command.starts_with('m') {
-                                        let parts: Vec<&str> =
-                                            core_command[1..].split(',').collect();
-                                        if parts.len() == 2 {
-                                            if let (Ok(addr), Ok(len)) = (
-                                                u64::from_str_radix(parts[0], 16),
-                                                usize::from_str_radix(parts[1], 16),
-                                            ) {
-                                                command_sender
-                                                    .send(GdbCommand::ReadMemory { addr, len })
-                                                    .unwrap();
-                                                match response_receiver
-                                                    .lock()
-                                                    .unwrap()
-                                                    .recv()
-                                                    .unwrap()
-                                                {
-                                                    GdbResponse::MemoryData(data) => {
-                                                        let hex_data = data
-                                                            .iter()
-                                                            .map(|b| format!("{:02x}", b))
-                                                            .collect::<String>();
-                                                        send_packet(&mut writer, &hex_data);
-                                                    }
-                                                    _ => send_packet(&mut writer, GDB_ERROR),
-                                                }
-                                            } else {
-                                                send_packet(&mut writer, GDB_ERROR);
-                                            }
-                                        } else {
-                                            send_packet(&mut writer, GDB_ERROR);
-                                        }
-                                    } else if core_command.starts_with('M') {
-                                        let parts: Vec<&str> = core_command[1..]
-                                            .split(|c| c == ',' || c == ':')
-                                            .collect();
-                                        if parts.len() == 3 {
-                                            if let (Ok(addr), Ok(len)) = (
-                                                u64::from_str_radix(parts[0], 16),
-                                                usize::from_str_radix(parts[1], 16),
-                                            ) {
-                                                let data_str = parts[2];
-                                                if let Ok(data) = hex::decode(data_str) {
-                                                    if data.len() == len {
-                                                        command_sender
-                                                            .send(GdbCommand::WriteMemory {
-                                                                addr,
-                                                                data,
-                                                            })
-                                                            .unwrap();
-                                                        match response_receiver
-                                                            .lock()
-                                                            .unwrap()
-                                                            .recv()
-                                                            .unwrap()
-                                                        {
-                                                            GdbResponse::Ok => {
-                                                                send_packet(&mut writer, GDB_OK)
-                                                            }
-                                                            _ => {
-                                                                send_packet(&mut writer, GDB_ERROR)
-                                                            }
-                                                        }
-                                                    } else {
-                                                        send_packet(&mut writer, GDB_ERROR);
-                                                    }
-                                                } else {
-                                                    send_packet(&mut writer, GDB_ERROR);
-                                                }
-                                            } else {
-                                                send_packet(&mut writer, GDB_ERROR);
-                                            }
-                                        } else {
-                                            send_packet(&mut writer, GDB_ERROR);
-                                        }
-                                    } else if core_command.starts_with('x') {
-                                        send_packet(&mut writer, GDB_ERROR);
-                                    } else if core_command == "c" {
-                                        command_sender.send(GdbCommand::Continue).unwrap();
-                                    } else if core_command == "s" {
-                                        command_sender.send(GdbCommand::Step).unwrap();
-                                    } else if core_command == "QThreadSuffixSupported"
-                                        || core_command == "QListThreadsInStopReply"
-                                        || core_command == "qVAttachOrWaitSupported"
-                                        || core_command == "QEnableErrorStrings"
-                                    {
-                                        handle_thread_suffix_commands(&mut writer);
-                                    } else if core_command == "c" {
-                                        command_sender.send(GdbCommand::Continue).unwrap();
-                                    } else if core_command.starts_with("Z0,") {
-                                        let parts: Vec<&str> =
-                                            core_command[3..].split(',').collect();
-                                        if parts.len() == 2 {
-                                            if let (Ok(addr), Ok(kind)) = (
-                                                u64::from_str_radix(parts[0], 16),
-                                                u64::from_str_radix(parts[1], 16),
-                                            ) {
-                                                command_sender
-                                                    .send(GdbCommand::AddBreakpoint { addr, kind })
-                                                    .unwrap();
-                                                match response_receiver
-                                                    .lock()
-                                                    .unwrap()
-                                                    .recv()
-                                                    .unwrap()
-                                                {
-                                                    GdbResponse::Ok => {
-                                                        trace!("Sending OK");
-                                                        send_packet(&mut writer, GDB_OK);
-                                                    }
-                                                    GdbResponse::Error(e) => {
-                                                        let response = format!("E{:02x}", e);
-                                                        send_packet(&mut writer, &response);
-                                                    }
-                                                    _ => {}
-                                                }
-                                            } else {
-                                                trace!("Malformed Z0 command");
-                                                send_packet(&mut writer, GDB_ERROR);
-                                            }
-                                        } else {
-                                            trace!("Malformed Z0 command");
-                                            send_packet(&mut writer, GDB_ERROR);
-                                        }
-                                    } else {
-                                        trace!("Unhandled GDB command: {}", core_command);
-                                        handle_unknown_command(&mut writer);
-                                    }
-                                } else {
-                                    trace!("Checksum incorrect, sending nack");
-                                    writer.write_all(b"-").unwrap();
-                                }
-                            }
-                            processed_bytes += packet_end;
-                        } else {
-                            // Incomplete packet
-                            break;
-                        }
-                    } else {
-                        // Incomplete packet
-                        break;
-                    }
-                }
-                _ => {
-                    // Invalid start of packet
-                    processed_bytes += 1;
-                }
+            if let Some(bytes_consumed) = process_packet(
+                current_buffer,
+                &mut writer,
+                &command_sender,
+                &response_receiver,
+                &mut no_ack_mode,
+            ) {
+                processed_bytes += bytes_consumed;
+            } else {
+                // Incomplete packet, need more data
+                break;
             }
         }
         buffer.drain(..processed_bytes);
