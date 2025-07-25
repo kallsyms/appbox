@@ -1,3 +1,4 @@
+use crate::dyld;
 use crate::vm::VmManager;
 use anyhow::{bail, Result};
 use log::{debug, trace, warn};
@@ -11,8 +12,13 @@ use std::rc::Rc;
 
 use hyperpom::applevisor as av;
 
-pub fn load_macho(vm: &mut VmManager, executable: &Path) -> Result<Loader> {
-    let mut loader = Loader::new(executable)?;
+pub fn load_macho(
+    vm: &mut VmManager,
+    executable: &Path,
+    arguments: Vec<String>,
+    environment: Vec<String>,
+) -> Result<Loader> {
+    let mut loader = Loader::new(executable, arguments, environment)?;
     loader.load_macho_recursive(vm, executable)?;
     loader.setup_stack(vm)?;
     loader.setup_commpage(vm)?;
@@ -22,20 +28,29 @@ pub fn load_macho(vm: &mut VmManager, executable: &Path) -> Result<Loader> {
 
 pub struct Loader {
     executable: PathBuf,
+    arguments: Vec<String>,
+    environment: Vec<String>,
+
+    pub shared_cache: dyld::SharedCache,
+    pub mh: u64,
+
+    map_fixed_next: usize,
+
     pub entry_point: u64,
     pub stack_pointer: u64,
-    map_fixed_next: usize,
-    mh: u64,
 }
 
 impl Loader {
-    fn new(executable: &Path) -> Result<Self> {
+    fn new(executable: &Path, arguments: Vec<String>, environment: Vec<String>) -> Result<Self> {
         Ok(Self {
             executable: executable.to_path_buf(),
+            arguments,
+            environment,
+            shared_cache: dyld::SharedCache::new_system_cache()?,
+            mh: 0,
+            map_fixed_next: 0x4_0000_0000,
             entry_point: 0,
             stack_pointer: 0,
-            map_fixed_next: 0x4_0000_0000,
-            mh: 0,
         })
     }
 
@@ -259,8 +274,6 @@ impl Loader {
          *      Where arg[i] and env[i] point into the STRING AREA
          */
 
-        let arguments: Vec<String> = vec![self.executable.to_str().unwrap().to_string()];
-        let environment: Vec<String> = vec![];
         let applep = vec![
             // TODO: this should be absolute path
             format!("executable_path={}", self.executable.to_str().unwrap()),
@@ -279,8 +292,8 @@ impl Loader {
         ];
         trace!("applep = {:?}", applep);
 
-        let total_len = arguments.iter().map(|s| s.len() + 1).sum::<usize>()
-            + environment.iter().map(|s| s.len() + 1).sum::<usize>()
+        let total_len = self.arguments.iter().map(|s| s.len() + 1).sum::<usize>()
+            + self.environment.iter().map(|s| s.len() + 1).sum::<usize>()
             + applep.iter().map(|s| s.len() + 1).sum::<usize>();
         let strings = self.new_mapping(
             vm,
@@ -301,8 +314,7 @@ impl Loader {
 
         let stack_size_in_ptrs = stack.len() / std::mem::size_of::<*const u8>();
 
-        let stack_top_offset =
-            1 /*mh*/ + 1 /*argc*/ + arguments.len() + 1 + environment.len() + 1 + applep.len() + 1;
+        let stack_top_offset = 1 /*mh*/ + 1 /*argc*/ + self.arguments.len() + 1 + self.environment.len() + 1 + applep.len() + 1;
 
         // Pointer to where the first pointer will be stored.
         // TODO: it would be nice to use a vec-like thing here so we don't have to keep adjusting the slice.
@@ -312,22 +324,22 @@ impl Loader {
         self.stack_pointer = stack_ptrs.as_ptr() as u64;
 
         stack_ptrs[0] = self.mh as _;
-        stack_ptrs[1] = arguments.len() as _;
+        stack_ptrs[1] = self.arguments.len() as _;
         stack_ptrs = &mut stack_ptrs[2..];
 
-        for (i, arg) in arguments.iter().enumerate() {
+        for (i, arg) in self.arguments.iter().enumerate() {
             stack_ptrs[i] = strings_ptr.as_ptr();
             strings_ptr[0..arg.len()].copy_from_slice(arg.as_bytes());
             strings_ptr = &mut strings_ptr[arg.len() + 1..];
         }
-        stack_ptrs = &mut stack_ptrs[arguments.len() + 1..];
+        stack_ptrs = &mut stack_ptrs[self.arguments.len() + 1..];
 
-        for (i, env) in environment.iter().enumerate() {
+        for (i, env) in self.environment.iter().enumerate() {
             stack_ptrs[i] = strings_ptr.as_ptr();
             strings_ptr[0..env.len()].copy_from_slice(env.as_bytes());
             strings_ptr = &mut strings_ptr[env.len() + 1..];
         }
-        stack_ptrs = &mut stack_ptrs[environment.len() + 1..];
+        stack_ptrs = &mut stack_ptrs[self.environment.len() + 1..];
 
         for (i, apple) in applep.iter().enumerate() {
             stack_ptrs[i] = strings_ptr.as_ptr();
