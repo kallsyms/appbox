@@ -54,11 +54,16 @@ fn main() -> Result<(), anyhow::Error> {
     let (response_sender, response_receiver) = std::sync::mpsc::channel();
 
     let notification_sender = if let Some(port) = args.gdb_port {
-        Some(appbox::gdb::start_gdb_server(port, command_sender, response_receiver, None)?)
+        Some(appbox::gdb::start_gdb_server(
+            port,
+            command_sender,
+            response_receiver,
+            None,
+        )?)
     } else {
         None
     };
-    
+
     if args.gdb_port.is_some() {
         if args.gdb_wait {
             info!("Waiting for GDB connection...");
@@ -120,7 +125,7 @@ fn main() -> Result<(), anyhow::Error> {
                     ExceptionClass::HvcA64 => {
                         let pc = vm.vcpu.get_reg(av::Reg::PC)?;
                         println!("HVC call at {:#x}", pc);
-                        ExitKind::Continue
+                        ExitKind::Exit
                     }
                     ExceptionClass::BrkA64 => {
                         let pc = vm.vcpu.get_reg(av::Reg::PC)?;

@@ -18,10 +18,13 @@ pub struct VmManager {
 impl VmManager {
     pub fn new() -> Result<Self> {
         let vm = av::VirtualMachine::new()?;
-        let vcpu = av::Vcpu::new()?;
+        let mut vcpu = av::Vcpu::new()?;
         let pma = PhysMemAllocator::new(0x1000_0000)?;
-        let vma = VirtMemAllocator::new(pma)?;
+        let mut vma = VirtMemAllocator::new(pma)?;
         let hooks = Hooks::new();
+
+        vma.init(&mut vcpu, true)?;
+        vcpu.set_reg(av::Reg::LR, 0xdeadf000)?;
 
         Ok(Self {
             _vm: vm,
