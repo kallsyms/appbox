@@ -1,5 +1,5 @@
 use clap::Parser;
-use log::{info, trace};
+use log::info;
 use std::path::PathBuf;
 
 use appbox::applevisor as av;
@@ -53,8 +53,13 @@ fn main() -> Result<(), anyhow::Error> {
     let (command_sender, command_receiver) = std::sync::mpsc::channel();
     let (response_sender, response_receiver) = std::sync::mpsc::channel();
 
-    if let Some(port) = args.gdb_port {
-        appbox::gdb::start_gdb_server(port, command_sender, response_receiver, None)?;
+    let notification_sender = if let Some(port) = args.gdb_port {
+        Some(appbox::gdb::start_gdb_server(port, command_sender, response_receiver, None)?)
+    } else {
+        None
+    };
+    
+    if args.gdb_port.is_some() {
         if args.gdb_wait {
             info!("Waiting for GDB connection...");
             loop {
@@ -68,13 +73,43 @@ fn main() -> Result<(), anyhow::Error> {
         }
     }
 
+    let mut single_step_breakpoint: Option<u64> = None;
+
     loop {
         vm.vcpu.run()?;
         while let Ok(cmd) = command_receiver.try_recv() {
-            if let appbox::gdb::GdbCommand::Continue = cmd {
-                break;
+            match cmd {
+                appbox::gdb::GdbCommand::Continue => {
+                    // Remove single step breakpoint if it exists
+                    if let Some(addr) = single_step_breakpoint.take() {
+                        let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+                    }
+                    break;
+                }
+                appbox::gdb::GdbCommand::Step => {
+                    // Get current instruction to determine next PC
+                    let pc = vm.vcpu.get_reg(av::Reg::PC)?;
+                    let mut insn_bytes = [0; 4];
+                    vm.vma.read(pc, &mut insn_bytes)?;
+
+                    // Remove previous single step breakpoint if it exists
+                    if let Some(addr) = single_step_breakpoint.take() {
+                        let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+                    }
+
+                    // For now, assume next instruction is at PC + 4
+                    // TODO: Enhance this to handle branches properly by using instruction emulation
+                    let next_pc = pc + 4;
+
+                    // Set new single step breakpoint
+                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma)?;
+                    single_step_breakpoint = Some(next_pc);
+                    break;
+                }
+                _ => {
+                    appbox::gdb::handle_command(cmd, &mut vm, &response_sender);
+                }
             }
-            appbox::gdb::handle_command(cmd, &mut vm, &response_sender);
         }
 
         // https://github.com/kallsyms/hyperpom/blob/a1dd1aebd8f306bb8549595d9d1506c2a361f0d7/src/core.rs#L1535
@@ -89,9 +124,44 @@ fn main() -> Result<(), anyhow::Error> {
                     }
                     ExceptionClass::BrkA64 => {
                         let pc = vm.vcpu.get_reg(av::Reg::PC)?;
-                        println!("Breakpoint hit at {:#x}", pc);
-                        vm.hooks.handle(&mut vm.vcpu, &mut vm.vma)?;
-                        ExitKind::Continue
+
+                        // Check if this is our single step breakpoint
+                        if Some(pc) == single_step_breakpoint {
+                            println!("Single step completed at {:#x}", pc);
+                            // Remove the single step breakpoint
+                            vm.hooks.remove_breakpoint(pc, &mut vm.vma)?;
+                            single_step_breakpoint = None;
+                            // Don't handle as normal breakpoint since we removed it
+                            ExitKind::Continue
+                        } else {
+                            println!("Breakpoint hit at {:#x}", pc);
+                            vm.hooks.handle(&mut vm.vcpu, &mut vm.vma)?;
+                            ExitKind::Continue
+                        }
+                    }
+                    ExceptionClass::InsAbortLowerEl => {
+                        let pc = vm.vcpu.get_reg(av::Reg::PC)?;
+                        println!("Instruction Abort (Lower EL) at {:#x}", pc);
+
+                        // Send SIGSEGV signal to GDB to indicate fault
+                        if let Some(ref sender) = notification_sender {
+                            appbox::gdb::send_sigsegv(sender);
+                        }
+
+                        // Enter GDB evaluation loop for system state inspection
+                        loop {
+                            if let Ok(cmd) = command_receiver.recv() {
+                                match cmd {
+                                    appbox::gdb::GdbCommand::Continue => break,
+                                    _ => {
+                                        appbox::gdb::handle_command(cmd, &mut vm, &response_sender)
+                                    }
+                                }
+                            }
+                        }
+
+                        // Always crash after inspection - no recovery possible
+                        ExitKind::Crash("Instruction Abort".to_string())
                     }
                     _ => Err(ExceptionError::UnimplementedException(
                         exit_info.exception.syndrome,
