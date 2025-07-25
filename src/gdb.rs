@@ -1,6 +1,7 @@
 use anyhow::Result;
 use log::{debug, info, trace, warn};
-use std::io::{BufReader, ErrorKind, Read, Write};
+use mio::{Events, Interest, Poll, Token};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -146,50 +147,50 @@ impl GdbRegister {
 }
 
 // GDB Command Handlers
-fn handle_qsupported(writer: &mut TcpStream) {
+fn handle_qsupported(writer: &mut mio::net::TcpStream) {
     send_packet(writer, GDB_SUPPORTED);
 }
 
-fn handle_qstartnoackmode(writer: &mut TcpStream) -> bool {
+fn handle_qstartnoackmode(writer: &mut mio::net::TcpStream) -> bool {
     trace!("Entering No-Ack mode");
     send_packet(writer, GDB_OK);
     true
 }
 
-fn handle_qc(writer: &mut TcpStream) {
+fn handle_qc(writer: &mut mio::net::TcpStream) {
     send_packet(writer, GDB_CURRENT_THREAD);
 }
 
-fn handle_qxfer_features(writer: &mut TcpStream) {
+fn handle_qxfer_features(writer: &mut mio::net::TcpStream) {
     let response = format!("l{}", TARGET_XML);
     send_packet(writer, &response);
 }
 
-fn handle_status_query(writer: &mut TcpStream) {
+fn handle_status_query(writer: &mut mio::net::TcpStream) {
     send_packet(writer, GDB_SIGNAL_TRAP);
 }
 
-fn handle_qhostinfo(writer: &mut TcpStream) {
+fn handle_qhostinfo(writer: &mut mio::net::TcpStream) {
     send_packet(writer, GDB_HOST_INFO);
 }
 
-fn handle_qprocessinfo(writer: &mut TcpStream) {
+fn handle_qprocessinfo(writer: &mut mio::net::TcpStream) {
     send_packet(writer, GDB_PROCESS_INFO);
 }
 
-fn handle_qfthreadinfo(writer: &mut TcpStream) {
+fn handle_qfthreadinfo(writer: &mut mio::net::TcpStream) {
     send_packet(writer, GDB_THREAD_LIST);
 }
 
-fn handle_qsthreadinfo(writer: &mut TcpStream) {
+fn handle_qsthreadinfo(writer: &mut mio::net::TcpStream) {
     send_packet(writer, GDB_THREAD_LIST_END);
 }
 
-fn handle_thread_suffix_commands(writer: &mut TcpStream) {
+fn handle_thread_suffix_commands(writer: &mut mio::net::TcpStream) {
     send_packet(writer, GDB_OK);
 }
 
-fn handle_unknown_command(writer: &mut TcpStream) {
+fn handle_unknown_command(writer: &mut mio::net::TcpStream) {
     send_packet(writer, GDB_EMPTY_RESPONSE);
 }
 
@@ -226,7 +227,7 @@ fn get_all_registers(vm: &mut VmManager) -> Vec<u64> {
 
 // Complex command handlers
 fn handle_register_write(
-    writer: &mut TcpStream,
+    writer: &mut mio::net::TcpStream,
     command: &str,
     command_sender: &Sender<GdbCommand>,
     response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
@@ -257,7 +258,7 @@ fn handle_register_write(
 }
 
 fn handle_register_read(
-    writer: &mut TcpStream,
+    writer: &mut mio::net::TcpStream,
     command: &str,
     command_sender: &Sender<GdbCommand>,
     response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
@@ -282,7 +283,7 @@ fn handle_register_read(
 }
 
 fn handle_memory_read(
-    writer: &mut TcpStream,
+    writer: &mut mio::net::TcpStream,
     command: &str,
     command_sender: &Sender<GdbCommand>,
     response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
@@ -318,7 +319,7 @@ fn handle_memory_read(
 }
 
 fn handle_memory_write(
-    writer: &mut TcpStream,
+    writer: &mut mio::net::TcpStream,
     command: &str,
     command_sender: &Sender<GdbCommand>,
     response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
@@ -356,7 +357,7 @@ fn handle_memory_write(
 }
 
 fn handle_all_registers(
-    writer: &mut TcpStream,
+    writer: &mut mio::net::TcpStream,
     command_sender: &Sender<GdbCommand>,
     response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
 ) {
@@ -376,7 +377,7 @@ fn handle_all_registers(
 }
 
 fn handle_breakpoint(
-    writer: &mut TcpStream,
+    writer: &mut mio::net::TcpStream,
     command: &str,
     command_sender: &Sender<GdbCommand>,
     response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
@@ -517,7 +518,7 @@ const TARGET_XML: &str = r#"<target version="1.0">
 </feature>
 </target>"#;
 
-fn send_packet(writer: &mut TcpStream, data: &str) {
+fn send_packet(writer: &mut mio::net::TcpStream, data: &str) {
     let checksum = data.bytes().fold(0u8, |acc, b| acc.wrapping_add(b));
     let response = format!("${}#{:02x}", data, checksum);
     trace!("Sending packet: {}", response);
@@ -526,7 +527,7 @@ fn send_packet(writer: &mut TcpStream, data: &str) {
 
 fn process_gdb_command(
     command_str: &str,
-    writer: &mut TcpStream,
+    writer: &mut mio::net::TcpStream,
     command_sender: &Sender<GdbCommand>,
     response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
     no_ack_mode: &mut bool,
@@ -583,7 +584,7 @@ fn process_gdb_command(
 
 fn process_packet(
     current_buffer: &[u8],
-    writer: &mut TcpStream,
+    writer: &mut mio::net::TcpStream,
     command_sender: &Sender<GdbCommand>,
     response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
     no_ack_mode: &mut bool,
@@ -647,11 +648,11 @@ fn process_packet(
 }
 
 fn read_and_buffer_data(
-    reader: &mut BufReader<TcpStream>,
+    stream: &mut mio::net::TcpStream,
     buffer: &mut Vec<u8>,
 ) -> Result<bool, std::io::Error> {
     let mut read_buf = [0; 1024];
-    match reader.read(&mut read_buf) {
+    match stream.read(&mut read_buf) {
         Ok(0) => {
             trace!("Connection closed");
             Ok(false) // Connection closed
@@ -661,8 +662,7 @@ fn read_and_buffer_data(
             Ok(true) // Data read successfully
         }
         Err(e) if e.kind() == ErrorKind::WouldBlock => {
-            // No data available, sleep briefly and continue
-            thread::sleep(Duration::from_millis(10));
+            // No data available right now
             Err(e)
         }
         Err(e) => {
@@ -672,6 +672,8 @@ fn read_and_buffer_data(
     }
 }
 
+const SOCKET_TOKEN: Token = Token(0);
+
 fn handle_connection(
     stream: TcpStream,
     command_sender: Sender<GdbCommand>,
@@ -679,55 +681,100 @@ fn handle_connection(
     notification_receiver: Arc<Mutex<Receiver<GdbNotification>>>,
 ) {
     debug!("New GDB client connected: {}", stream.peer_addr().unwrap());
-    stream.set_nonblocking(true).unwrap();
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut writer = stream;
+    
+    // Convert std::net::TcpStream to mio::net::TcpStream
+    let mut mio_stream = mio::net::TcpStream::from_std(stream);
+    
+    // Create poll instance
+    let mut poll = Poll::new().unwrap();
+    let mut events = Events::with_capacity(128);
+    
+    // Register the socket for read events
+    poll.registry()
+        .register(&mut mio_stream, SOCKET_TOKEN, Interest::READABLE)
+        .unwrap();
 
     let mut no_ack_mode = false;
 
-    // GDB handshake
+    // GDB handshake - read the first byte (blocking behavior through polling)
     let mut handshake = [0; 1];
-    if reader.read_exact(&mut handshake).is_err() {
-        trace!("Connection closed during handshake");
-        return;
+    loop {
+        match mio_stream.read(&mut handshake) {
+            Ok(0) => {
+                trace!("Connection closed during handshake");
+                return;
+            }
+            Ok(_) => break, // Got some data, continue
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // Wait for data to arrive
+                poll.poll(&mut events, None).unwrap();
+                continue;
+            }
+            Err(_) => {
+                trace!("Handshake read error");
+                return;
+            }
+        }
     }
     if &handshake != b"+" {
         trace!("Handshake failed");
         return;
     }
     trace!("Handshake successful, sending ack");
-    writer.write_all(b"+").unwrap();
+    mio_stream.write_all(b"+").unwrap();
 
     let mut buffer = Vec::new();
+    
     loop {
-        // Check for notifications first (non-blocking)
+        // Poll for events with a short timeout to check notifications
+        match poll.poll(&mut events, Some(Duration::from_millis(1))) {
+            Ok(_) => {
+                // Check for socket events
+                for event in events.iter() {
+                    match event.token() {
+                        SOCKET_TOKEN => {
+                            if event.is_readable() {
+                                match read_and_buffer_data(&mut mio_stream, &mut buffer) {
+                                    Ok(false) => {
+                                        // Connection closed
+                                        info!("GDB client disconnected: {}", mio_stream.peer_addr().unwrap());
+                                        return;
+                                    }
+                                    Ok(true) => {
+                                        // Data read successfully, process packets below
+                                    }
+                                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                                        // No more data available right now
+                                    }
+                                    Err(_) => {
+                                        // Read error, close connection
+                                        info!("GDB connection error, closing");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Poll error: {}", e);
+                break;
+            }
+        }
+        
+        // Check for notifications (non-blocking)
         if let Ok(notification) = notification_receiver.lock().unwrap().try_recv() {
             match notification {
                 GdbNotification::Stop(signal) => {
                     let signal_packet = format!("S{:02x}", signal);
-                    send_packet(&mut writer, &signal_packet);
+                    send_packet(&mut mio_stream, &signal_packet);
                 }
             }
         }
-        
-        match read_and_buffer_data(&mut reader, &mut buffer) {
-            Ok(false) => {
-                // Connection closed
-                break;
-            }
-            Ok(true) => {
-                // Data read successfully, continue to process packets
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // No data available, continue to check notifications
-                continue;
-            }
-            Err(_) => {
-                // Read error, close connection
-                break;
-            }
-        }
 
+        // Process any buffered packets
         let mut processed_bytes = 0;
         while processed_bytes < buffer.len() {
             let current_buffer = &buffer[processed_bytes..];
@@ -737,7 +784,7 @@ fn handle_connection(
 
             if let Some(bytes_consumed) = process_packet(
                 current_buffer,
-                &mut writer,
+                &mut mio_stream,
                 &command_sender,
                 &response_receiver,
                 &mut no_ack_mode,
@@ -750,7 +797,6 @@ fn handle_connection(
         }
         buffer.drain(..processed_bytes);
     }
-    info!("GDB client disconnected: {}", writer.peer_addr().unwrap());
 }
 
 /// Handles core GDB commands sent by the client, including:

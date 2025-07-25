@@ -17,6 +17,7 @@ mmap-fixed-fixed = "0.1.3"  # lolz
 anyhow = "1.0.75"
 mach_object = "0.1.17"
 time = "0.3.35"
+mio = { version = "0.8", features = ["os-poll", "net"] }
 
 [build-dependencies]
 bindgen = "0.63.0"
