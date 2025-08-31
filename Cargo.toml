@@ -22,3 +22,4 @@ mio = { version = "0.8", features = ["os-poll", "net"] }
 
 [build-dependencies]
 bindgen = "0.63.0"
+ureq = { version = "2", features = ["tls"] }
