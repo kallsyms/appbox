@@ -26,6 +26,16 @@ impl Default for GdbFeatures {
     }
 }
 
+// Bytes for each register in the order defined by TARGET_XML
+// x0..x30 (31), sp, pc are 8 bytes; cpsr is 4 bytes
+const GDB_REG_SIZES: [usize; 34] = [
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, // x0..x30
+    8, // sp
+    8, // pc
+    4, // cpsr
+];
+
 // GDB Protocol Response Constants
 const GDB_OK: &str = "OK";
 const GDB_ERROR: &str = "E01";
@@ -294,8 +304,14 @@ fn handle_register_write(
     let (reg_result, hex_result) = (usize::from_str_radix(parts[0], 16), hex::decode(parts[1]));
 
     if let (Ok(reg), Ok(hex_val)) = (reg_result, hex_result) {
+        if hex_val.len() > 8 {
+            send_packet(writer, GDB_ERROR);
+            return;
+        }
         let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&hex_val);
+        // GDB sends register contents in target endianness (little-endian here)
+        // Accept variable sizes (e.g., cpsr is 4 bytes) and place into LSBs
+        bytes[..hex_val.len()].copy_from_slice(&hex_val);
         let val = u64::from_le_bytes(bytes);
 
         command_sender
@@ -322,8 +338,9 @@ fn handle_register_read(
             .unwrap();
         match response_receiver.lock().unwrap().recv().unwrap() {
             GdbResponse::RegisterValue(val) => {
+                let size = if reg < GDB_REG_SIZES.len() { GDB_REG_SIZES[reg] } else { 8 };
                 let mut reg_data = String::new();
-                for byte in val.to_le_bytes() {
+                for byte in val.to_le_bytes()[..size].iter() {
                     reg_data.push_str(&format!("{:02x}", byte));
                 }
                 send_packet(writer, &reg_data);
@@ -418,8 +435,9 @@ fn handle_all_registers(
     match response_receiver.lock().unwrap().recv().unwrap() {
         GdbResponse::RegisterData(regs) => {
             let mut reg_data = String::new();
-            for reg in regs {
-                for byte in reg.to_le_bytes() {
+            for (i, reg) in regs.iter().enumerate() {
+                let size = if i < GDB_REG_SIZES.len() { GDB_REG_SIZES[i] } else { 8 };
+                for byte in reg.to_le_bytes()[..size].iter() {
                     reg_data.push_str(&format!("{:02x}", byte));
                 }
             }
@@ -614,10 +632,10 @@ const TARGET_XML: &str = r#"<target version="1.0">
 <reg name="x26" bitsize="64" type="uint64"/>
 <reg name="x27" bitsize="64" type="uint64"/>
 <reg name="x28" bitsize="64" type="uint64"/>
-<reg name="fp" bitsize="64" type="data_ptr"/>
-<reg name="lr" bitsize="64" type="code_ptr"/>
-<reg name="sp" bitsize="64" type="data_ptr"/>
-<reg name="pc" bitsize="64" type="code_ptr"/>
+<reg name="x29" bitsize="64" type="uint64"/>
+<reg name="x30" bitsize="64" type="uint64"/>
+<reg name="sp" bitsize="64" type="uint64"/>
+<reg name="pc" bitsize="64" type="uint64"/>
 <reg name="cpsr" bitsize="32" type="uint32"/>
 </feature>
 </target>"#;
