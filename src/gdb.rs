@@ -162,7 +162,7 @@ impl GdbRegister {
 // GDB Command Handlers
 fn build_supported_string(features: &GdbFeatures) -> String {
     let mut supported =
-        "PacketSize=4000;swbreak+;hwbreak+;qXfer:features:read+;QStartNoAckMode+".to_string();
+        "PacketSize=4000;swbreak+;hwbreak+;qXfer:features:read+;QStartNoAckMode+;vContSupported+".to_string();
 
     if features.reverse_continue {
         supported.push_str(";ReverseContinue+");
@@ -193,6 +193,30 @@ fn handle_qc(writer: &mut mio::net::TcpStream) {
 fn handle_qxfer_features(writer: &mut mio::net::TcpStream) {
     let response = format!("l{}", TARGET_XML);
     send_packet(writer, &response);
+}
+
+fn handle_vcont_query(writer: &mut mio::net::TcpStream) {
+    // Advertise minimal vCont actions we can map to existing handlers
+    // Returning this enables LLDB to build a continue packet even if it ends up sending 'c'.
+    // Include signal-carrying variants to avoid LLDB clearing packets when it wants to
+    // deliver a signal along with continue/step.
+    send_packet(writer, "vCont;c;C;s;S");
+}
+
+fn handle_vcont_run(command: &str, command_sender: &Sender<GdbCommand>) {
+    // command examples:
+    //  - "vCont;c" (all continue)
+    //  - "vCont;c:1" (continue TID 1)
+    //  - "vCont;s" or "vCont;s:1" (single step)
+    //  - "vCont;C0b:1" (continue with signal)
+    //  - "vCont;S0b:1" (step with signal)
+    // For now we ignore thread ids and signals and choose the strongest action:
+    // any ";s" or ";S" implies Step, otherwise any ";c" or ";C" implies Continue.
+    if command.contains(";s") || command.starts_with("vCont;s") || command.contains(";S") || command.starts_with("vCont;S") {
+        let _ = command_sender.send(GdbCommand::Step);
+    } else {
+        let _ = command_sender.send(GdbCommand::Continue);
+    }
 }
 
 fn handle_status_query(writer: &mut mio::net::TcpStream) {
@@ -444,9 +468,49 @@ fn handle_breakpoint(
     }
 }
 
+fn handle_remove_breakpoint(
+    writer: &mut mio::net::TcpStream,
+    command: &str,
+    command_sender: &Sender<GdbCommand>,
+    response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
+) {
+    let parts: Vec<&str> = command[3..].split(',').collect();
+    if parts.len() != 2 {
+        trace!("Malformed z0 command");
+        send_packet(writer, GDB_ERROR);
+        return;
+    }
+
+    let (addr_result, kind_result) = (
+        u64::from_str_radix(parts[0], 16),
+        u64::from_str_radix(parts[1], 16),
+    );
+
+    if let (Ok(addr), Ok(kind)) = (addr_result, kind_result) {
+        command_sender
+            .send(GdbCommand::RemoveBreakpoint { addr, kind })
+            .unwrap();
+        match response_receiver.lock().unwrap().recv().unwrap() {
+            GdbResponse::Ok => {
+                trace!("Sending OK");
+                send_packet(writer, GDB_OK);
+            }
+            GdbResponse::Error(e) => {
+                let response = format!("E{:02x}", e);
+                send_packet(writer, &response);
+            }
+            _ => {}
+        }
+    } else {
+        trace!("Malformed z0 command");
+        send_packet(writer, GDB_ERROR);
+    }
+}
+
 #[derive(Debug)]
 pub enum GdbCommand {
     AddBreakpoint { addr: u64, kind: u64 },
+    RemoveBreakpoint { addr: u64, kind: u64 },
     Continue,
     Step,
     Kill,
@@ -583,6 +647,8 @@ fn process_gdb_command(
         handle_qc(writer);
     } else if command_str.starts_with("qXfer:features:read:target.xml") {
         handle_qxfer_features(writer);
+    } else if core_command == "vCont?" {
+        handle_vcont_query(writer);
     } else if command_str == "?" {
         handle_status_query(writer);
     } else if command_str == "qHostInfo" {
@@ -609,6 +675,20 @@ fn process_gdb_command(
         command_sender.send(GdbCommand::Continue).unwrap();
     } else if core_command == "s" {
         command_sender.send(GdbCommand::Step).unwrap();
+    } else if core_command.starts_with("vCont") {
+        // Use the full command string to inspect actions and thread qualifiers
+        handle_vcont_run(command_str, command_sender);
+    } else if core_command.starts_with('C') {
+        // Legacy continue with signal, ignore signal value for now
+        command_sender.send(GdbCommand::Continue).unwrap();
+    } else if core_command.starts_with('S') {
+        // Legacy step with signal, ignore signal value for now
+        command_sender.send(GdbCommand::Step).unwrap();
+    } else if core_command.starts_with('H') {
+        // Handle thread selection commands (Hg / Hc). We don't track threads yet,
+        // so just acknowledge to keep LLDB happy.
+        // Examples: Hg0, Hg-1, Hc0, Hc-1, Hg<pid>, Hc<pid>
+        send_packet(writer, GDB_OK);
     } else if core_command == "bc" {
         command_sender.send(GdbCommand::BackwardsContinue).unwrap();
     } else if core_command == "bs" {
@@ -623,6 +703,8 @@ fn process_gdb_command(
         handle_thread_suffix_commands(writer);
     } else if core_command.starts_with("Z0,") {
         handle_breakpoint(writer, core_command, command_sender, response_receiver);
+    } else if core_command.starts_with("z0,") {
+        handle_remove_breakpoint(writer, core_command, command_sender, response_receiver);
     } else {
         trace!("Unhandled GDB command: {}", core_command);
         handle_unknown_command(writer);
@@ -866,6 +948,10 @@ pub fn handle_command(
     match cmd {
         GdbCommand::AddBreakpoint { addr, .. } => {
             vm.hooks.add_breakpoint(addr, &mut vm.vma).unwrap();
+            response_sender.send(GdbResponse::Ok).unwrap();
+        }
+        GdbCommand::RemoveBreakpoint { addr, .. } => {
+            vm.hooks.remove_breakpoint(addr, &mut vm.vma).unwrap();
             response_sender.send(GdbResponse::Ok).unwrap();
         }
         GdbCommand::ReadMemory { addr, len } => {

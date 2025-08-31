@@ -92,19 +92,13 @@ fn main() -> Result<(), anyhow::Error> {
                     break;
                 }
                 appbox::gdb::GdbCommand::Step => {
-                    // Get current instruction to determine next PC
-                    let pc = vm.vcpu.get_reg(av::Reg::PC)?;
-                    let mut insn_bytes = [0; 4];
-                    vm.vma.read(pc, &mut insn_bytes)?;
-
                     // Remove previous single step breakpoint if it exists
                     if let Some(addr) = single_step_breakpoint.take() {
                         let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
                     }
 
-                    // For now, assume next instruction is at PC + 4
-                    // TODO: Enhance this to handle branches properly by using instruction emulation
-                    let next_pc = pc + 4;
+                    // Compute correct next PC using emulator
+                    let next_pc = vm.hooks.compute_step_target(&vm.vcpu, &vm.vma)?;
 
                     // Set new single step breakpoint
                     vm.hooks.add_breakpoint(next_pc, &mut vm.vma)?;
@@ -140,7 +134,8 @@ fn main() -> Result<(), anyhow::Error> {
                             ExitKind::Continue
                         } else {
                             println!("Breakpoint hit at {:#x}", pc);
-                            vm.hooks.handle(&mut vm.vcpu, &mut vm.vma)?;
+                            // Restore original instruction at PC for debugger visibility
+                            vm.hooks.prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)?;
                             ExitKind::Continue
                         }
                     }

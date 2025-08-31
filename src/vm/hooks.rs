@@ -3,6 +3,7 @@ use bitfield::bitfield;
 use hyperpom::applevisor as av;
 use hyperpom::caches::*;
 use hyperpom::memory::VirtMemAllocator;
+use log::trace;
 use std::collections::{hash_map::Entry, HashMap};
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
@@ -58,6 +59,7 @@ impl Hooks {
 
     pub fn add_breakpoint(&mut self, addr: u64, vma: &mut VirtMemAllocator) -> Result<()> {
         if let Entry::Vacant(e) = self.hooks.entry(addr) {
+            trace!("Adding breakpoint at {:#x}", addr);
             let mut hook = Hook::new();
             vma.read(addr, &mut hook.insn)?;
             vma.write_dword(addr, Self::BRK_STAGE_1)?;
@@ -70,59 +72,55 @@ impl Hooks {
     pub fn remove_breakpoint(&mut self, addr: u64, vma: &mut VirtMemAllocator) -> Result<()> {
         if let Some(hook) = self.hooks.remove(&addr) {
             if hook.applied {
+                trace!("Removing breakpoint at {:#x}", addr);
                 vma.write(addr, &hook.insn)?;
             }
         }
         Ok(())
     }
 
-    pub fn handle(&mut self, vcpu: &mut av::Vcpu, vma: &mut VirtMemAllocator) -> Result<()> {
-        let exit = vcpu.get_exit_info();
-        match HookType::from(exit.exception.syndrome as u16) {
-            HookType::Stage1 => self.hook_stage1(vcpu, vma),
-            HookType::Stage2 => self.hook_stage2(vcpu, vma),
-            HookType::Exit => bail!("Exit hook hit"),
-            HookType::Unknown(u) => bail!("Unknown hook type: {}", u),
+    /// Restore original instruction at PC if a software breakpoint was planted, without
+    /// removing tracking state. Use before entering debugger command loop so reading/disassembly
+    /// at PC sees original bytes.
+    pub fn prepare_for_debugger(
+        &mut self,
+        vcpu: &mut av::Vcpu,
+        vma: &mut VirtMemAllocator,
+    ) -> Result<()> {
+        let pc = vcpu.get_reg(av::Reg::PC)?;
+        if let Some(hook) = self.hooks.get_mut(&pc) {
+            if hook.applied {
+                trace!(
+                    "Preparing for debugger at {:#x}: restoring original instruction",
+                    pc
+                );
+                vma.write(pc, &hook.insn)?;
+                hook.applied = false;
+            }
         }
+        Ok(())
     }
 
-    fn hook_stage1(&mut self, vcpu: &mut av::Vcpu, vma: &mut VirtMemAllocator) -> Result<()> {
-        let addr = vcpu.get_reg(av::Reg::PC)?;
-        let hook = self.hooks.get_mut(&addr).unwrap();
-        let insn = u32::from_le_bytes(hook.insn);
+    /// Compute the next PC for a single-step from the current PC by emulating the instruction.
+    pub fn compute_step_target(&self, vcpu: &av::Vcpu, vma: &VirtMemAllocator) -> Result<u64> {
+        let pc = vcpu.get_reg(av::Reg::PC)?;
+        let mut insn_bytes = [0u8; 4];
+        vma.read(pc, &mut insn_bytes)?;
+        let insn = u32::from_le_bytes(insn_bytes);
 
         let emu_res = Emulator::emulate(insn, vcpu)?;
-        match emu_res {
+        let next_pc = match emu_res {
             EmulationResult::BranchRel(offset) => {
-                let addr = if offset >= 0 {
-                    addr + offset as u64
+                if offset >= 0 {
+                    pc + offset as u64
                 } else {
-                    (addr as i64 + offset as i64) as u64
-                };
-                vcpu.set_reg(av::Reg::PC, addr)?;
+                    (pc as i64 + offset as i64) as u64
+                }
             }
-            EmulationResult::BranchAbs(addr) => vcpu.set_reg(av::Reg::PC, addr)?,
-            EmulationResult::Other => {
-                let mut next_insn = [0; 4];
-                vma.read(addr + 4, &mut next_insn)?;
-                hook.next_insn = Some(next_insn);
-                vma.write_dword(addr + 4, Self::BRK_STAGE_2)?;
-                vma.write(addr, &hook.insn)?;
-                vcpu.set_reg(av::Reg::PC, addr)?;
-                Caches::ic_ivau(vcpu, vma)?;
-            }
+            EmulationResult::BranchAbs(addr) => addr,
+            EmulationResult::Other => pc + 4,
         };
-        Ok(())
-    }
-
-    fn hook_stage2(&mut self, vcpu: &mut av::Vcpu, vma: &mut VirtMemAllocator) -> Result<()> {
-        let addr = vcpu.get_reg(av::Reg::PC)?;
-        let stage1_addr = addr - 4;
-        let hook = self.hooks.get(&stage1_addr).unwrap();
-        vma.write(addr, &hook.next_insn.unwrap())?;
-        vma.write_dword(stage1_addr, Self::BRK_STAGE_1)?;
-        Caches::ic_ivau(vcpu, vma)?;
-        Ok(())
+        Ok(next_pc)
     }
 }
 
