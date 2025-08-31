@@ -25,6 +25,15 @@ pub fn load_macho(
     loader.setup_stack(vm)?;
     loader.setup_commpage(vm)?;
 
+    // Enable Top Byte Ignore for the lower VA range because PAC breaks us.
+    // I'm not sure _why_ exactly because we don't rely on pre-mapped dyld shared cache or anything
+    // where pointers would already be PAC'd with a key we don't have, but we die in libobjc without this.
+    // And we die with a data pointer on the heap being authed with the B key of all things which should be process-specific anyways.
+    // TODO: figure out why.
+    let mut tcr_el1 = vm.vcpu.get_sys_reg(av::SysReg::TCR_EL1)?;
+    tcr_el1 |= 1 << 37; // TBI0
+    vm.vcpu.set_sys_reg(av::SysReg::TCR_EL1, tcr_el1)?;
+
     Ok(loader)
 }
 
