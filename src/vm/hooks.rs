@@ -192,8 +192,17 @@ impl Emulator {
             i if (i >> 10) == 0b1101011000111111000000 && i & 0x1f == 0 => Self::blr(i, vcpu),
             // BR
             i if (i >> 10) == 0b1101011000011111000000 && i & 0x1f == 0 => Self::br(i, vcpu),
-            // RET
-            i if (i >> 10) == 0b1101011001011111000000 && i & 0x1f == 0 => Self::ret(i, vcpu),
+            // RET (register), any Rn. Match by high 16 bits (0xD65F) and low5 == 0.
+            i if (i & 0xFFFF_0000) == 0xD65F_0000 && (i & 0x1f) == 0 => Self::ret(i, vcpu),
+            // Pointer-auth RET variants (RETAA/RETAB): high 16 bits 0xD65F and low5 == 0x1f.
+            // Treat as a branch to LR for step target computation.
+            i if (i & 0xFFFF_0000) == 0xD65F_0000 && (i & 0x1f) == 0x1f => Self::ret_pac(vcpu),
+            // Pointer-auth BLR variants (BLRAA/BLRAB): treat like BLR.
+            // Match high 16 bits of BLR family (0xD63F) and low5 == 0x1f.
+            i if (i & 0xFFFF_0000) == 0xD63F_0000 && (i & 0x1f) == 0x1f => Self::blr(i, vcpu),
+            // Pointer-auth BR variants (BRAA/BRAB): treat like BR.
+            // Match high 16 bits of BR family (0xD61F) and low5 == 0x1f.
+            i if (i & 0xFFFF_0000) == 0xD61F_0000 && (i & 0x1f) == 0x1f => Self::br(i, vcpu),
             _ => Ok(EmulationResult::Other),
         }
     }
@@ -406,5 +415,12 @@ impl Emulator {
     #[inline]
     fn ret(insn: u32, vcpu: &av::Vcpu) -> Result<EmulationResult> {
         Self::br(insn, vcpu)
+    }
+
+    /// Emulates a pointer-authenticated `ret` instruction (RETAA/RETAB): branch to LR.
+    #[inline]
+    fn ret_pac(vcpu: &av::Vcpu) -> Result<EmulationResult> {
+        let target = vcpu.get_reg(av::Reg::LR)?;
+        Ok(EmulationResult::BranchAbs(target))
     }
 }
