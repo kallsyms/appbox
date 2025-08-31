@@ -652,3 +652,20 @@ static const uint64_t kDyldSharedCacheTypeProduction = 1;
 static const uint64_t kDyldSharedCacheTypeUniversal = 2;
 
 #endif // __DYLD_CACHE_FORMAT__
+
+// Plus add old/missing dyld_cache_dynamic_data_header
+// Now in https://github.com/apple-oss-distributions/dyld/blob/93bd81f9d7fcf004fcebcb66ec78983882b41e71/common/DyldSharedCache.h#L194
+#define DYLD_SHARED_CACHE_DYNAMIC_DATA_MAGIC "dyld_data    v0"
+struct dyld_cache_dynamic_data_header
+{
+    char magic[16];   // e.g. "dyld_data    v0"
+    uint64_t fsId;    // The fsid_t of the shared cache being used by a process
+    uint64_t fsObjId; // The fs_obj_id_t of the shared cache being used by a process
+
+    uint32_t osCryptexPathOffset;
+    uint32_t cachePathOffset;
+
+    uint64_t paddingToAlign;
+    __uint128_t systemWideFunctionVariantFlags;
+    __uint128_t processorFunctionVariantFlags;
+};

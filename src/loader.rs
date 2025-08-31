@@ -19,7 +19,9 @@ pub fn load_macho(
     environment: Vec<String>,
 ) -> Result<Loader> {
     let mut loader = Loader::new(executable, arguments, environment)?;
+
     loader.load_macho_recursive(vm, executable)?;
+    loader.shared_cache.map_into_vm(vm)?;
     loader.setup_stack(vm)?;
     loader.setup_commpage(vm)?;
 
@@ -48,7 +50,7 @@ impl Loader {
             environment,
             shared_cache: dyld::SharedCache::new_system_cache()?,
             mh: 0,
-            map_fixed_next: 0x4_0000_0000,
+            map_fixed_next: 0x5_0000_0000,
             entry_point: 0,
             stack_pointer: 0,
         })

@@ -11,11 +11,24 @@ use std::time::Duration;
 use crate::applevisor as av;
 use crate::vm::VmManager;
 
+#[derive(Debug, Clone)]
+pub struct GdbFeatures {
+    pub reverse_continue: bool,
+    pub reverse_step: bool,
+}
+
+impl Default for GdbFeatures {
+    fn default() -> Self {
+        Self {
+            reverse_continue: false,
+            reverse_step: false,
+        }
+    }
+}
+
 // GDB Protocol Response Constants
 const GDB_OK: &str = "OK";
 const GDB_ERROR: &str = "E01";
-const GDB_SUPPORTED: &str =
-    "PacketSize=4000;swbreak+;hwbreak+;qXfer:features:read+;QStartNoAckMode+";
 const GDB_CURRENT_THREAD: &str = "QC1";
 const GDB_SIGNAL_TRAP: &str = "S05";
 const GDB_HOST_INFO: &str =
@@ -147,8 +160,24 @@ impl GdbRegister {
 }
 
 // GDB Command Handlers
-fn handle_qsupported(writer: &mut mio::net::TcpStream) {
-    send_packet(writer, GDB_SUPPORTED);
+fn build_supported_string(features: &GdbFeatures) -> String {
+    let mut supported =
+        "PacketSize=4000;swbreak+;hwbreak+;qXfer:features:read+;QStartNoAckMode+".to_string();
+
+    if features.reverse_continue {
+        supported.push_str(";ReverseContinue+");
+    }
+
+    if features.reverse_step {
+        supported.push_str(";ReverseStep+");
+    }
+
+    supported
+}
+
+fn handle_qsupported(writer: &mut mio::net::TcpStream, features: &GdbFeatures) {
+    let supported_string = build_supported_string(features);
+    send_packet(writer, &supported_string);
 }
 
 fn handle_qstartnoackmode(writer: &mut mio::net::TcpStream) -> bool {
@@ -420,6 +449,9 @@ pub enum GdbCommand {
     AddBreakpoint { addr: u64, kind: u64 },
     Continue,
     Step,
+    Kill,
+    BackwardsContinue,
+    BackwardsStep,
     ReadMemory { addr: u64, len: usize },
     WriteMemory { addr: u64, data: Vec<u8> },
     ReadRegisters,
@@ -446,11 +478,12 @@ pub fn start_gdb_server(
     command_sender: Sender<GdbCommand>,
     response_receiver: Receiver<GdbResponse>,
     wait_sender: Option<Sender<()>>,
+    features: GdbFeatures,
 ) -> Result<Sender<GdbNotification>> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     info!("GDB server listening on port {}", port);
     let response_receiver = Arc::new(Mutex::new(response_receiver));
-    
+
     let (notification_sender, notification_receiver) = std::sync::mpsc::channel();
     let notification_receiver = Arc::new(Mutex::new(notification_receiver));
 
@@ -464,8 +497,15 @@ pub fn start_gdb_server(
                     let command_sender = command_sender.clone();
                     let response_receiver = response_receiver.clone();
                     let notification_receiver = notification_receiver.clone();
+                    let features_clone = features.clone();
                     thread::spawn(move || {
-                        handle_connection(stream, command_sender, response_receiver, notification_receiver);
+                        handle_connection(
+                            stream,
+                            command_sender,
+                            response_receiver,
+                            notification_receiver,
+                            features_clone,
+                        );
                     });
                 }
                 Err(e) => {
@@ -531,11 +571,12 @@ fn process_gdb_command(
     command_sender: &Sender<GdbCommand>,
     response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
     no_ack_mode: &mut bool,
+    features: &GdbFeatures,
 ) {
     let core_command = command_str.split(';').next().unwrap_or("");
 
     if core_command.starts_with("qSupported") {
-        handle_qsupported(writer);
+        handle_qsupported(writer, features);
     } else if command_str == "QStartNoAckMode" {
         *no_ack_mode = handle_qstartnoackmode(writer);
     } else if command_str == "qC" {
@@ -568,6 +609,12 @@ fn process_gdb_command(
         command_sender.send(GdbCommand::Continue).unwrap();
     } else if core_command == "s" {
         command_sender.send(GdbCommand::Step).unwrap();
+    } else if core_command == "bc" {
+        command_sender.send(GdbCommand::BackwardsContinue).unwrap();
+    } else if core_command == "bs" {
+        command_sender.send(GdbCommand::BackwardsStep).unwrap();
+    } else if core_command == "k" {
+        command_sender.send(GdbCommand::Kill).unwrap();
     } else if core_command == "QThreadSuffixSupported"
         || core_command == "QListThreadsInStopReply"
         || core_command == "qVAttachOrWaitSupported"
@@ -588,6 +635,7 @@ fn process_packet(
     command_sender: &Sender<GdbCommand>,
     response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
     no_ack_mode: &mut bool,
+    features: &GdbFeatures,
 ) -> Option<usize> {
     match current_buffer[0] {
         b'+' => {
@@ -624,6 +672,7 @@ fn process_packet(
                                 command_sender,
                                 response_receiver,
                                 no_ack_mode,
+                                features,
                             );
                         } else {
                             trace!("Checksum incorrect, sending nack");
@@ -679,16 +728,16 @@ fn handle_connection(
     command_sender: Sender<GdbCommand>,
     response_receiver: Arc<Mutex<Receiver<GdbResponse>>>,
     notification_receiver: Arc<Mutex<Receiver<GdbNotification>>>,
+    features: GdbFeatures,
 ) {
     debug!("New GDB client connected: {}", stream.peer_addr().unwrap());
-    
-    // Convert std::net::TcpStream to mio::net::TcpStream
+
     let mut mio_stream = mio::net::TcpStream::from_std(stream);
-    
+
     // Create poll instance
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(128);
-    
+
     // Register the socket for read events
     poll.registry()
         .register(&mut mio_stream, SOCKET_TOKEN, Interest::READABLE)
@@ -724,7 +773,7 @@ fn handle_connection(
     mio_stream.write_all(b"+").unwrap();
 
     let mut buffer = Vec::new();
-    
+
     loop {
         // Poll for events with a short timeout to check notifications
         match poll.poll(&mut events, Some(Duration::from_millis(1))) {
@@ -737,7 +786,10 @@ fn handle_connection(
                                 match read_and_buffer_data(&mut mio_stream, &mut buffer) {
                                     Ok(false) => {
                                         // Connection closed
-                                        info!("GDB client disconnected: {}", mio_stream.peer_addr().unwrap());
+                                        info!(
+                                            "GDB client disconnected: {}",
+                                            mio_stream.peer_addr().unwrap()
+                                        );
                                         return;
                                     }
                                     Ok(true) => {
@@ -763,7 +815,7 @@ fn handle_connection(
                 break;
             }
         }
-        
+
         // Check for notifications (non-blocking)
         if let Ok(notification) = notification_receiver.lock().unwrap().try_recv() {
             match notification {
@@ -788,6 +840,7 @@ fn handle_connection(
                 &command_sender,
                 &response_receiver,
                 &mut no_ack_mode,
+                &features,
             ) {
                 processed_bytes += bytes_consumed;
             } else {
@@ -848,8 +901,12 @@ pub fn handle_command(
                 .send(GdbResponse::RegisterValue(val))
                 .unwrap();
         }
+        // These do not respond with anything
         GdbCommand::Continue => {}
         GdbCommand::Step => {}
+        GdbCommand::Kill => {}
+        GdbCommand::BackwardsContinue => {}
+        GdbCommand::BackwardsStep => {}
     }
 }
 

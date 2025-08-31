@@ -24,6 +24,7 @@ impl VmManager {
         let hooks = Hooks::new();
 
         vma.init(&mut vcpu, true)?;
+        hyperpom::caches::Caches::init(&mut vcpu, &mut vma)?;
         vcpu.set_reg(av::Reg::LR, 0xdeadf000)?;
 
         Ok(Self {

@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::os::macos::fs::MetadataExt;
 use std::os::unix::prelude::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -8,6 +9,8 @@ use std::rc::Rc;
 use anyhow::{bail, Result};
 use log::{debug, trace};
 use mmap_fixed_fixed::{MapOption, MemoryMap};
+
+use hyperpom::applevisor as av;
 
 use crate::dyld_cache_format::*;
 
@@ -70,28 +73,42 @@ impl SharedCache {
         };
         cache.map_single_cache(cache_path)?;
 
-        // let dyndata_mapping = MemoryMap::new(
-        //     std::mem::size_of::<dyld_cache_dynamic_data_header>(),
-        //     &[
-        //         MapOption::MapReadable,
-        //         MapOption::MapWritable,
-        //         MapOption::MapAddr(unsafe {
-        //             cache
-        //                 .base_address()
-        //                 .add(cache_header.dynamicDataOffset as _)
-        //         }),
-        //     ],
-        // )?;
+        let dyndata_mapping = MemoryMap::new(
+            std::mem::size_of::<dyld_cache_dynamic_data_header>() + 4096, // sizeof struct plus path strings
+            &[
+                MapOption::MapReadable,
+                MapOption::MapWritable,
+                MapOption::MapAddr(unsafe {
+                    cache
+                        .base_address()
+                        .add(cache_header.dynamicDataOffset as _)
+                }),
+            ],
+        )?;
 
-        // let dyndata: *mut dyld_cache_dynamic_data_header = dyndata_mapping.data() as _;
-        // let stat = std::fs::metadata(cache_path)?;
-        // unsafe {
-        //     (*dyndata).magic = std::mem::transmute(*DYLD_SHARED_CACHE_DYNAMIC_DATA_MAGIC);
-        //     (*dyndata).fsId = stat.st_dev();
-        //     (*dyndata).fsObjId = stat.st_ino();
-        // }
+        let dyndata: *mut dyld_cache_dynamic_data_header = dyndata_mapping.data() as _;
+        let stat = std::fs::metadata(cache_path)?;
+        unsafe {
+            (*dyndata).magic = std::mem::transmute(*DYLD_SHARED_CACHE_DYNAMIC_DATA_MAGIC);
+            (*dyndata).fsId = stat.st_dev();
+            (*dyndata).fsObjId = stat.st_ino();
+        }
 
-        // cache.mappings.push(Rc::new(dyndata_mapping));
+        // TODO: cryptex path?
+        let path_bytes = cache_path.as_os_str().as_encoded_bytes();
+        unsafe {
+            (*dyndata).cachePathOffset =
+                std::mem::size_of::<dyld_cache_dynamic_data_header>() as u32;
+            std::ptr::copy_nonoverlapping(
+                path_bytes.as_ptr(),
+                dyndata_mapping
+                    .data()
+                    .add((*dyndata).cachePathOffset as usize),
+                path_bytes.len(),
+            );
+        }
+
+        cache.mappings.push(Rc::new(dyndata_mapping));
 
         debug!("shared cache loaded");
 
@@ -255,6 +272,19 @@ impl SharedCache {
             self.map_single_cache(&subcache_path)?;
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn map_into_vm(&self, vm: &mut crate::vm::VmManager) -> Result<()> {
+        for mapping in &self.mappings {
+            trace!(
+                "mapping shared cache region {:p}-{:p} into VM",
+                mapping.data(),
+                unsafe { mapping.data().add(mapping.len()) }
+            );
+            vm.vma
+                .map_1to1(mapping.data() as _, mapping.len(), av::MemPerms::RWX)?;
+        }
         Ok(())
     }
 }
