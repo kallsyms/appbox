@@ -198,18 +198,15 @@ fn main() -> Result<()> {
     let mut bpf_mem = vec![0u8; mem::size_of::<SyscallContext>() + SCRATCH_SIZE];
 
     loop {
-        println!("Running guest at PC={:#x}", vm.vcpu.get_reg(av::Reg::PC)?);
         let exit = match vm.run()? {
             VmRunResult::Svc => {
                 let elr = vm.vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
                 let esr = vm.vcpu.get_sys_reg(av::SysReg::ESR_EL1)?;
-                println!("HVC called at ELR={:#x} ESR={:#x}", elr, esr);
                 if esr != 0x56000080 {
                     warn!("Unhandled ESR_EL1 value: {:#x}", esr);
                     ExitKind::Crash("Unhandled fault".to_string())
                 } else {
                     let num = vm.vcpu.get_reg(av::Reg::X16)?;
-                    println!("Guest syscall: {}", num);
                     let args = [
                         vm.vcpu.get_reg(av::Reg::X0)?,
                         vm.vcpu.get_reg(av::Reg::X1)?,
@@ -268,7 +265,7 @@ fn main() -> Result<()> {
                             _ => (ExitKind::Continue, nix::libc::EPERM as u64, 0, 1 << 29),
                         };
 
-                        if !matches!(exit, ExitKind::Continue) {
+                        if exit != ExitKind::Continue {
                             exit
                         } else {
                             debug!("Returning x0={:x} x1={:x} cflags={:x}", ret0, ret1, cflags);
@@ -280,27 +277,24 @@ fn main() -> Result<()> {
                 }
             }
             VmRunResult::Brk => ExitKind::Continue,
-            VmRunResult::Other(exit_info) => {
-                println!("Guest exited: {:?}", exit_info);
-                match exit_info.reason {
-                    av::ExitReason::EXCEPTION => {
-                        match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
-                            ExceptionClass::InsAbortLowerEl => {
-                                ExitKind::Crash("Instruction Abort".to_string())
-                            }
-                            _ => Err(ExceptionError::UnimplementedException(
-                                exit_info.exception.syndrome,
-                            ))?,
+            VmRunResult::Other(exit_info) => match exit_info.reason {
+                av::ExitReason::EXCEPTION => {
+                    match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
+                        ExceptionClass::InsAbortLowerEl => {
+                            ExitKind::Crash("Instruction Abort".to_string())
                         }
+                        _ => Err(ExceptionError::UnimplementedException(
+                            exit_info.exception.syndrome,
+                        ))?,
                     }
-                    av::ExitReason::CANCELED => ExitKind::Timeout,
-                    av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
-                    av::ExitReason::UNKNOWN => panic!(
-                        "Vcpu exited unexpectedly at address {:#x}",
-                        vm.vcpu.get_reg(av::Reg::PC)?
-                    ),
                 }
-            }
+                av::ExitReason::CANCELED => ExitKind::Timeout,
+                av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
+                av::ExitReason::UNKNOWN => panic!(
+                    "Vcpu exited unexpectedly at address {:#x}",
+                    vm.vcpu.get_reg(av::Reg::PC)?
+                ),
+            },
         };
 
         match exit {
