@@ -37,3 +37,7 @@ path = "examples/gdb_stub/src/main.rs"
 [[example]]
 name = "ebpf_syscall_guard"
 path = "examples/ebpf_syscall_guard/src/main.rs"
+
+[[example]]
+name = "strace"
+path = "examples/strace/src/main.rs"

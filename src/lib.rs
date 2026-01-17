@@ -4,6 +4,7 @@ pub mod dyld_cache_format;
 pub mod gdb;
 pub mod loader;
 pub mod syscalls;
+pub mod trap;
 pub mod vm;
 
 pub mod hyperpom;
