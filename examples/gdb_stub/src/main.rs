@@ -6,7 +6,7 @@ use appbox::applevisor as av;
 use appbox::hyperpom::crash::ExitKind;
 use appbox::hyperpom::error::ExceptionError;
 use appbox::hyperpom::exceptions::ExceptionClass;
-use appbox::vm::VmManager;
+use appbox::vm::{VmManager, VmRunResult};
 
 #[derive(Parser)]
 pub struct Args {
@@ -83,7 +83,7 @@ fn main() -> Result<(), anyhow::Error> {
     let mut single_step_breakpoint: Option<u64> = None;
 
     loop {
-        vm.vcpu.run()?;
+        let run_result = vm.run()?;
         while let Ok(cmd) = command_receiver.try_recv() {
             match cmd {
                 appbox::gdb::GdbCommand::Continue => {
@@ -115,68 +115,71 @@ fn main() -> Result<(), anyhow::Error> {
         }
 
         // https://github.com/kallsyms/hyperpom/blob/a1dd1aebd8f306bb8549595d9d1506c2a361f0d7/src/core.rs#L1535
-        let exit_info = vm.vcpu.get_exit_info();
-        let exit = match exit_info.reason {
-            av::ExitReason::EXCEPTION => {
-                match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
-                    ExceptionClass::HvcA64 => {
-                        let pc = vm.vcpu.get_reg(av::Reg::PC)?;
-                        println!("HVC call at {:#x}", pc);
-                        ExitKind::Exit
-                    }
-                    ExceptionClass::BrkA64 => {
-                        let pc = vm.vcpu.get_reg(av::Reg::PC)?;
+        let exit = match run_result {
+            VmRunResult::Svc => {
+                let pc = vm.vcpu.get_reg(av::Reg::PC)?;
+                println!("HVC call at {:#x}", pc);
+                ExitKind::Exit
+            }
+            VmRunResult::Brk => {
+                let pc = vm.vcpu.get_reg(av::Reg::PC)?;
 
-                        // Check if this is our single step breakpoint
-                        if Some(pc) == single_step_breakpoint {
-                            println!("Single step completed at {:#x}", pc);
-                            // Remove the single step breakpoint
-                            vm.hooks.remove_breakpoint(pc, &mut vm.vma)?;
-                            single_step_breakpoint = None;
-                            // Don't handle as normal breakpoint since we removed it
-                            ExitKind::Continue
-                        } else {
-                            println!("Breakpoint hit at {:#x}", pc);
-                            // Restore original instruction at PC for debugger visibility
-                            vm.hooks.prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)?;
-                            ExitKind::Continue
-                        }
-                    }
-                    ExceptionClass::InsAbortLowerEl => {
-                        let pc = vm.vcpu.get_reg(av::Reg::PC)?;
-                        println!("Instruction Abort (Lower EL) at {:#x}", pc);
+                // Check if this is our single step breakpoint
+                if Some(pc) == single_step_breakpoint {
+                    println!("Single step completed at {:#x}", pc);
+                    // Remove the single step breakpoint
+                    vm.hooks.remove_breakpoint(pc, &mut vm.vma)?;
+                    single_step_breakpoint = None;
+                    // Don't handle as normal breakpoint since we removed it
+                    ExitKind::Continue
+                } else {
+                    println!("Breakpoint hit at {:#x}", pc);
+                    // Restore original instruction at PC for debugger visibility
+                    vm.hooks.prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)?;
+                    ExitKind::Continue
+                }
+            }
+            VmRunResult::Other(exit_info) => match exit_info.reason {
+                av::ExitReason::EXCEPTION => {
+                    match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
+                        ExceptionClass::InsAbortLowerEl => {
+                            let pc = vm.vcpu.get_reg(av::Reg::PC)?;
+                            println!("Instruction Abort (Lower EL) at {:#x}", pc);
 
-                        // Send SIGSEGV signal to GDB to indicate fault
-                        if let Some(ref sender) = notification_sender {
-                            appbox::gdb::send_sigsegv(sender);
-                        }
+                            // Send SIGSEGV signal to GDB to indicate fault
+                            if let Some(ref sender) = notification_sender {
+                                appbox::gdb::send_sigsegv(sender);
+                            }
 
-                        // Enter GDB evaluation loop for system state inspection
-                        loop {
-                            if let Ok(cmd) = command_receiver.recv() {
-                                match cmd {
-                                    appbox::gdb::GdbCommand::Continue => break,
-                                    _ => {
-                                        appbox::gdb::handle_command(cmd, &mut vm, &response_sender)
+                            // Enter GDB evaluation loop for system state inspection
+                            loop {
+                                if let Ok(cmd) = command_receiver.recv() {
+                                    match cmd {
+                                        appbox::gdb::GdbCommand::Continue => break,
+                                        _ => appbox::gdb::handle_command(
+                                            cmd,
+                                            &mut vm,
+                                            &response_sender,
+                                        ),
                                     }
                                 }
                             }
-                        }
 
-                        // Always crash after inspection - no recovery possible
-                        ExitKind::Crash("Instruction Abort".to_string())
+                            // Always crash after inspection - no recovery possible
+                            ExitKind::Crash("Instruction Abort".to_string())
+                        }
+                        _ => Err(ExceptionError::UnimplementedException(
+                            exit_info.exception.syndrome,
+                        ))?,
                     }
-                    _ => Err(ExceptionError::UnimplementedException(
-                        exit_info.exception.syndrome,
-                    ))?,
                 }
-            }
-            av::ExitReason::CANCELED => ExitKind::Timeout,
-            av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
-            av::ExitReason::UNKNOWN => panic!(
-                "Vcpu exited unexpectedly at address {:#x}",
-                vm.vcpu.get_reg(av::Reg::PC)?
-            ),
+                av::ExitReason::CANCELED => ExitKind::Timeout,
+                av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
+                av::ExitReason::UNKNOWN => panic!(
+                    "Vcpu exited unexpectedly at address {:#x}",
+                    vm.vcpu.get_reg(av::Reg::PC)?
+                ),
+            },
         };
 
         match exit {

@@ -3,8 +3,6 @@ name = "appbox"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 applevisor = "0.1.2"
 applevisor-sys = "0.1.1"
@@ -23,11 +21,19 @@ rhexdump = "0.1.1"
 [dev-dependencies]
 clap = "4.5.40"
 clap-verbosity-flag = "3.0.3"
+rbpf = "0.4.0"
 
 [build-dependencies]
 bindgen = "0.63.0"
 ureq = { version = "2", features = ["tls"] }
 
+[profile.release]
+debug = true
+
 [[example]]
 name = "gdb_stub"
 path = "examples/gdb_stub/src/main.rs"
+
+[[example]]
+name = "ebpf_syscall_guard"
+path = "examples/ebpf_syscall_guard/src/main.rs"
