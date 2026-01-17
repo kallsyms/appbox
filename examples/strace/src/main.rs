@@ -71,22 +71,43 @@ fn formatters_by_syscall() -> &'static HashMap<u64, Vec<ArgFormat>> {
         );
         map.insert(appbox::syscalls::SYS_shm_open, vec![Str, Hex, Octal]);
         map.insert(appbox::syscalls::SYS_shared_region_check_np, vec![Ptr]);
-        map.insert(appbox::syscalls::SYS_proc_info, vec![Hex, Hex, Hex, Hex, Hex]);
+        map.insert(
+            appbox::syscalls::SYS_proc_info,
+            vec![Hex, Hex, Hex, Hex, Hex],
+        );
         map.insert(appbox::syscalls::SYS_read_nocancel, vec![Dec, Ptr, Size]);
         map.insert(appbox::syscalls::SYS_write_nocancel, vec![Dec, Ptr, Size]);
         map.insert(appbox::syscalls::SYS_open_nocancel, vec![Str, Hex, Octal]);
-        map.insert(appbox::syscalls::SYS_pread_nocancel, vec![Dec, Ptr, Size, Dec]);
+        map.insert(
+            appbox::syscalls::SYS_pread_nocancel,
+            vec![Dec, Ptr, Size, Dec],
+        );
         map.insert(appbox::syscalls::SYS_openat, vec![Dec, Str, Hex, Octal]);
-        map.insert(appbox::syscalls::SYS_openat_nocancel, vec![Dec, Str, Hex, Octal]);
+        map.insert(
+            appbox::syscalls::SYS_openat_nocancel,
+            vec![Dec, Str, Hex, Octal],
+        );
 
-        map.insert(appbox::syscalls::TRAP_mach_vm_allocate, vec![Hex, Ptr, Size, Hex]);
-        map.insert(appbox::syscalls::TRAP_mach_vm_deallocate, vec![Hex, Ptr, Size]);
-        map.insert(appbox::syscalls::TRAP_mach_vm_protect, vec![Hex, Ptr, Size, Hex]);
+        map.insert(
+            appbox::syscalls::TRAP_mach_vm_allocate,
+            vec![Hex, Ptr, Size, Hex],
+        );
+        map.insert(
+            appbox::syscalls::TRAP_mach_vm_deallocate,
+            vec![Hex, Ptr, Size],
+        );
+        map.insert(
+            appbox::syscalls::TRAP_mach_vm_protect,
+            vec![Hex, Ptr, Size, Hex],
+        );
         map.insert(
             appbox::syscalls::TRAP_mach_vm_map,
             vec![Hex, Ptr, Size, Hex, Hex, Hex, Hex, Hex, Hex],
         );
-        map.insert(appbox::syscalls::TRAP_mach_msg2, vec![Ptr, Hex, Size, Hex, Hex]);
+        map.insert(
+            appbox::syscalls::TRAP_mach_msg2,
+            vec![Ptr, Hex, Size, Hex, Hex],
+        );
 
         map
     })
@@ -97,7 +118,11 @@ fn default_formatters() -> &'static [ArgFormat] {
     &DEFAULT
 }
 
-fn format_arg(vma: &mut appbox::hyperpom::memory::VirtMemAllocator, fmt: ArgFormat, val: u64) -> String {
+fn format_arg(
+    vma: &mut appbox::hyperpom::memory::VirtMemAllocator,
+    fmt: ArgFormat,
+    val: u64,
+) -> String {
     match fmt {
         ArgFormat::Hex => format!("0x{:x}", val),
         ArgFormat::Dec => format!("{}", val),
@@ -114,10 +139,7 @@ fn format_arg(vma: &mut appbox::hyperpom::memory::VirtMemAllocator, fmt: ArgForm
     }
 }
 
-fn format_c_string(
-    vma: &mut appbox::hyperpom::memory::VirtMemAllocator,
-    addr: u64,
-) -> String {
+fn format_c_string(vma: &mut appbox::hyperpom::memory::VirtMemAllocator, addr: u64) -> String {
     if addr == 0 {
         return "NULL".to_string();
     }
@@ -257,16 +279,16 @@ fn main() -> Result<()> {
             }
             VmRunResult::Brk => ExitKind::Continue,
             VmRunResult::Other(exit_info) => match exit_info.reason {
-                av::ExitReason::EXCEPTION => match ExceptionClass::from(
-                    exit_info.exception.syndrome >> 26,
-                ) {
-                    ExceptionClass::InsAbortLowerEl => {
-                        ExitKind::Crash("Instruction Abort".to_string())
+                av::ExitReason::EXCEPTION => {
+                    match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
+                        ExceptionClass::InsAbortLowerEl => {
+                            ExitKind::Crash("Instruction Abort".to_string())
+                        }
+                        _ => Err(ExceptionError::UnimplementedException(
+                            exit_info.exception.syndrome,
+                        ))?,
                     }
-                    _ => Err(ExceptionError::UnimplementedException(
-                        exit_info.exception.syndrome,
-                    ))?,
-                },
+                }
                 av::ExitReason::CANCELED => ExitKind::Timeout,
                 av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
                 av::ExitReason::UNKNOWN => {
