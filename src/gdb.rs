@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use applevisor as av;
 use crate::vm::VmManager;
+use applevisor as av;
 
 #[derive(Debug, Clone)]
 pub struct GdbFeatures {
@@ -29,8 +29,8 @@ impl Default for GdbFeatures {
 // Bytes for each register in the order defined by TARGET_XML
 // x0..x30 (31), sp, pc are 8 bytes; cpsr is 4 bytes
 const GDB_REG_SIZES: [usize; 34] = [
-    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-    8, 8, 8, 8, 8, 8, // x0..x30
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, // x0..x30
     8, // sp
     8, // pc
     4, // cpsr
@@ -172,7 +172,8 @@ impl GdbRegister {
 // GDB Command Handlers
 fn build_supported_string(features: &GdbFeatures) -> String {
     let mut supported =
-        "PacketSize=4000;swbreak+;hwbreak+;qXfer:features:read+;QStartNoAckMode+;vContSupported+".to_string();
+        "PacketSize=4000;swbreak+;hwbreak+;qXfer:features:read+;QStartNoAckMode+;vContSupported+"
+            .to_string();
 
     if features.reverse_continue {
         supported.push_str(";ReverseContinue+");
@@ -222,7 +223,11 @@ fn handle_vcont_run(command: &str, command_sender: &Sender<GdbCommand>) {
     //  - "vCont;S0b:1" (step with signal)
     // For now we ignore thread ids and signals and choose the strongest action:
     // any ";s" or ";S" implies Step, otherwise any ";c" or ";C" implies Continue.
-    if command.contains(";s") || command.starts_with("vCont;s") || command.contains(";S") || command.starts_with("vCont;S") {
+    if command.contains(";s")
+        || command.starts_with("vCont;s")
+        || command.contains(";S")
+        || command.starts_with("vCont;S")
+    {
         let _ = command_sender.send(GdbCommand::Step);
     } else {
         let _ = command_sender.send(GdbCommand::Continue);
@@ -338,7 +343,11 @@ fn handle_register_read(
             .unwrap();
         match response_receiver.lock().unwrap().recv().unwrap() {
             GdbResponse::RegisterValue(val) => {
-                let size = if reg < GDB_REG_SIZES.len() { GDB_REG_SIZES[reg] } else { 8 };
+                let size = if reg < GDB_REG_SIZES.len() {
+                    GDB_REG_SIZES[reg]
+                } else {
+                    8
+                };
                 let mut reg_data = String::new();
                 for byte in val.to_le_bytes()[..size].iter() {
                     reg_data.push_str(&format!("{:02x}", byte));
@@ -436,7 +445,11 @@ fn handle_all_registers(
         GdbResponse::RegisterData(regs) => {
             let mut reg_data = String::new();
             for (i, reg) in regs.iter().enumerate() {
-                let size = if i < GDB_REG_SIZES.len() { GDB_REG_SIZES[i] } else { 8 };
+                let size = if i < GDB_REG_SIZES.len() {
+                    GDB_REG_SIZES[i]
+                } else {
+                    8
+                };
                 for byte in reg.to_le_bytes()[..size].iter() {
                     reg_data.push_str(&format!("{:02x}", byte));
                 }

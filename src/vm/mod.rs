@@ -1,10 +1,10 @@
 use self::hooks::Hooks;
-use anyhow::Result;
 use crate::hyperpom::applevisor as av;
 use crate::hyperpom::caches::Caches;
 use crate::hyperpom::error::{Error as HyperpomError, MemoryError};
 use crate::hyperpom::exceptions::ExceptionClass;
 use crate::hyperpom::memory::{PhysMemAllocator, VirtMemAllocator};
+use anyhow::Result;
 use mmap_fixed_fixed::MemoryMap;
 use std::rc::Rc;
 
@@ -18,11 +18,12 @@ pub enum VmRunResult {
 
 pub struct VmManager {
     pub vcpu: av::Vcpu,
-    _vm: av::VirtualMachine,
     pub vma: VirtMemAllocator,
     pub hooks: Hooks,
     pub(crate) mappings: Vec<Rc<MemoryMap>>,
     stopped: bool,
+    // Drop vCPU before VM; VM teardown fails if vCPU is still alive.
+    _vm: av::VirtualMachine,
 }
 
 impl VmManager {
@@ -39,11 +40,11 @@ impl VmManager {
 
         Ok(Self {
             vcpu,
-            _vm: vm,
             vma,
             hooks,
             mappings: Vec::new(),
             stopped: false,
+            _vm: vm,
         })
     }
 

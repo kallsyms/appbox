@@ -201,86 +201,83 @@ fn main() -> Result<()> {
         println!("Running guest at PC={:#x}", vm.vcpu.get_reg(av::Reg::PC)?);
         let exit = match vm.run()? {
             VmRunResult::Svc => {
-                        let elr = vm.vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
-                        let esr = vm.vcpu.get_sys_reg(av::SysReg::ESR_EL1)?;
-                        println!("HVC called at ELR={:#x} ESR={:#x}", elr, esr);
-                        if esr != 0x56000080 {
-                            warn!("Unhandled ESR_EL1 value: {:#x}", esr);
-                            ExitKind::Crash("Unhandled fault".to_string())
-                        } else {
-                            let num = vm.vcpu.get_reg(av::Reg::X16)?;
-                            println!("Guest syscall: {}", num);
-                            let args = [
-                                vm.vcpu.get_reg(av::Reg::X0)?,
-                                vm.vcpu.get_reg(av::Reg::X1)?,
-                                vm.vcpu.get_reg(av::Reg::X2)?,
-                                vm.vcpu.get_reg(av::Reg::X3)?,
-                                vm.vcpu.get_reg(av::Reg::X4)?,
-                                vm.vcpu.get_reg(av::Reg::X5)?,
-                                vm.vcpu.get_reg(av::Reg::X6)?,
-                                vm.vcpu.get_reg(av::Reg::X7)?,
-                                vm.vcpu.get_reg(av::Reg::X8)?,
-                                vm.vcpu.get_reg(av::Reg::X9)?,
-                                vm.vcpu.get_reg(av::Reg::X10)?,
-                                vm.vcpu.get_reg(av::Reg::X11)?,
-                                vm.vcpu.get_reg(av::Reg::X12)?,
-                                vm.vcpu.get_reg(av::Reg::X13)?,
-                                vm.vcpu.get_reg(av::Reg::X14)?,
-                                vm.vcpu.get_reg(av::Reg::X15)?,
-                            ];
+                let elr = vm.vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
+                let esr = vm.vcpu.get_sys_reg(av::SysReg::ESR_EL1)?;
+                println!("HVC called at ELR={:#x} ESR={:#x}", elr, esr);
+                if esr != 0x56000080 {
+                    warn!("Unhandled ESR_EL1 value: {:#x}", esr);
+                    ExitKind::Crash("Unhandled fault".to_string())
+                } else {
+                    let num = vm.vcpu.get_reg(av::Reg::X16)?;
+                    println!("Guest syscall: {}", num);
+                    let args = [
+                        vm.vcpu.get_reg(av::Reg::X0)?,
+                        vm.vcpu.get_reg(av::Reg::X1)?,
+                        vm.vcpu.get_reg(av::Reg::X2)?,
+                        vm.vcpu.get_reg(av::Reg::X3)?,
+                        vm.vcpu.get_reg(av::Reg::X4)?,
+                        vm.vcpu.get_reg(av::Reg::X5)?,
+                        vm.vcpu.get_reg(av::Reg::X6)?,
+                        vm.vcpu.get_reg(av::Reg::X7)?,
+                        vm.vcpu.get_reg(av::Reg::X8)?,
+                        vm.vcpu.get_reg(av::Reg::X9)?,
+                        vm.vcpu.get_reg(av::Reg::X10)?,
+                        vm.vcpu.get_reg(av::Reg::X11)?,
+                        vm.vcpu.get_reg(av::Reg::X12)?,
+                        vm.vcpu.get_reg(av::Reg::X13)?,
+                        vm.vcpu.get_reg(av::Reg::X14)?,
+                        vm.vcpu.get_reg(av::Reg::X15)?,
+                    ];
 
-                            if num == appbox::syscalls::SYS_exit {
-                                ExitKind::Exit
-                            } else {
-                                let ctx = SyscallContext {
-                                    syscall_number: num,
-                                    args,
-                                };
-                                bpf_mem.fill(0);
-                                unsafe {
-                                    ptr::copy_nonoverlapping(
-                                        &ctx as *const SyscallContext as *const u8,
-                                        bpf_mem.as_mut_ptr(),
-                                        mem::size_of::<SyscallContext>(),
-                                    );
-                                }
-
-                                let _guard = HelperGuard::new(&mut vm.vma, &mut bpf_mem);
-                                let decision = bpf_vm
-                                    .execute_program(&mut bpf_mem)
-                                    .map_err(|e| anyhow!("rbpf exec: {e}"))?;
-
-                                let (exit, ret0, ret1, cflags) = match decision {
-                                    0 => {
-                                        let (ret0, ret1, cflags) = forward_syscall(num, &args);
-                                        (ExitKind::Continue, ret0, ret1, cflags)
-                                    }
-                                    1 => (ExitKind::Continue, nix::libc::EPERM as u64, 0, 1 << 29),
-                                    2 => {
-                                        info!("Killed by eBPF policy");
-                                        (
-                                            ExitKind::Crash("Killed by eBPF policy".to_string()),
-                                            0,
-                                            0,
-                                            0,
-                                        )
-                                    }
-                                    _ => (ExitKind::Continue, nix::libc::EPERM as u64, 0, 1 << 29),
-                                };
-
-                                if !matches!(exit, ExitKind::Continue) {
-                                    exit
-                                } else {
-                                    debug!(
-                                        "Returning x0={:x} x1={:x} cflags={:x}",
-                                        ret0, ret1, cflags
-                                    );
-
-                                    write_syscall_result(&mut vm.vcpu, elr, ret0, ret1, cflags)?;
-                                    ExitKind::Continue
-                                }
-                            }
+                    if num == appbox::syscalls::SYS_exit {
+                        ExitKind::Exit
+                    } else {
+                        let ctx = SyscallContext {
+                            syscall_number: num,
+                            args,
+                        };
+                        bpf_mem.fill(0);
+                        unsafe {
+                            ptr::copy_nonoverlapping(
+                                &ctx as *const SyscallContext as *const u8,
+                                bpf_mem.as_mut_ptr(),
+                                mem::size_of::<SyscallContext>(),
+                            );
                         }
+
+                        let _guard = HelperGuard::new(&mut vm.vma, &mut bpf_mem);
+                        let decision = bpf_vm
+                            .execute_program(&mut bpf_mem)
+                            .map_err(|e| anyhow!("rbpf exec: {e}"))?;
+
+                        let (exit, ret0, ret1, cflags) = match decision {
+                            0 => {
+                                let (ret0, ret1, cflags) = forward_syscall(num, &args);
+                                (ExitKind::Continue, ret0, ret1, cflags)
+                            }
+                            1 => (ExitKind::Continue, nix::libc::EPERM as u64, 0, 1 << 29),
+                            2 => {
+                                info!("Killed by eBPF policy");
+                                (
+                                    ExitKind::Crash("Killed by eBPF policy".to_string()),
+                                    0,
+                                    0,
+                                    0,
+                                )
+                            }
+                            _ => (ExitKind::Continue, nix::libc::EPERM as u64, 0, 1 << 29),
+                        };
+
+                        if !matches!(exit, ExitKind::Continue) {
+                            exit
+                        } else {
+                            debug!("Returning x0={:x} x1={:x} cflags={:x}", ret0, ret1, cflags);
+
+                            write_syscall_result(&mut vm.vcpu, elr, ret0, ret1, cflags)?;
+                            ExitKind::Continue
+                        }
+                    }
+                }
             }
             VmRunResult::Brk => ExitKind::Continue,
             VmRunResult::Other(exit_info) => {
