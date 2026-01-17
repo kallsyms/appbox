@@ -1,7 +1,7 @@
 use self::hooks::Hooks;
 use anyhow::Result;
-use hyperpom::applevisor as av;
-use hyperpom::memory::{PhysMemAllocator, VirtMemAllocator};
+use crate::hyperpom::applevisor as av;
+use crate::hyperpom::memory::{PhysMemAllocator, VirtMemAllocator};
 use mmap_fixed_fixed::MemoryMap;
 use std::rc::Rc;
 
@@ -24,7 +24,7 @@ impl VmManager {
         let hooks = Hooks::new();
 
         vma.init(&mut vcpu, true)?;
-        hyperpom::caches::Caches::init(&mut vcpu, &mut vma)?;
+        crate::hyperpom::caches::Caches::init(&mut vcpu, &mut vma)?;
         vcpu.set_reg(av::Reg::LR, 0xdeadf000)?;
 
         Ok(Self {

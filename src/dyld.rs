@@ -10,7 +10,7 @@ use anyhow::{bail, Result};
 use log::{debug, trace};
 use mmap_fixed_fixed::{MapOption, MemoryMap};
 
-use hyperpom::applevisor as av;
+use crate::hyperpom::applevisor as av;
 
 use crate::dyld_cache_format::*;
 

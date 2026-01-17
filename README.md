@@ -42,13 +42,13 @@ debug!("executor returned: {:?}", ret);
 ### Basic Flow
 When the `AppBox` is run:
 * A "blank" VM is created.
-* Hyperpom is configured with an `AppBoxLoader` which:
+* The `AppBoxLoader` prepares the guest environment:
     * Loads the executable (and dyld) into memory.
     * Sets up the stack as required by the runtime.
     * Sets up the commpage.
     * Initializes thread local storage.
     * Maps the dyld shared cache.
-* The Hyperpom `Executor` is then run which initializes registers, and starts the VM.
+* AppBox initializes registers and starts the VM run loop.
 
 Then, when the guest/application traps out (usually due to a syscall or mach trap causing the VM to trap to EL1), the `AppBoxTrapHandler` passed into the `AppBox` is called back where it can decide what to do with the event (e.g. forward the syscall to the host), and then resume the guest.
 
@@ -63,9 +63,5 @@ One of the most difficult parts of creating isolated VMs for Mac binaries is map
 dyld is intertwined into the OS and changes not infrequently.
 AppBox implements just enough to load an arm64 shared cache as of macOS Ventura (13.x), so run on/use a shared cache from Ventura if you run into issues.
 
-### Building on Hyperpom
-Hyperpom was originally created for fuzzing, and has a very different intended usage pattern than AppBox.
-AppBox intends a VM to be run once then be torn down, and cares about keeping state in a separate `AppBoxTrapHandler` outside of/independent from the Hyperpom `Executor`.
-
 ## Credits
-As noted, AppBox uses a fork of [hyperpom](https://github.com/Impalabs/hyperpom) to manage VM setup, most notably handling the construction of the required page tables.
+As noted, AppBox vendors part of [hyperpom](https://github.com/Impalabs/hyperpom) to manage VM setup, most notably handling the construction of the required page tables.

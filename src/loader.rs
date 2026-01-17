@@ -10,7 +10,7 @@ use std::os::unix::prelude::FileExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use hyperpom::applevisor as av;
+use crate::hyperpom::applevisor as av;
 
 pub fn load_macho(
     vm: &mut VmManager,

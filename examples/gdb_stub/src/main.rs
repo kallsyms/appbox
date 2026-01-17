@@ -59,6 +59,7 @@ fn main() -> Result<(), anyhow::Error> {
             command_sender,
             response_receiver,
             None,
+            appbox::gdb::GdbFeatures::default(),
         )?)
     } else {
         None
@@ -69,10 +70,11 @@ fn main() -> Result<(), anyhow::Error> {
             info!("Waiting for GDB connection...");
             loop {
                 if let Ok(cmd) = command_receiver.recv() {
-                    if let appbox::gdb::GdbCommand::Continue = cmd {
-                        break;
+                    match cmd {
+                        appbox::gdb::GdbCommand::Continue => break,
+                        appbox::gdb::GdbCommand::Kill => return Ok(()),
+                        _ => appbox::gdb::handle_command(cmd, &mut vm, &response_sender),
                     }
-                    appbox::gdb::handle_command(cmd, &mut vm, &response_sender);
                 }
             }
         }
@@ -105,6 +107,7 @@ fn main() -> Result<(), anyhow::Error> {
                     single_step_breakpoint = Some(next_pc);
                     break;
                 }
+                appbox::gdb::GdbCommand::Kill => return Ok(()),
                 _ => {
                     appbox::gdb::handle_command(cmd, &mut vm, &response_sender);
                 }

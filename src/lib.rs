@@ -6,7 +6,7 @@ pub mod loader;
 pub mod syscalls;
 pub mod vm;
 
-pub extern crate hyperpom;
+pub mod hyperpom;
 pub mod applevisor {
-    pub use hyperpom::applevisor::*;
+    pub use applevisor::*;
 }

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::applevisor as av;
+use applevisor as av;
 use crate::vm::VmManager;
 
 #[derive(Debug, Clone)]

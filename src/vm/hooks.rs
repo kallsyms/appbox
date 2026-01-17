@@ -1,8 +1,7 @@
 use anyhow::{bail, Result};
 use bitfield::bitfield;
-use hyperpom::applevisor as av;
-use hyperpom::caches::*;
-use hyperpom::memory::VirtMemAllocator;
+use crate::hyperpom::applevisor as av;
+use crate::hyperpom::memory::VirtMemAllocator;
 use log::trace;
 use std::collections::{hash_map::Entry, HashMap};
 
