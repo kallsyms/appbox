@@ -42,10 +42,13 @@ fn main() -> Result<(), anyhow::Error> {
 
     let mut vm = VmManager::new()?;
 
+    let mut argv = Vec::new();
+    argv.push(args.executable.clone());
+    argv.extend(args.arguments.iter().cloned());
     let loader = appbox::loader::load_macho(
         &mut vm,
         &PathBuf::from(args.executable.clone()),
-        vec![args.executable],
+        argv,
         vec![],
     )?;
 
