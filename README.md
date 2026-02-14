@@ -28,7 +28,8 @@ This drastically simplifies the process of handlings traps from the VM, as there
 ### dyld shared cache
 One of the most difficult parts of creating isolated VMs for Mac binaries is mapping the dyld shared cache into the VM.
 dyld is intertwined into the OS and changes not infrequently.
-AppBox implements just enough to load an arm64 shared cache as of macOS Ventura (13.x), so run on/use a shared cache from Ventura if you run into issues.
+AppBox implements just enough to load an arm64 shared cache as of macOS Tahoe (26.x), so run on/use a Tahoe shared cache if you run into issues.
+All that said, minimal work was required to keep dyld bootstrapping for simple programs like `/bin/ls` even through multiple years, so things _might_ just work on newer OSs.
 
 ## Credits
 As noted, AppBox vendors part of [hyperpom](https://github.com/Impalabs/hyperpom) to manage VM setup, most notably handling the construction of the required page tables.
