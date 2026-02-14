@@ -392,7 +392,9 @@ impl TrapHandler for DefaultTrapHandler {
                 // We need to stub a few messages here.
                 // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/mach_traps.h#L465
                 // for trap argument layout.
-                let msgh_id = args[4] >> 32;
+                let header = unsafe { &*(args[0] as *const MachMsgHeader) };
+                let msgh_id = header.msgh_id as u64;
+                let msgh_size = header.msgh_size as usize;
                 match msgh_id {
                     3405 => {
                         // task_info with TASK_DYLD_INFO. Return NOT_FOUND.
@@ -410,6 +412,12 @@ impl TrapHandler for DefaultTrapHandler {
                     4811 => unsafe {
                         // mach_vm_map
                         // https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/mach_vm.defs#L352
+                        if msgh_size < std::mem::size_of::<KernelRpcMachVmMapRequest>() {
+                            ret0 = KERN_DENIED;
+                            ret1 = 0;
+                            cflags = 1 << 29;
+                            return Ok(SyscallResult::cont(ret0, ret1, cflags));
+                        }
                         let req = args[0] as *mut KernelRpcMachVmMapRequest;
                         // In macOS 14, the above does not work for some reason (returning MACH_SEND_INVALID_REPLY), but only on replay.
                         // To get around this, emulate the map behavior with mmap.
@@ -425,7 +433,13 @@ impl TrapHandler for DefaultTrapHandler {
                         }
 
                         let address = (*req).address;
-                        nix::libc::mmap(
+                        if address & (PAGE_ALIGN - 1) != 0 {
+                            ret0 = KERN_DENIED;
+                            ret1 = 0;
+                            cflags = 1 << 29;
+                            return Ok(SyscallResult::cont(ret0, ret1, cflags));
+                        }
+                        let map_ret = nix::libc::mmap(
                             address as _,
                             (*req).size as _,
                             (*req).cur_protection as _,
@@ -435,19 +449,23 @@ impl TrapHandler for DefaultTrapHandler {
                             -1,
                             0,
                         );
-                        vma.map_1to1(address, (*req).size as _, av::MemPerms::RWX)?;
-                        self.record_mapping(address, (*req).size as _);
-
                         let reply = args[0] as *mut KernelRpcMachVmMapReply;
                         (*reply).head.msgh_bits = 0x1200;
                         (*reply).head.msgh_size =
                             std::mem::size_of::<KernelRpcMachVmMapReply>() as _;
                         (*reply).head.msgh_remote_port = 0;
                         (*reply).head.msgh_id = (*reply).head.msgh_id + 100;
-                        (*reply).ret_code = KERN_SUCCESS as _;
-                        (*reply).address = address;
-
-                        ret0 = KERN_SUCCESS;
+                        if map_ret == nix::libc::MAP_FAILED {
+                            (*reply).ret_code = KERN_DENIED as _;
+                            (*reply).address = 0;
+                            ret0 = KERN_DENIED;
+                        } else {
+                            vma.map_1to1(address, (*req).size as _, av::MemPerms::RWX)?;
+                            self.record_mapping(address, (*req).size as _);
+                            (*reply).ret_code = KERN_SUCCESS as _;
+                            (*reply).address = address;
+                            ret0 = KERN_SUCCESS;
+                        }
                         handled = true;
                     },
                     8000 => {
