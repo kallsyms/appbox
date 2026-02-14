@@ -6,6 +6,9 @@ use appbox::applevisor as av;
 use appbox::hyperpom::crash::ExitKind;
 use appbox::hyperpom::error::ExceptionError;
 use appbox::hyperpom::exceptions::ExceptionClass;
+use appbox::trap::{
+    read_syscall_context, write_syscall_result, DefaultTrapHandler, TrapHandler,
+};
 use appbox::vm::{VmManager, VmRunResult};
 
 #[derive(Parser)]
@@ -81,6 +84,7 @@ fn main() -> Result<(), anyhow::Error> {
     }
 
     let mut single_step_breakpoint: Option<u64> = None;
+    let mut handler = DefaultTrapHandler::new();
 
     loop {
         let run_result = vm.run()?;
@@ -117,9 +121,23 @@ fn main() -> Result<(), anyhow::Error> {
         // https://github.com/kallsyms/hyperpom/blob/a1dd1aebd8f306bb8549595d9d1506c2a361f0d7/src/core.rs#L1535
         let exit = match run_result {
             VmRunResult::Svc => {
-                let pc = vm.vcpu.get_reg(av::Reg::PC)?;
-                println!("HVC call at {:#x}", pc);
-                ExitKind::Exit
+                let ctx = read_syscall_context(&mut vm.vcpu)?;
+                let result = handler.handle_syscall(&ctx, &mut vm.vcpu, &mut vm.vma, &loader)?;
+                match result.exit {
+                    ExitKind::Continue => {
+                        if result.write_back {
+                            write_syscall_result(
+                                &mut vm.vcpu,
+                                ctx.elr,
+                                result.ret0,
+                                result.ret1,
+                                result.cflags,
+                            )?;
+                        }
+                        ExitKind::Continue
+                    }
+                    _ => result.exit,
+                }
             }
             VmRunResult::Brk => {
                 let pc = vm.vcpu.get_reg(av::Reg::PC)?;
