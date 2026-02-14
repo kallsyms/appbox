@@ -240,7 +240,7 @@ impl TrapHandler for DefaultTrapHandler {
         vma: &mut VirtMemAllocator,
         loader: &Loader,
     ) -> Result<SyscallResult> {
-        let elr = ctx.elr;
+        let _elr = ctx.elr;
         let esr = ctx.esr;
         if esr != SVC_ESR {
             error!("Unhandled ESR_EL1 value: {:#x}", esr);
@@ -476,7 +476,7 @@ impl TrapHandler for DefaultTrapHandler {
                     _ => {}
                 }
             }
-            0x8000_0000 => {
+            0x8000_0000 | 0xffff_ffff_8000_0000 => {
                 // platform_syscall
                 let code = args[3];
                 match code {
@@ -503,25 +503,31 @@ impl TrapHandler for DefaultTrapHandler {
         // Stage 2.5: map newly allocated memory into the VM as necessary.
         match num {
             syscalls::SYS_mmap => {
-                trace!("1:1 map of {:x} {:x} due to mmap", ret0, args[1]);
-                vma.map_1to1(ret0, args[1] as _, av::MemPerms::RWX)?;
-                self.record_mapping(ret0, args[1] as _);
+                if cflags & (1 << 29) == 0 {
+                    trace!("1:1 map of {:x} {:x} due to mmap", ret0, args[1]);
+                    vma.map_1to1(ret0, args[1] as _, av::MemPerms::RWX)?;
+                    self.record_mapping(ret0, args[1] as _);
+                }
             }
             syscalls::TRAP_mach_vm_allocate => {
-                let addr: u64 = unsafe { *(args[1] as *const u64) };
-                trace!(
-                    "1:1 map of {:x} {:x} due to mach_vm_allocate",
-                    addr,
-                    args[2]
-                );
-                vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
-                self.record_mapping(addr, args[2] as usize);
+                if ret0 == KERN_SUCCESS {
+                    let addr: u64 = unsafe { *(args[1] as *const u64) };
+                    trace!(
+                        "1:1 map of {:x} {:x} due to mach_vm_allocate",
+                        addr,
+                        args[2]
+                    );
+                    vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
+                    self.record_mapping(addr, args[2] as usize);
+                }
             }
             syscalls::TRAP_mach_vm_map => {
-                let addr: u64 = unsafe { *(args[1] as *const u64) };
-                trace!("1:1 map of {:x} {:x} due to mach_vm_map", addr, args[2]);
-                vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
-                self.record_mapping(addr, args[2] as usize);
+                if ret0 == KERN_SUCCESS {
+                    let addr: u64 = unsafe { *(args[1] as *const u64) };
+                    trace!("1:1 map of {:x} {:x} due to mach_vm_map", addr, args[2]);
+                    vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
+                    self.record_mapping(addr, args[2] as usize);
+                }
             }
             _ => {}
         }
