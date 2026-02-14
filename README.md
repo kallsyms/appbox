@@ -4,53 +4,20 @@ AppBox is a framework to load Mach-O executables into a VM and intercept/handle 
 This was originally created to be the foundation for [warpspeed](https://github.com/kallsyms/warpspeed), a record/replay debugger for macOS.
 
 ## Example
-```rust
-pub struct Example { ... }
-
-// AppBoxTrapHandler defines a single method, trap_handler, which is invoked
-// whenever the VM traps out to the host when a syscall, mach trap, etc. is hit.
-impl AppBoxTrapHandler for Example {
-    fn trap_handler(
-        &mut self,
-        vcpu: &mut av::Vcpu,
-        vma: &mut VirtMemAllocator,
-        load_info: &LoadInfo,
-    ) -> Result<ExitKind> {
-        let elr = vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
-        debug!("ELR_EL1: {:#x}", elr);
-        Ok(ExitKind::Continue)
-    }
-}
-
-let handler = RefCell::new(Example{ ... });
-
-// Create the AppBox with the executable, argv, envp, and the struct that implements `AppBoxTrapHandler`.
-let mut app = appbox::AppBox::new(
-    &PathBuf::from(&args.executable),
-    &args.arguments,
-    &env,
-    handler.clone(),
-)
-.unwrap();
-
-// And run!
-let ret = app.run();
-debug!("executor returned: {:?}", ret);
-```
+See the [examples](./examples) directory for a handful of examples of how AppBox is used.
 
 ## 10,000ft Overview
 ### Basic Flow
-When the `AppBox` is run:
-* A "blank" VM is created.
-* The `AppBoxLoader` prepares the guest environment:
+* A "blank" `VmManager` is created.
+* An application (Mach-O) is loaded into the VM:
     * Loads the executable (and dyld) into memory.
     * Sets up the stack as required by the runtime.
     * Sets up the commpage.
     * Initializes thread local storage.
     * Maps the dyld shared cache.
-* AppBox initializes registers and starts the VM run loop.
-
-Then, when the guest/application traps out (usually due to a syscall or mach trap causing the VM to trap to EL1), the `AppBoxTrapHandler` passed into the `AppBox` is called back where it can decide what to do with the event (e.g. forward the syscall to the host), and then resume the guest.
+* `VmManager.run()` is called in a loop:
+    * `run()` returns when the program makes a syscall/mach trap
+    * A `DefaultTrapHandler` can be instantiated and used to automatically handle forwarding syscalls, manage keeping memory  mappings inside the VM consistent, etc. or this can be implemented manually.
 
 ### 1:1 Mappings
 One of the fundamentals of AppBox is that (nearly) all loads are mapped "1 to 1" into the VM.
