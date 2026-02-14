@@ -110,7 +110,10 @@ pub trait TrapHandler {
 pub fn read_syscall_context(vcpu: &mut av::Vcpu) -> Result<SyscallContext> {
     let elr = vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
     let esr = vcpu.get_sys_reg(av::SysReg::ESR_EL1)?;
-    let num = vcpu.get_reg(av::Reg::X16)?;
+    let mut num = vcpu.get_reg(av::Reg::X16)?;
+    if num <= 0xffff_ffff && (num & 0x8000_0000) != 0 {
+        num |= 0xffff_ffff_0000_0000;
+    }
     let args = [
         vcpu.get_reg(av::Reg::X0)?,
         vcpu.get_reg(av::Reg::X1)?,

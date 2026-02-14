@@ -244,7 +244,9 @@ fn main() -> Result<()> {
         let exit = match vm.run()? {
             VmRunResult::Svc => {
                 let ctx = read_syscall_context(&mut vm.vcpu)?;
-                let name = appbox::syscalls::syscall_name(ctx.num).unwrap_or("<unknown>");
+                let name = appbox::syscalls::syscall_name(ctx.num)
+                    .map(|name| name.to_string())
+                    .unwrap_or_else(|| format!("<unknown 0x{:x}>", ctx.num));
                 let args = format_syscall_args(&mut vm.vma, ctx.num, &ctx.args);
 
                 let result = handler.handle_syscall(&ctx, &mut vm.vcpu, &mut vm.vma, &loader)?;
