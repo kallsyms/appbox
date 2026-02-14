@@ -181,7 +181,7 @@ fn main() -> Result<()> {
                         info!("Killed by eBPF policy");
                         SyscallResult::exit(ExitKind::Crash("Killed by eBPF policy".to_string()))
                     }
-                    _ => SyscallResult::cont(nix::libc::EPERM as u64, 0, 1 << 29),
+                    _ => return Err(anyhow!("Invalid eBPF return value: {decision}")),
                 };
 
                 match result.exit {
