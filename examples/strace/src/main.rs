@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use log::{debug, warn};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -248,16 +249,13 @@ fn main() -> Result<()> {
                     .map(|name| name.to_string())
                     .unwrap_or_else(|| format!("<unknown 0x{:x}>", ctx.num));
                 let args = format_syscall_args(&mut vm.vma, ctx.num, &ctx.args);
+                print!("{}({}) = ", name, args.join(", "));
+                std::io::stdout().flush()?;
 
                 let result = handler.handle_syscall(&ctx, &mut vm.vcpu, &mut vm.vma, &loader)?;
                 match result.exit {
                     ExitKind::Continue => {
-                        println!(
-                            "{}({}) = {}",
-                            name,
-                            args.join(", "),
-                            format_syscall_result(&result)
-                        );
+                        println!("{}", format_syscall_result(&result));
                         if result.write_back {
                             debug!(
                                 "Returning x0={:x} x1={:x} cflags={:x}",
@@ -274,7 +272,7 @@ fn main() -> Result<()> {
                         ExitKind::Continue
                     }
                     _ => {
-                        println!("{}({}) = {:?}", name, args.join(", "), result.exit);
+                        println!("{:?}", result.exit);
                         result.exit
                     }
                 }
