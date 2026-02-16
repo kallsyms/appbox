@@ -13,4 +13,4 @@ pub mod applevisor {
     pub use applevisor::*;
 }
 
-pub use debug::format_vm_state;
+pub use debug::{format_user_stack, format_vm_state, unwind_user_stack};

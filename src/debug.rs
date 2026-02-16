@@ -1,5 +1,6 @@
 use crate::hyperpom::applevisor as av;
 use crate::vm::VmManager;
+use std::convert::TryInto;
 use std::fmt::Write as _;
 
 const REG_NAME_WIDTH: usize = 24;
@@ -34,8 +35,8 @@ const GENERAL_REGS: &[(&str, av::Reg)] = &[
     ("X26", av::Reg::X26),
     ("X27", av::Reg::X27),
     ("X28", av::Reg::X28),
-    ("X29", av::Reg::X29),
-    ("X30", av::Reg::X30),
+    ("X29/FP", av::Reg::X29),
+    ("X30/LR", av::Reg::X30),
     ("PC", av::Reg::PC),
     ("FPCR", av::Reg::FPCR),
     ("FPSR", av::Reg::FPSR),
@@ -43,72 +44,6 @@ const GENERAL_REGS: &[(&str, av::Reg)] = &[
 ];
 
 const SYS_REGS: &[(&str, av::SysReg)] = &[
-    ("DBGBVR0_EL1", av::SysReg::DBGBVR0_EL1),
-    ("DBGBCR0_EL1", av::SysReg::DBGBCR0_EL1),
-    ("DBGWVR0_EL1", av::SysReg::DBGWVR0_EL1),
-    ("DBGWCR0_EL1", av::SysReg::DBGWCR0_EL1),
-    ("DBGBVR1_EL1", av::SysReg::DBGBVR1_EL1),
-    ("DBGBCR1_EL1", av::SysReg::DBGBCR1_EL1),
-    ("DBGWVR1_EL1", av::SysReg::DBGWVR1_EL1),
-    ("DBGWCR1_EL1", av::SysReg::DBGWCR1_EL1),
-    ("MDCCINT_EL1", av::SysReg::MDCCINT_EL1),
-    ("MDSCR_EL1", av::SysReg::MDSCR_EL1),
-    ("DBGBVR2_EL1", av::SysReg::DBGBVR2_EL1),
-    ("DBGBCR2_EL1", av::SysReg::DBGBCR2_EL1),
-    ("DBGWVR2_EL1", av::SysReg::DBGWVR2_EL1),
-    ("DBGWCR2_EL1", av::SysReg::DBGWCR2_EL1),
-    ("DBGBVR3_EL1", av::SysReg::DBGBVR3_EL1),
-    ("DBGBCR3_EL1", av::SysReg::DBGBCR3_EL1),
-    ("DBGWVR3_EL1", av::SysReg::DBGWVR3_EL1),
-    ("DBGWCR3_EL1", av::SysReg::DBGWCR3_EL1),
-    ("DBGBVR4_EL1", av::SysReg::DBGBVR4_EL1),
-    ("DBGBCR4_EL1", av::SysReg::DBGBCR4_EL1),
-    ("DBGWVR4_EL1", av::SysReg::DBGWVR4_EL1),
-    ("DBGWCR4_EL1", av::SysReg::DBGWCR4_EL1),
-    ("DBGBVR5_EL1", av::SysReg::DBGBVR5_EL1),
-    ("DBGBCR5_EL1", av::SysReg::DBGBCR5_EL1),
-    ("DBGWVR5_EL1", av::SysReg::DBGWVR5_EL1),
-    ("DBGWCR5_EL1", av::SysReg::DBGWCR5_EL1),
-    ("DBGBVR6_EL1", av::SysReg::DBGBVR6_EL1),
-    ("DBGBCR6_EL1", av::SysReg::DBGBCR6_EL1),
-    ("DBGWVR6_EL1", av::SysReg::DBGWVR6_EL1),
-    ("DBGWCR6_EL1", av::SysReg::DBGWCR6_EL1),
-    ("DBGBVR7_EL1", av::SysReg::DBGBVR7_EL1),
-    ("DBGBCR7_EL1", av::SysReg::DBGBCR7_EL1),
-    ("DBGWVR7_EL1", av::SysReg::DBGWVR7_EL1),
-    ("DBGWCR7_EL1", av::SysReg::DBGWCR7_EL1),
-    ("DBGBVR8_EL1", av::SysReg::DBGBVR8_EL1),
-    ("DBGBCR8_EL1", av::SysReg::DBGBCR8_EL1),
-    ("DBGWVR8_EL1", av::SysReg::DBGWVR8_EL1),
-    ("DBGWCR8_EL1", av::SysReg::DBGWCR8_EL1),
-    ("DBGBVR9_EL1", av::SysReg::DBGBVR9_EL1),
-    ("DBGBCR9_EL1", av::SysReg::DBGBCR9_EL1),
-    ("DBGWVR9_EL1", av::SysReg::DBGWVR9_EL1),
-    ("DBGWCR9_EL1", av::SysReg::DBGWCR9_EL1),
-    ("DBGBVR10_EL1", av::SysReg::DBGBVR10_EL1),
-    ("DBGBCR10_EL1", av::SysReg::DBGBCR10_EL1),
-    ("DBGWVR10_EL1", av::SysReg::DBGWVR10_EL1),
-    ("DBGWCR10_EL1", av::SysReg::DBGWCR10_EL1),
-    ("DBGBVR11_EL1", av::SysReg::DBGBVR11_EL1),
-    ("DBGBCR11_EL1", av::SysReg::DBGBCR11_EL1),
-    ("DBGWVR11_EL1", av::SysReg::DBGWVR11_EL1),
-    ("DBGWCR11_EL1", av::SysReg::DBGWCR11_EL1),
-    ("DBGBVR12_EL1", av::SysReg::DBGBVR12_EL1),
-    ("DBGBCR12_EL1", av::SysReg::DBGBCR12_EL1),
-    ("DBGWVR12_EL1", av::SysReg::DBGWVR12_EL1),
-    ("DBGWCR12_EL1", av::SysReg::DBGWCR12_EL1),
-    ("DBGBVR13_EL1", av::SysReg::DBGBVR13_EL1),
-    ("DBGBCR13_EL1", av::SysReg::DBGBCR13_EL1),
-    ("DBGWVR13_EL1", av::SysReg::DBGWVR13_EL1),
-    ("DBGWCR13_EL1", av::SysReg::DBGWCR13_EL1),
-    ("DBGBVR14_EL1", av::SysReg::DBGBVR14_EL1),
-    ("DBGBCR14_EL1", av::SysReg::DBGBCR14_EL1),
-    ("DBGWVR14_EL1", av::SysReg::DBGWVR14_EL1),
-    ("DBGWCR14_EL1", av::SysReg::DBGWCR14_EL1),
-    ("DBGBVR15_EL1", av::SysReg::DBGBVR15_EL1),
-    ("DBGBCR15_EL1", av::SysReg::DBGBCR15_EL1),
-    ("DBGWVR15_EL1", av::SysReg::DBGWVR15_EL1),
-    ("DBGWCR15_EL1", av::SysReg::DBGWCR15_EL1),
     ("MIDR_EL1", av::SysReg::MIDR_EL1),
     ("MPIDR_EL1", av::SysReg::MPIDR_EL1),
     ("ID_AA64PFR0_EL1", av::SysReg::ID_AA64PFR0_EL1),
@@ -125,16 +60,6 @@ const SYS_REGS: &[(&str, av::SysReg)] = &[
     ("TTBR0_EL1", av::SysReg::TTBR0_EL1),
     ("TTBR1_EL1", av::SysReg::TTBR1_EL1),
     ("TCR_EL1", av::SysReg::TCR_EL1),
-    ("APIAKEYLO_EL1", av::SysReg::APIAKEYLO_EL1),
-    ("APIAKEYHI_EL1", av::SysReg::APIAKEYHI_EL1),
-    ("APIBKEYLO_EL1", av::SysReg::APIBKEYLO_EL1),
-    ("APIBKEYHI_EL1", av::SysReg::APIBKEYHI_EL1),
-    ("APDAKEYLO_EL1", av::SysReg::APDAKEYLO_EL1),
-    ("APDAKEYHI_EL1", av::SysReg::APDAKEYHI_EL1),
-    ("APDBKEYLO_EL1", av::SysReg::APDBKEYLO_EL1),
-    ("APDBKEYHI_EL1", av::SysReg::APDBKEYHI_EL1),
-    ("APGAKEYLO_EL1", av::SysReg::APGAKEYLO_EL1),
-    ("APGAKEYHI_EL1", av::SysReg::APGAKEYHI_EL1),
     ("SPSR_EL1", av::SysReg::SPSR_EL1),
     ("ELR_EL1", av::SysReg::ELR_EL1),
     ("SP_EL0", av::SysReg::SP_EL0),
@@ -185,6 +110,48 @@ pub fn format_vm_state(vm: &VmManager) -> String {
         write_reg_line(&mut out, name, vcpu.get_sys_reg(*reg));
     }
 
+    out
+}
+
+pub fn unwind_user_stack(vm: &VmManager, max_frames: usize) -> Vec<u64> {
+    let mut frames = Vec::new();
+    let mut fp = vm.vcpu.get_reg(av::Reg::X29).unwrap_or(0);
+    let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap_or(0);
+    if pc != 0 {
+        frames.push(pc);
+    }
+
+    for _ in 0..max_frames {
+        if fp == 0 || fp & 0x7 != 0 {
+            break;
+        }
+
+        let mut buf = [0u8; 16];
+        if vm.vma.read(fp, &mut buf).is_err() {
+            break;
+        }
+
+        let prev_fp = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let lr = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        if lr == 0 {
+            break;
+        }
+        frames.push(lr);
+        if prev_fp <= fp {
+            break;
+        }
+        fp = prev_fp;
+    }
+
+    frames
+}
+
+pub fn format_user_stack(vm: &VmManager, max_frames: usize) -> String {
+    let mut out = String::new();
+    out.push_str("== User Stack ==\n");
+    for (idx, addr) in unwind_user_stack(vm, max_frames).iter().enumerate() {
+        let _ = writeln!(out, "{:02} 0x{:016x}", idx, addr);
+    }
     out
 }
 
@@ -265,11 +232,5 @@ fn append_cpsr_decode(out: &mut String, cpsr: u32) {
         ssbs,
         width = REG_NAME_WIDTH
     );
-    let _ = writeln!(
-        out,
-        "{:width$} M=0x{:x}",
-        "MODE",
-        m,
-        width = REG_NAME_WIDTH
-    );
+    let _ = writeln!(out, "{:width$} M=0x{:x}", "MODE", m, width = REG_NAME_WIDTH);
 }
