@@ -1,4 +1,5 @@
 use crate::dyld;
+use crate::symbols::{self, MachOSymbolMap, Symbolication};
 use crate::vm::VmManager;
 use anyhow::{bail, Result};
 use log::{debug, trace, warn};
@@ -44,6 +45,7 @@ pub struct Loader {
 
     pub shared_cache: dyld::SharedCache,
     pub mh: u64,
+    pub symbol_maps: Vec<MachOSymbolMap>,
 
     map_fixed_next: usize,
 
@@ -59,10 +61,27 @@ impl Loader {
             environment,
             shared_cache: dyld::SharedCache::new_system_cache()?,
             mh: 0,
+            symbol_maps: Vec::new(),
             map_fixed_next: 0x5_0000_0000,
             entry_point: 0,
             stack_pointer: 0,
         })
+    }
+
+    pub fn symbolicate(&self, addr: u64) -> Option<Symbolication> {
+        for map in &self.symbol_maps {
+            if map.contains_addr(addr) {
+                return map.symbolicate(addr);
+            }
+        }
+        if self.shared_cache.contains_addr(addr) {
+            return self.shared_cache.symbolicate(addr).map(|sym| Symbolication {
+                image: sym.image,
+                symbol: sym.symbol,
+                symbol_addr: sym.symbol_addr,
+            });
+        }
+        None
     }
 
     fn new_mapping(
@@ -168,7 +187,7 @@ impl Loader {
         let slide = reservation.data() as u64 - minaddr;
 
         let mut entrypoint: Option<u64> = None;
-        for MachCommand(cmd, _cmdsize) in mach_commands {
+        for MachCommand(cmd, _cmdsize) in &mach_commands {
             match cmd {
                 LoadCommand::Segment64 {
                     vmaddr,
@@ -177,22 +196,22 @@ impl Loader {
                     filesize,
                     ..
                 } => {
-                    if filesize > 0 {
+                    if *filesize > 0 {
                         let slid_addr = unsafe {
                             reservation
                                 .data()
-                                .offset(vmaddr as isize - minaddr as isize)
+                                .offset(*vmaddr as isize - minaddr as isize)
                                 as _
                         };
                         trace!(
                             "mapping 0x{:x} bytes at {:p} from offset 0x{:x}",
                             filesize,
                             slid_addr,
-                            arch_file_offset + fileoff as u64
+                            arch_file_offset + *fileoff as u64
                         );
                         let mapping = self.new_mapping(
                             vm,
-                            vmsize,
+                            *vmsize,
                             &[
                                 MapOption::MapReadable,
                                 MapOption::MapWritable,
@@ -200,11 +219,11 @@ impl Loader {
                             ],
                         )?;
                         executable_file.read_exact_at(
-                            unsafe { std::slice::from_raw_parts_mut(mapping.data(), filesize) },
-                            arch_file_offset + fileoff as u64,
+                            unsafe { std::slice::from_raw_parts_mut(mapping.data(), *filesize) },
+                            arch_file_offset + *fileoff as u64,
                         )?;
 
-                        if fileoff == 0 && mach_header.filetype == mach_object::MH_EXECUTE {
+                        if *fileoff == 0 && mach_header.filetype == mach_object::MH_EXECUTE {
                             trace!("setting mh to {:p}", mapping.data());
                             self.mh = mapping.data() as _;
                         }
@@ -226,6 +245,16 @@ impl Loader {
                 }
                 _ => {}
             }
+        }
+
+        if let Ok(Some(map)) = symbols::load_macho_symbols(
+            path,
+            &executable_data,
+            arch_file_offset,
+            &mach_commands,
+            slide,
+        ) {
+            self.symbol_maps.push(map);
         }
 
         if self.entry_point == 0 {
