@@ -111,7 +111,7 @@ pub fn read_syscall_context(vcpu: &mut av::Vcpu) -> Result<SyscallContext> {
     let elr = vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
     let esr = vcpu.get_sys_reg(av::SysReg::ESR_EL1)?;
     let mut num = vcpu.get_reg(av::Reg::X16)?;
-    if num <= 0xffff_ffff && (num & 0x8000_0000) != 0 {
+    if num <= 0xffff_ffff && (num & 0x8000_0000) != 0 && num != 0x8000_0000 {
         num |= 0xffff_ffff_0000_0000;
     }
     let args = [
@@ -494,7 +494,7 @@ impl TrapHandler for DefaultTrapHandler {
                     _ => {}
                 }
             }
-            0x8000_0000 | 0xffff_ffff_8000_0000 => {
+            0x8000_0000 => {
                 // platform_syscall
                 let code = args[3];
                 match code {
