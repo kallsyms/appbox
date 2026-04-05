@@ -31,6 +31,7 @@ unsafe extern "C" {
     fn mach_vm_deallocate(target: nix::libc::mach_port_t, address: u64, size: u64) -> i32;
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct MachMsgHeader {
     msgh_bits: u32,
@@ -41,6 +42,7 @@ struct MachMsgHeader {
     msgh_id: u32,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct MigReplyError {
     hdr: MachMsgHeader,
@@ -48,6 +50,7 @@ struct MigReplyError {
     ret_code: u32,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct KernelRpcMachVmMapRequest {
     head: MachMsgHeader,
@@ -68,6 +71,7 @@ struct KernelRpcMachVmMapRequest {
     inheritance: i32,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct KernelRpcMachVmMapReply {
     head: MachMsgHeader,
@@ -525,25 +529,26 @@ impl TrapHandler for DefaultTrapHandler {
                             cflags = 1 << 29;
                             return Ok(SyscallResult::cont(ret0, ret1, cflags));
                         }
-                        let req = args[0] as *mut KernelRpcMachVmMapRequest;
+                        let req_ptr = args[0] as *mut KernelRpcMachVmMapRequest;
+                        let mut req = std::ptr::read_unaligned(req_ptr);
                         // In macOS 14, the above does not work for some reason (returning MACH_SEND_INVALID_REPLY), but only on replay.
                         // To get around this, emulate the map behavior with mmap.
                         // TODO: this assumes object == 0.
-                        (*req).size = Self::align_size((*req).size);
-                        let released_fixed_range = if (*req).flags & 1 != 0 {
-                            Some((*req).size)
+                        req.size = Self::align_size(req.size);
+                        let released_fixed_range = if req.flags & 1 != 0 {
+                            Some(req.size)
                         } else {
                             None
                         };
-                        if (*req).flags & 1 != 0 {
-                            let chosen =
-                                self.reserve_fixed_address((*req).size, Some((*req).mask));
+                        if req.flags & 1 != 0 {
+                            let chosen = self.reserve_fixed_address(req.size, Some(req.mask));
                             trace!("Fixing kernelrpc_mach_vm_map address to {:x}", chosen);
-                            self.release_fixed_map_range(chosen, (*req).size)?;
-                            (*req).address = chosen;
+                            self.release_fixed_map_range(chosen, req.size)?;
+                            req.address = chosen;
                         }
+                        std::ptr::write_unaligned(req_ptr, req);
 
-                        let address = (*req).address;
+                        let address = req.address;
                         if address & (PAGE_ALIGN - 1) != 0 {
                             ret0 = KERN_DENIED;
                             ret1 = 0;
@@ -552,34 +557,35 @@ impl TrapHandler for DefaultTrapHandler {
                         }
                         let map_ret = nix::libc::mmap(
                             address as _,
-                            (*req).size as _,
-                            (*req).cur_protection as _,
+                            req.size as _,
+                            req.cur_protection as _,
                             nix::libc::MAP_PRIVATE
                                 | nix::libc::MAP_ANONYMOUS
                                 | nix::libc::MAP_FIXED,
                             -1,
                             0,
                         );
-                        let reply = args[0] as *mut KernelRpcMachVmMapReply;
-                        (*reply).head.msgh_bits = 0x1200;
-                        (*reply).head.msgh_size =
-                            std::mem::size_of::<KernelRpcMachVmMapReply>() as _;
-                        (*reply).head.msgh_remote_port = 0;
-                        (*reply).head.msgh_id = (*reply).head.msgh_id + 100;
+                        let reply_ptr = args[0] as *mut KernelRpcMachVmMapReply;
+                        let mut reply = std::ptr::read_unaligned(reply_ptr);
+                        reply.head.msgh_bits = 0x1200;
+                        reply.head.msgh_size = std::mem::size_of::<KernelRpcMachVmMapReply>() as _;
+                        reply.head.msgh_remote_port = 0;
+                        reply.head.msgh_id += 100;
                         if map_ret == nix::libc::MAP_FAILED {
                             if let Some(size) = released_fixed_range {
                                 self.restore_fixed_map_range(address, size)?;
                             }
-                            (*reply).ret_code = KERN_DENIED as _;
-                            (*reply).address = 0;
+                            reply.ret_code = KERN_DENIED as _;
+                            reply.address = 0;
                             ret0 = KERN_DENIED;
                         } else {
-                            vma.map_1to1(address, (*req).size as _, av::MemPerms::RWX)?;
-                            self.record_mapping(address, (*req).size as _);
-                            (*reply).ret_code = KERN_SUCCESS as _;
-                            (*reply).address = address;
+                            vma.map_1to1(address, req.size as _, av::MemPerms::RWX)?;
+                            self.record_mapping(address, req.size as _);
+                            reply.ret_code = KERN_SUCCESS as _;
+                            reply.address = address;
                             ret0 = KERN_SUCCESS;
                         }
+                        std::ptr::write_unaligned(reply_ptr, reply);
                         handled = true;
                     },
                     8000 => {
@@ -587,18 +593,20 @@ impl TrapHandler for DefaultTrapHandler {
                         // Subsystem task_restartable (8000), 0th routine.
                         debug!("Returning KERN_SUCCESS for task_restartable_ranges_register");
                         unsafe {
-                            let reply = args[0] as *mut MigReplyError;
+                            let reply_ptr = args[0] as *mut MigReplyError;
+                            let mut reply = std::ptr::read_unaligned(reply_ptr);
                             // Incoming msgh_bits is 0x1513.
                             // On a real system, reply is 0x1200.
                             // idk, maybe the remote bits (0x13=MACH_MSG_TYPE_COPY_SEND) gets reduced to
                             // MACH_MSG_TYPE_PORT_SEND (0x12)?
-                            (*reply).hdr.msgh_bits = 0x1200;
-                            (*reply).hdr.msgh_size = 36;
-                            (*reply).hdr.msgh_remote_port = 0;
-                            (*reply).hdr.msgh_reserved = 0;
-                            (*reply).hdr.msgh_id = (*reply).hdr.msgh_id + 100;
-                            (*reply).ndr = 0x100000000;
-                            (*reply).ret_code = KERN_SUCCESS as _;
+                            reply.hdr.msgh_bits = 0x1200;
+                            reply.hdr.msgh_size = 36;
+                            reply.hdr.msgh_remote_port = 0;
+                            reply.hdr.msgh_reserved = 0;
+                            reply.hdr.msgh_id += 100;
+                            reply.ndr = 0x100000000;
+                            reply.ret_code = KERN_SUCCESS as _;
+                            std::ptr::write_unaligned(reply_ptr, reply);
                         }
                         ret0 = KERN_SUCCESS;
                         ret1 = 0;

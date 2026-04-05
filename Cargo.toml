@@ -30,6 +30,12 @@ ureq = { version = "2", features = ["tls"] }
 [profile.release]
 debug = true
 
+[profile.dev]
+opt-level = 3
+
+[profile.test]
+opt-level = 3
+
 [[example]]
 name = "gdb_stub"
 path = "examples/gdb_stub/src/main.rs"
