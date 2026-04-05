@@ -423,3 +423,91 @@ impl Emulator {
         Ok(EmulationResult::BranchAbs(target))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_type_from_maps_known_and_unknown_values() {
+        assert_eq!(HookType::from(0), HookType::Stage1);
+        assert_eq!(HookType::from(1), HookType::Stage2);
+        assert_eq!(HookType::from(0xffff), HookType::Exit);
+        assert_eq!(HookType::from(2), HookType::Unknown(2));
+        assert_eq!(HookType::from(0xfffe), HookType::Unknown(0xfffe));
+    }
+
+    #[test]
+    fn evaluate_condition_matches_arm64_condition_table() {
+        let mut cpsr = Cpsr(0);
+        cpsr.set_z(true);
+        assert!(Emulator::evaluate_condition(0b0000, cpsr));
+        assert!(!Emulator::evaluate_condition(0b0001, cpsr));
+
+        let mut cpsr = Cpsr(0);
+        cpsr.set_c(true);
+        assert!(Emulator::evaluate_condition(0b0010, cpsr));
+        assert!(!Emulator::evaluate_condition(0b0011, cpsr));
+
+        let mut cpsr = Cpsr(0);
+        cpsr.set_n(true);
+        assert!(Emulator::evaluate_condition(0b0100, cpsr));
+        assert!(!Emulator::evaluate_condition(0b0101, cpsr));
+
+        let mut cpsr = Cpsr(0);
+        cpsr.set_v(true);
+        assert!(Emulator::evaluate_condition(0b0110, cpsr));
+        assert!(!Emulator::evaluate_condition(0b0111, cpsr));
+
+        let mut cpsr = Cpsr(0);
+        cpsr.set_c(true);
+        assert!(Emulator::evaluate_condition(0b1000, cpsr));
+        cpsr.set_z(true);
+        assert!(!Emulator::evaluate_condition(0b1000, cpsr));
+        assert!(Emulator::evaluate_condition(0b1001, cpsr));
+
+        let mut cpsr = Cpsr(0);
+        cpsr.set_n(true);
+        cpsr.set_v(true);
+        assert!(Emulator::evaluate_condition(0b1010, cpsr));
+        cpsr.set_v(false);
+        assert!(!Emulator::evaluate_condition(0b1010, cpsr));
+        assert!(Emulator::evaluate_condition(0b1011, cpsr));
+
+        let mut cpsr = Cpsr(0);
+        cpsr.set_n(true);
+        cpsr.set_v(true);
+        assert!(Emulator::evaluate_condition(0b1100, cpsr));
+        cpsr.set_z(true);
+        assert!(!Emulator::evaluate_condition(0b1100, cpsr));
+        assert!(Emulator::evaluate_condition(0b1101, cpsr));
+
+        let cpsr = Cpsr(0);
+        assert!(Emulator::evaluate_condition(0b1110, cpsr));
+        assert!(Emulator::evaluate_condition(0b1111, cpsr));
+    }
+
+    #[test]
+    fn sign_extend32_extends_positive_and_negative_values() {
+        assert_eq!(Emulator::sign_extend32(0b0, 1), 0);
+        assert_eq!(Emulator::sign_extend32(0b1, 1), -1);
+        assert_eq!(Emulator::sign_extend32(0b0111_1111, 8), 127);
+        assert_eq!(Emulator::sign_extend32(0b1000_0000, 8), -128);
+        assert_eq!(Emulator::sign_extend32(0x0002_0000, 18), -131072);
+        assert_eq!(Emulator::sign_extend32(0x03ff_ffff, 26), -1);
+        assert_eq!(Emulator::sign_extend32(0x7fff_ffff, 32), 0x7fff_ffff);
+        assert_eq!(Emulator::sign_extend32(0x8000_0000, 32), i32::MIN);
+    }
+
+    #[test]
+    #[should_panic]
+    fn sign_extend32_rejects_zero_width() {
+        let _ = Emulator::sign_extend32(0, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn sign_extend32_rejects_widths_over_32_bits() {
+        let _ = Emulator::sign_extend32(0, 33);
+    }
+}

@@ -31,6 +31,9 @@ impl MachOSymbolMap {
     }
 
     pub fn symbolicate(&self, addr: u64) -> Option<Symbolication> {
+        if !self.contains_addr(addr) {
+            return None;
+        }
         let idx = match self.symbols.binary_search_by_key(&addr, |entry| entry.addr) {
             Ok(idx) => idx,
             Err(0) => return None,
@@ -169,4 +172,78 @@ pub fn load_macho_symbols(
         range,
         symbols,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_symbol_map() -> MachOSymbolMap {
+        MachOSymbolMap {
+            image: "/tmp/test-image".to_string(),
+            range: (0x1000, 0x2000),
+            symbols: vec![
+                SymbolEntry {
+                    addr: 0x1000,
+                    name: "_start".to_string(),
+                },
+                SymbolEntry {
+                    addr: 0x1100,
+                    name: "_middle".to_string(),
+                },
+                SymbolEntry {
+                    addr: 0x1f00,
+                    name: "_end".to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn contains_addr_respects_image_boundaries() {
+        let map = synthetic_symbol_map();
+
+        assert!(!map.contains_addr(0x0fff));
+        assert!(map.contains_addr(0x1000));
+        assert!(map.contains_addr(0x1fff));
+        assert!(!map.contains_addr(0x2000));
+    }
+
+    #[test]
+    fn symbolicate_returns_exact_and_preceding_symbol_within_range() {
+        let map = synthetic_symbol_map();
+
+        let start = map.symbolicate(0x1000).unwrap();
+        assert_eq!(start.image, "/tmp/test-image");
+        assert_eq!(start.symbol, "_start");
+        assert_eq!(start.symbol_addr, 0x1000);
+
+        let interior = map.symbolicate(0x1180).unwrap();
+        assert_eq!(interior.symbol, "_middle");
+        assert_eq!(interior.symbol_addr, 0x1100);
+
+        let last = map.symbolicate(0x1fff).unwrap();
+        assert_eq!(last.symbol, "_end");
+        assert_eq!(last.symbol_addr, 0x1f00);
+    }
+
+    #[test]
+    fn symbolicate_returns_none_outside_range_or_before_first_symbol() {
+        let map = synthetic_symbol_map();
+
+        assert!(map.symbolicate(0x0fff).is_none());
+        assert!(map.symbolicate(0x2000).is_none());
+
+        let map = MachOSymbolMap {
+            image: "/tmp/test-image".to_string(),
+            range: (0x1000, 0x2000),
+            symbols: vec![SymbolEntry {
+                addr: 0x1100,
+                name: "_middle".to_string(),
+            }],
+        };
+        assert!(map.symbolicate(0x1000).is_none());
+        assert!(map.symbolicate(0x10ff).is_none());
+        assert_eq!(map.symbolicate(0x1100).unwrap().symbol, "_middle");
+    }
 }
