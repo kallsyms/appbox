@@ -3,10 +3,11 @@ use crate::hyperpom::crash::ExitKind;
 use crate::hyperpom::memory::VirtMemAllocator;
 use crate::loader::Loader;
 use crate::syscalls;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{debug, error, trace, warn};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::CStr;
+use std::io;
 use std::sync::OnceLock;
 
 const KERN_SUCCESS: u64 = 0;
@@ -217,19 +218,19 @@ pub struct DefaultTrapHandler {
 }
 
 impl DefaultTrapHandler {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         Self::new_with_map_base(FIXED_MAP_BASE)
     }
 
-    pub fn new_with_map_base(map_fixed_next: u64) -> Self {
+    pub fn new_with_map_base(map_fixed_next: u64) -> Result<Self> {
         if !cfg!(test) {
-            Self::ensure_fixed_map_pool().expect("failed to reserve fixed mapping pool");
+            Self::ensure_fixed_map_pool()?;
         }
-        Self {
+        Ok(Self {
             map_fixed_next,
             mappings: Vec::new(),
             tsd: 0,
-        }
+        })
     }
 
     fn record_mapping(&mut self, addr: u64, size: usize) {
@@ -274,12 +275,14 @@ impl DefaultTrapHandler {
 
         match reservation {
             Ok(()) => Ok(()),
-            Err(kr) => Err(anyhow::anyhow!(
-                "failed to reserve fixed mapping pool at {:#x} size {:#x}: kern_return_t={}",
-                FIXED_MAP_BASE,
-                FIXED_MAP_SIZE,
-                kr
-            )),
+            Err(kr) => Err(io::Error::from_raw_os_error(nix::libc::ENOMEM))
+                .map_err(anyhow::Error::from)
+                .context(format!(
+                    "failed to reserve fixed mapping pool at {:#x} size {:#x}: kern_return_t={}",
+                    FIXED_MAP_BASE,
+                    FIXED_MAP_SIZE,
+                    kr
+                )),
         }
     }
 
@@ -749,7 +752,7 @@ mod tests {
 
     #[test]
     fn remove_mapping_only_removes_exact_matches() {
-        let mut handler = DefaultTrapHandler::new();
+        let mut handler = DefaultTrapHandler::new().unwrap();
         handler.record_mapping(0x1000, 0x2000);
         handler.record_mapping(0x4000, 0x1000);
 

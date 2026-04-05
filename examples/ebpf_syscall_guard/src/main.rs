@@ -149,7 +149,7 @@ fn main() -> Result<()> {
     vm.vcpu
         .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)?;
 
-    let mut handler = DefaultTrapHandler::new();
+    let mut handler = DefaultTrapHandler::new()?;
     let mut bpf_mem = vec![0u8; mem::size_of::<BpfSyscallContext>() + SCRATCH_SIZE];
 
     loop {
