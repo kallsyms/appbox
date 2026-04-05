@@ -6,6 +6,10 @@ ARGS ?=
 build:
 	$(CARGO) build
 
+.PHONY: test
+test:
+	./scripts/cargo-test-signed.sh $(ARGS)
+
 # Build --release for performance
 .PHONY: example-%
 example-%:
