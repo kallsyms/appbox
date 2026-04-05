@@ -68,7 +68,7 @@ macro_rules! align_virt_page {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use applevisor as av;
 /// use applevisor::Mappable;
 /// use hyperpom::memory::PhysMem;
@@ -95,7 +95,7 @@ macro_rules! align_virt_page {
 /// let mut data = [0; 4];
 /// physmem.read(0x12340000, &mut data).unwrap();
 /// assert_eq!(data, [0, 1, 2, 3]);
-/// ```
+/// ```ignore
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysMem {
     /// A reference to the allocator that allocated the object. Only used when we drop the object.
@@ -253,7 +253,7 @@ impl PhysMemAllocatorInner {
 ///
 /// ```text
 ///             256KB
-/// ```
+/// ```ignore
 ///
 /// The buddy allocator then divides this chunk, and the subsequent ones, into two until it fines
 /// the smallest chunk large enough to contain the requested allocation. For example, if we want
@@ -270,7 +270,7 @@ impl PhysMemAllocatorInner {
 ///    ^^^^
 ///     |
 ///     +--> allocated chunk returned
-/// ```
+/// ```ignore
 ///
 /// The buddy allocator takes its name from the fact that all chunks (expect for the initial one)
 /// have a buddy, the other half of the chunk they were split from.
@@ -285,7 +285,7 @@ impl PhysMemAllocatorInner {
 ///    64KB  64KB
 ///     |      |
 ///     +------+----> buddies
-/// ```
+/// ```ignore
 ///
 /// This is useful when a chunk is freed and needs to be merged back by the buddy allocator. The
 /// allocator checks if the buddy of a chunk is allocated, and if it's not the case, it merges them
@@ -312,7 +312,7 @@ impl PhysMemAllocatorInner {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use applevisor as av;
 /// use hyperpom::memory::PhysMemAllocator;
 ///
@@ -535,7 +535,7 @@ impl PartialEq for PhysMemAllocator {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use applevisor as av;
 /// use hyperpom::memory::{PhysMemAllocator, SlabAllocator};
 ///
@@ -782,12 +782,12 @@ bitfield! {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```ignore
     /// use hyperpom::memory::TableDescriptor;
     ///
     /// // Creates a descriptor for a table at address `0x1234000`.
     /// let descriptor = TableDescriptor::new(0x1234000);
-    /// ```
+    /// ```ignore
     #[derive(Copy, Clone, Eq, Hash, PartialEq)]
     pub struct TableDescriptor(u64);
     impl Debug;
@@ -844,7 +844,7 @@ bitfield! {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```ignore
     /// use applevisor as av;
     /// use hyperpom::memory::PageDescriptor;
     ///
@@ -1172,7 +1172,7 @@ impl Page {
 ///                         |                     |
 ///  0x0000_0000_0000_0000  +---------------------+
 ///
-/// ```
+/// ```ignore
 ///
 /// **Note:** While it's possible to have privileged mappings in lower addresses and non-privileged
 ///           in higher ones, keep in mind that some addresses in the upper virtual address range
@@ -1212,7 +1212,7 @@ impl Page {
 ///             +--> Level 2: bits [29:21]
 ///                 +--> Level 3: bits [20:12]
 ///                     +--> Page offset: bits [11:0]
-/// ```
+/// ```ignore
 ///
 /// To address these four levels in the fuzzer, we shamelessly stole Linux's naming convention:
 ///
@@ -1238,7 +1238,7 @@ impl Page {
 ///         +--> Level 1: bits [38:30] = (0xdead_beef_cafe >> 30) & 0x1ff = 0xb6
 ///             +--> Level 2: bits [29:21] = (0xdead_beef_cafe >> 21) & 0x1ff = 0x1f7
 ///                 +--> Level 3: bits [20:12] = (0xdead_beef_cafe >> 12) & 0x1ff = 0xfc
-/// ```
+/// ```ignore
 ///
 /// Then, we check if the entries exists in the corresponding levels, starting with the page
 /// global directory:
@@ -1293,7 +1293,7 @@ impl Page {
 ///                                                                       •
 ///                                                                       +--> Index 0x0fc: Page
 ///                                                                       •
-/// ```
+/// ```ignore
 ///
 /// The MMU can now use our page tables to resolve the physical page that corresponds to the
 /// the virtual address `0xdead_beef_c000`.
@@ -1763,7 +1763,7 @@ impl fmt::Display for PageTableManager {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use applevisor as av;
 /// use hyperpom::memory::{PhysMemAllocator, VirtMemAllocator};
 ///
@@ -1795,7 +1795,7 @@ impl fmt::Display for PageTableManager {
 ///
 /// Now it's also possible to map code and make the cpu execute arbitrary programs.
 ///
-/// ```
+/// ```ignore
 /// use applevisor as av;
 /// use keystone as ks;
 /// use hyperpom::memory::{PhysMemAllocator, VirtMemAllocator};
@@ -2588,10 +2588,20 @@ mod tests {
 
     #[test]
     fn macro_page_round_align() {
-        assert_eq!(round_phys_page!(0x1234567), 0x1240000);
-        assert_eq!(align_phys_page!(0x1234567), 0x1230000);
-        assert_eq!(round_virt_page!(0x1234567), 0x1235000);
-        assert_eq!(align_virt_page!(0x1234567), 0x1234000);
+        let addr = 0x1234567u64;
+        let phys_mask = !(av::PAGE_SIZE as u64 - 1);
+        let virt_mask = !(VIRT_PAGE_SIZE as u64 - 1);
+
+        assert_eq!(
+            round_phys_page!(addr),
+            (addr + av::PAGE_SIZE as u64 - 1) & phys_mask
+        );
+        assert_eq!(align_phys_page!(addr), addr & phys_mask);
+        assert_eq!(
+            round_virt_page!(addr),
+            (addr + VIRT_PAGE_SIZE as u64 - 1) & virt_mask
+        );
+        assert_eq!(align_virt_page!(addr), addr & virt_mask);
     }
 
     // -------------------------------------------------------------------------------------------

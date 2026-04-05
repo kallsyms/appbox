@@ -613,3 +613,57 @@ fn check_ptr(vma: &VirtMemAllocator, ptr: u64, valid_pages: &mut HashSet<u64>) -
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::VM_TEST_LOCK;
+    use crate::vm::VmManager;
+
+    #[test]
+    fn align_size_rounds_up_to_guest_page_size() {
+        assert_eq!(DefaultTrapHandler::align_size(0), 0);
+        assert_eq!(DefaultTrapHandler::align_size(1), PAGE_ALIGN);
+        assert_eq!(DefaultTrapHandler::align_size(PAGE_ALIGN), PAGE_ALIGN);
+        assert_eq!(
+            DefaultTrapHandler::align_size(PAGE_ALIGN + 1),
+            PAGE_ALIGN * 2
+        );
+    }
+
+    #[test]
+    fn remove_mapping_only_removes_exact_matches() {
+        let mut handler = DefaultTrapHandler::new();
+        handler.record_mapping(0x1000, 0x2000);
+        handler.record_mapping(0x4000, 0x1000);
+
+        handler.remove_mapping(0x1000, 0x1000);
+        assert_eq!(handler.mappings, vec![(0x1000, 0x2000), (0x4000, 0x1000)]);
+
+        handler.remove_mapping(0x1000, 0x2000);
+        assert_eq!(handler.mappings, vec![(0x4000, 0x1000)]);
+    }
+
+    #[test]
+    fn explore_pointers_follows_pointer_chains_across_pages() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut vm = VmManager::new()?;
+        let page1 = 0x1000_0000;
+        let page2 = 0x1000_1000;
+        let page3 = 0x1000_2000;
+
+        for page in [page1, page2, page3] {
+            vm.vma.map(page, 0x1000, av::MemPerms::RWX)?;
+        }
+
+        vm.vma.write_qword(page1, page2 + 0x20)?;
+        vm.vma.write_qword(page1 + 8, 0xdead_beef)?;
+        vm.vma.write_qword(page2 + 0x20, page3 + 0x40)?;
+
+        let pages = explore_pointers(&vm.vma, &[page1]);
+
+        assert_eq!(pages, HashSet::from([page1, page2, page3]));
+        Ok(())
+    }
+}

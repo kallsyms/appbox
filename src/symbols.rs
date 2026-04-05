@@ -31,10 +31,7 @@ impl MachOSymbolMap {
     }
 
     pub fn symbolicate(&self, addr: u64) -> Option<Symbolication> {
-        let idx = match self
-            .symbols
-            .binary_search_by_key(&addr, |entry| entry.addr)
-        {
+        let idx = match self.symbols.binary_search_by_key(&addr, |entry| entry.addr) {
             Ok(idx) => idx,
             Err(0) => return None,
             Err(idx) => idx - 1,
@@ -58,7 +55,16 @@ pub fn load_macho_symbols(
     let mut min_addr: Option<u64> = None;
     let mut max_addr: Option<u64> = None;
     for cmd in mach_commands {
-        if let MachCommand(LoadCommand::Segment64 { segname, vmaddr, vmsize, .. }, _) = cmd {
+        if let MachCommand(
+            LoadCommand::Segment64 {
+                segname,
+                vmaddr,
+                vmsize,
+                ..
+            },
+            _,
+        ) = cmd
+        {
             if segname == "__PAGEZERO" {
                 continue;
             }
@@ -70,9 +76,15 @@ pub fn load_macho_symbols(
     }
 
     let symtab = mach_commands.iter().find_map(|cmd| match cmd {
-        MachCommand(LoadCommand::SymTab { symoff, nsyms, stroff, strsize }, _) => {
-            Some((*symoff, *nsyms, *stroff, *strsize))
-        }
+        MachCommand(
+            LoadCommand::SymTab {
+                symoff,
+                nsyms,
+                stroff,
+                strsize,
+            },
+            _,
+        ) => Some((*symoff, *nsyms, *stroff, *strsize)),
         _ => None,
     });
     let Some((symoff, nsyms, stroff, strsize)) = symtab else {
@@ -93,7 +105,10 @@ pub fn load_macho_symbols(
     let mut sections: Vec<Rc<Section>> = Vec::new();
     for cmd in mach_commands {
         if let MachCommand(
-            LoadCommand::Segment64 { sections: seg_sections, .. },
+            LoadCommand::Segment64 {
+                sections: seg_sections,
+                ..
+            },
             _,
         ) = cmd
         {
@@ -110,7 +125,11 @@ pub fn load_macho_symbols(
     let mut symbols = Vec::new();
     while let Some(sym) = iter.next() {
         match sym {
-            Symbol::Defined { name: Some(name), entry, .. } => {
+            Symbol::Defined {
+                name: Some(name),
+                entry,
+                ..
+            } => {
                 if entry != 0 {
                     symbols.push(SymbolEntry {
                         addr: entry as u64 + slide,
@@ -118,7 +137,11 @@ pub fn load_macho_symbols(
                     });
                 }
             }
-            Symbol::Debug { name: Some(name), addr, .. } => {
+            Symbol::Debug {
+                name: Some(name),
+                addr,
+                ..
+            } => {
                 if addr != 0 {
                     symbols.push(SymbolEntry {
                         addr: addr as u64 + slide,
@@ -141,5 +164,9 @@ pub fn load_macho_symbols(
         (Some(start), Some(end)) if start < end => (start, end),
         _ => (0, 0),
     };
-    Ok(Some(MachOSymbolMap { image, range, symbols }))
+    Ok(Some(MachOSymbolMap {
+        image,
+        range,
+        symbols,
+    }))
 }

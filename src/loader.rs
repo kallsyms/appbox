@@ -55,17 +55,31 @@ pub struct Loader {
 
 impl Loader {
     fn new(executable: &Path, arguments: Vec<String>, environment: Vec<String>) -> Result<Self> {
-        Ok(Self {
+        Ok(Self::new_with_shared_cache(
+            executable,
+            arguments,
+            environment,
+            dyld::SharedCache::new_system_cache()?,
+        ))
+    }
+
+    fn new_with_shared_cache(
+        executable: &Path,
+        arguments: Vec<String>,
+        environment: Vec<String>,
+        shared_cache: dyld::SharedCache,
+    ) -> Self {
+        Self {
             executable: executable.to_path_buf(),
             arguments,
             environment,
-            shared_cache: dyld::SharedCache::new_system_cache()?,
+            shared_cache,
             mh: 0,
             symbol_maps: Vec::new(),
             map_fixed_next: 0x5_0000_0000,
             entry_point: 0,
             stack_pointer: 0,
-        })
+        }
     }
 
     pub fn symbolicate(&self, addr: u64) -> Option<Symbolication> {
@@ -75,11 +89,14 @@ impl Loader {
             }
         }
         if self.shared_cache.contains_addr(addr) {
-            return self.shared_cache.symbolicate(addr).map(|sym| Symbolication {
-                image: sym.image,
-                symbol: sym.symbol,
-                symbol_addr: sym.symbol_addr,
-            });
+            return self
+                .shared_cache
+                .symbolicate(addr)
+                .map(|sym| Symbolication {
+                    image: sym.image,
+                    symbol: sym.symbol,
+                    symbol_addr: sym.symbol_addr,
+                });
         }
         None
     }
@@ -413,14 +430,6 @@ impl Loader {
             crate::commpage::_COMM_PAGE_THIS_VERSION as _,
         )?;
 
-        vm.vma.write_byte(crate::commpage::_COMM_PAGE_NCPUS, 1)?;
-        vm.vma
-            .write_byte(crate::commpage::_COMM_PAGE_ACTIVE_CPUS, 1)?;
-        vm.vma
-            .write_byte(crate::commpage::_COMM_PAGE_PHYSICAL_CPUS, 1)?;
-        vm.vma
-            .write_byte(crate::commpage::_COMM_PAGE_LOGICAL_CPUS, 1)?;
-
         // N.B. These are in the RO page
         vm.vma.write_byte(
             crate::commpage::_COMM_PAGE_USER_PAGE_SHIFT_64,
@@ -429,19 +438,164 @@ impl Loader {
         vm.vma
             .write_byte(crate::commpage::_COMM_PAGE_KERNEL_PAGE_SHIFT, 14)?;
 
+        let configured_cpus = 1u32;
+        let cpu_capabilities =
+            crate::commpage::kUP | (configured_cpus << crate::commpage::kNumCPUsShift);
         vm.vma.write_dword(
             crate::commpage::_COMM_PAGE_CPU_CAPABILITIES,
-            crate::commpage::kUP,
+            cpu_capabilities,
         )?;
         vm.vma.write_qword(
             crate::commpage::_COMM_PAGE_CPU_CAPABILITIES64,
-            crate::commpage::kUP as _,
+            cpu_capabilities as _,
         )?;
 
         vm.vma.write_qword(
             crate::commpage::_COMM_PAGE_MEMORY_SIZE,
             1 * 1024 * 1024 * 1024, // TODO: no idea if correct
         )?;
+
+        vm.vma.write_byte(crate::commpage::_COMM_PAGE_NCPUS, configured_cpus as u8)?;
+        vm.vma
+            .write_byte(crate::commpage::_COMM_PAGE_ACTIVE_CPUS, configured_cpus as u8)?;
+        vm.vma
+            .write_byte(crate::commpage::_COMM_PAGE_PHYSICAL_CPUS, configured_cpus as u8)?;
+        vm.vma
+            .write_byte(crate::commpage::_COMM_PAGE_LOGICAL_CPUS, configured_cpus as u8)?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commpage;
+    use crate::test_support::VM_TEST_LOCK;
+
+    fn test_executable() -> PathBuf {
+        PathBuf::from("/usr/bin/true")
+    }
+
+    fn load_test_binary(
+        arguments: Vec<String>,
+        environment: Vec<String>,
+    ) -> Result<(VmManager, Loader)> {
+        let executable = test_executable();
+        let mut vm = VmManager::new()?;
+        let loader = load_macho(&mut vm, &executable, arguments, environment)?;
+        Ok((vm, loader))
+    }
+
+    #[test]
+    fn load_macho_bootstraps_vm_state() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let executable = test_executable();
+
+        let (vm, loader) = load_test_binary(vec![executable.display().to_string()], Vec::new())?;
+
+        assert_ne!(loader.entry_point, 0);
+        assert_ne!(loader.stack_pointer, 0);
+        assert_ne!(loader.mh, 0);
+        assert!(loader
+            .shared_cache
+            .contains_addr(loader.shared_cache.base_address() as u64));
+        assert_ne!(vm.vcpu.get_sys_reg(av::SysReg::TCR_EL1)? & (1 << 37), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn load_macho_sets_up_expected_stack_layout() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let executable = test_executable();
+        let arguments = vec![
+            executable.display().to_string(),
+            "alpha".to_string(),
+            "beta gamma".to_string(),
+        ];
+        let environment = vec!["FOO=bar".to_string(), "EMPTY=".to_string()];
+
+        let (vm, loader) = load_test_binary(arguments.clone(), environment.clone())?;
+        let sp = loader.stack_pointer;
+
+        assert_eq!(vm.vma.read_qword(sp)?, loader.mh);
+        assert_eq!(vm.vma.read_qword(sp + 8)?, arguments.len() as u64);
+
+        let mut cursor = sp + 16;
+        for argument in &arguments {
+            let ptr = vm.vma.read_qword(cursor)?;
+            assert_eq!(vm.vma.read_cstring(ptr)?, *argument);
+            cursor += 8;
+        }
+        assert_eq!(vm.vma.read_qword(cursor)?, 0);
+        cursor += 8;
+
+        for env in &environment {
+            let ptr = vm.vma.read_qword(cursor)?;
+            assert_eq!(vm.vma.read_cstring(ptr)?, *env);
+            cursor += 8;
+        }
+        assert_eq!(vm.vma.read_qword(cursor)?, 0);
+        cursor += 8;
+
+        let mut apple = Vec::new();
+        loop {
+            let ptr = vm.vma.read_qword(cursor)?;
+            if ptr == 0 {
+                break;
+            }
+            apple.push(vm.vma.read_cstring(ptr)?);
+            cursor += 8;
+        }
+
+        assert!(apple
+            .iter()
+            .any(|value| value == &format!("executable_path={}", executable.display())));
+        assert!(apple.iter().any(|value| value.starts_with("ptr_munge=0x")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn load_macho_sets_up_commpage_contents() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let executable = test_executable();
+        let (vm, _) = load_test_binary(vec![executable.display().to_string()], Vec::new())?;
+        let expected_cpu_capabilities = commpage::kUP | (1 << commpage::kNumCPUsShift);
+
+        let mut label = [0u8; b"commpage 64-bit".len()];
+        vm.vma
+            .read(commpage::_COMM_PAGE64_BASE_ADDRESS, &mut label)?;
+        assert_eq!(&label, b"commpage 64-bit");
+        assert_eq!(
+            vm.vma.read_word(commpage::_COMM_PAGE_VERSION)?,
+            commpage::_COMM_PAGE_THIS_VERSION as u16
+        );
+        assert_eq!(vm.vma.read_byte(commpage::_COMM_PAGE_NCPUS)?, 1);
+        assert_eq!(vm.vma.read_byte(commpage::_COMM_PAGE_ACTIVE_CPUS)?, 1);
+        assert_eq!(vm.vma.read_byte(commpage::_COMM_PAGE_PHYSICAL_CPUS)?, 1);
+        assert_eq!(vm.vma.read_byte(commpage::_COMM_PAGE_LOGICAL_CPUS)?, 1);
+        assert_eq!(
+            vm.vma.read_byte(commpage::_COMM_PAGE_USER_PAGE_SHIFT_64)?,
+            14
+        );
+        assert_eq!(
+            vm.vma.read_byte(commpage::_COMM_PAGE_KERNEL_PAGE_SHIFT)?,
+            14
+        );
+        assert_eq!(
+            vm.vma.read_dword(commpage::_COMM_PAGE_CPU_CAPABILITIES)?,
+            expected_cpu_capabilities
+        );
+        assert_eq!(
+            vm.vma.read_qword(commpage::_COMM_PAGE_CPU_CAPABILITIES64)?,
+            expected_cpu_capabilities as u64
+        );
+        assert_eq!(
+            vm.vma.read_qword(commpage::_COMM_PAGE_MEMORY_SIZE)?,
+            1024 * 1024 * 1024
+        );
 
         Ok(())
     }

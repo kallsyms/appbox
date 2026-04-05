@@ -6,9 +6,7 @@ use appbox::applevisor as av;
 use appbox::hyperpom::crash::ExitKind;
 use appbox::hyperpom::error::ExceptionError;
 use appbox::hyperpom::exceptions::ExceptionClass;
-use appbox::trap::{
-    read_syscall_context, write_syscall_result, DefaultTrapHandler, TrapHandler,
-};
+use appbox::trap::{read_syscall_context, write_syscall_result, DefaultTrapHandler, TrapHandler};
 use appbox::vm::{VmManager, VmRunResult};
 
 #[derive(Parser)]

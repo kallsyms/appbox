@@ -398,22 +398,16 @@ pub struct Symbolication {
 
 impl SymbolMap {
     fn symbolicate(&self, addr: u64) -> Option<Symbolication> {
-        let idx = match self
-            .symbols
-            .binary_search_by_key(&addr, |entry| entry.addr)
-        {
+        let idx = match self.symbols.binary_search_by_key(&addr, |entry| entry.addr) {
             Ok(idx) => idx,
             Err(0) => return None,
             Err(idx) => idx - 1,
         };
         let entry = self.symbols.get(idx)?;
         let image = if let Some(image_index) = entry.image_index {
-            self.images
-                .get(image_index)
-                .map(|image| image.path.clone())
+            self.images.get(image_index).map(|image| image.path.clone())
         } else {
-            self.image_for_address(addr)
-                .map(|image| image.path.clone())
+            self.image_for_address(addr).map(|image| image.path.clone())
         }
         .unwrap_or_else(|| "<unknown>".to_string());
 
@@ -538,7 +532,8 @@ fn load_exports_symbols(
             continue;
         }
 
-        let mut cmd_ptr = unsafe { (header as *const mach_header_64).add(1) as *const load_command };
+        let mut cmd_ptr =
+            unsafe { (header as *const mach_header_64).add(1) as *const load_command };
         let mut export_info: Option<(u32, u32)> = None;
         for _ in 0..header.ncmds {
             let cmd = unsafe { &*cmd_ptr };
@@ -552,10 +547,13 @@ fn load_exports_symbols(
                     export_info = Some((dyld_info.export_off, dyld_info.export_size));
                 }
             }
-            cmd_ptr = unsafe { (cmd_ptr as *const u8).add(cmd.cmdsize as usize) as *const load_command };
+            cmd_ptr =
+                unsafe { (cmd_ptr as *const u8).add(cmd.cmdsize as usize) as *const load_command };
         }
 
-        let Some((dataoff, datasize)) = export_info else { continue };
+        let Some((dataoff, datasize)) = export_info else {
+            continue;
+        };
         if datasize == 0 {
             continue;
         }
@@ -688,3 +686,197 @@ fn read_uleb(data: &[u8], mut offset: usize) -> Result<(u64, usize)> {
 }
 
 // removed unused local-symbol helpers
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::VM_TEST_LOCK;
+    use crate::vm::VmManager;
+    use std::fs::{remove_file, File};
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("appbox-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn read_uleb_decodes_single_and_multi_byte_values() {
+        assert_eq!(read_uleb(&[0x7f], 0).unwrap(), (0x7f, 1));
+        assert_eq!(read_uleb(&[0xe5, 0x8e, 0x26], 0).unwrap(), (624485, 3));
+    }
+
+    #[test]
+    fn read_uleb_returns_partial_value_for_truncated_input() {
+        assert_eq!(read_uleb(&[0x80], 0).unwrap(), (0, 1));
+    }
+
+    #[test]
+    fn read_cstring_at_stops_at_nul() {
+        let path = temp_file_path("cstring");
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(b"hello\0").unwrap();
+            file.write_all(&vec![0u8; 300]).unwrap();
+        }
+
+        let file = File::open(&path).unwrap();
+        assert_eq!(read_cstring_at(&file, 0, 32).unwrap(), "hello");
+
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parse_exports_trie_reads_nested_edges() {
+        let trie = vec![
+            0, 1, b'f', b'o', b'o', 0, 7, //
+            0, 1, b'b', b'a', b'r', 0, 14, //
+            2, 0, 0x34, 0,
+        ];
+
+        let exports = parse_exports_trie(&trie).unwrap();
+
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].name, "foobar");
+        assert_eq!(exports[0].addr, 0x34);
+    }
+
+    #[test]
+    fn parse_exports_trie_skips_reexports() {
+        let trie = vec![
+            0,
+            1,
+            b'f',
+            b'o',
+            b'o',
+            0,
+            7, //
+            4,
+            EXPORT_SYMBOL_FLAGS_REEXPORT as u8,
+            1,
+            b'x',
+            0,
+            0,
+        ];
+
+        assert!(parse_exports_trie(&trie).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_exports_trie_uses_resolver_address_for_stub_symbols() {
+        let trie = vec![
+            0,
+            1,
+            b'f',
+            b'o',
+            b'o',
+            0,
+            7, //
+            3,
+            EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER as u8,
+            0x20,
+            0x40,
+            0,
+        ];
+
+        let exports = parse_exports_trie(&trie).unwrap();
+
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].name, "foo");
+        assert_eq!(exports[0].addr, 0x40);
+    }
+
+    #[test]
+    fn symbol_map_uses_image_ranges_and_nearest_symbol() {
+        let symbol_map = SymbolMap {
+            symbols: vec![
+                SymbolEntry {
+                    addr: 0x1000,
+                    name: "_start".to_string(),
+                    image_index: Some(0),
+                },
+                SymbolEntry {
+                    addr: 0x1100,
+                    name: "_mid".to_string(),
+                    image_index: None,
+                },
+                SymbolEntry {
+                    addr: 0x3000,
+                    name: "_other".to_string(),
+                    image_index: Some(1),
+                },
+            ],
+            images: vec![
+                ImageTextInfo {
+                    load_address: 0x1000,
+                    text_size: 0x400,
+                    path: "/image/one".to_string(),
+                },
+                ImageTextInfo {
+                    load_address: 0x3000,
+                    text_size: 0x200,
+                    path: "/image/two".to_string(),
+                },
+            ],
+        };
+
+        let first = symbol_map.symbolicate(0x1000).unwrap();
+        assert_eq!(first.image, "/image/one");
+        assert_eq!(first.symbol, "_start");
+        assert_eq!(first.symbol_addr, 0x1000);
+
+        let second = symbol_map.symbolicate(0x1120).unwrap();
+        assert_eq!(second.image, "/image/one");
+        assert_eq!(second.symbol, "_mid");
+        assert_eq!(second.symbol_addr, 0x1100);
+
+        let third = symbol_map.symbolicate(0x3010).unwrap();
+        assert_eq!(third.image, "/image/two");
+        assert_eq!(third.symbol, "_other");
+        assert_eq!(third.symbol_addr, 0x3000);
+
+        assert!(symbol_map.image_for_address(0x5000).is_none());
+    }
+
+    #[test]
+    fn shared_cache_loads_and_maps_into_vm() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let cache = SharedCache::new_system_cache()?;
+        assert!(cache.reservation.len() > 0);
+        assert!(!cache.mappings.is_empty());
+        assert!(cache.contains_addr(cache.base_address() as u64));
+
+        if let Some(symbol_map) = cache.symbol_map.as_ref() {
+            let first_symbol = symbol_map
+                .symbols
+                .iter()
+                .find(|entry| !entry.name.is_empty())
+                .expect("dyld symbol map unexpectedly empty");
+            let symbolication = cache
+                .symbolicate(first_symbol.addr)
+                .expect("failed to symbolicate first dyld symbol");
+            assert_eq!(symbolication.symbol, first_symbol.name);
+            assert_eq!(symbolication.symbol_addr, first_symbol.addr);
+        }
+
+        let mut vm = VmManager::new()?;
+        cache.map_into_vm(&mut vm)?;
+
+        let mapping = cache.mappings.first().unwrap();
+        let addr = mapping.data() as u64;
+        let mut host = [0u8; 16];
+        unsafe {
+            std::ptr::copy_nonoverlapping(mapping.data(), host.as_mut_ptr(), host.len());
+        }
+        let mut guest = [0u8; 16];
+        vm.vma.read(addr, &mut guest)?;
+        assert_eq!(guest, host);
+
+        Ok(())
+    }
+}
