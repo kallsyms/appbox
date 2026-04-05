@@ -7,12 +7,28 @@ use anyhow::Result;
 use log::{debug, error, trace, warn};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::CStr;
+use std::sync::OnceLock;
 
 const KERN_SUCCESS: u64 = 0;
 const KERN_DENIED: u64 = 53;
 const KERN_NOT_FOUND: u64 = 56;
 const SVC_ESR: u64 = 0x5600_0080;
 const PAGE_ALIGN: u64 = 0x4000;
+const FIXED_MAP_BASE: u64 = 0x6_0000_0000;
+const FIXED_MAP_SIZE: u64 = 0x1_0000_0000;
+
+static FIXED_MAP_POOL: OnceLock<std::result::Result<(), i32>> = OnceLock::new();
+
+unsafe extern "C" {
+    fn mach_vm_allocate(
+        target: nix::libc::mach_port_t,
+        address: *mut u64,
+        size: u64,
+        flags: i32,
+    ) -> i32;
+
+    fn mach_vm_deallocate(target: nix::libc::mach_port_t, address: u64, size: u64) -> i32;
+}
 
 #[repr(C)]
 struct MachMsgHeader {
@@ -202,10 +218,13 @@ pub struct DefaultTrapHandler {
 
 impl DefaultTrapHandler {
     pub fn new() -> Self {
-        Self::new_with_map_base(0x6_0000_0000)
+        Self::new_with_map_base(FIXED_MAP_BASE)
     }
 
     pub fn new_with_map_base(map_fixed_next: u64) -> Self {
+        if !cfg!(test) {
+            Self::ensure_fixed_map_pool().expect("failed to reserve fixed mapping pool");
+        }
         Self {
             map_fixed_next,
             mappings: Vec::new(),
@@ -229,6 +248,84 @@ impl DefaultTrapHandler {
 
     fn align_size(size: u64) -> u64 {
         (size + (PAGE_ALIGN - 1)) & !(PAGE_ALIGN - 1)
+    }
+
+    fn ensure_fixed_map_pool() -> Result<()> {
+        let reservation = FIXED_MAP_POOL.get_or_init(|| {
+            let mut addr = FIXED_MAP_BASE;
+            let kr = unsafe {
+                mach_vm_allocate(
+                    nix::libc::mach_task_self(),
+                    &mut addr,
+                    FIXED_MAP_SIZE,
+                    0,
+                )
+            };
+            if kr == KERN_SUCCESS as i32 && addr == FIXED_MAP_BASE {
+                Ok(())
+            } else {
+                Err(if kr == KERN_SUCCESS as i32 {
+                    nix::libc::KERN_NO_SPACE
+                } else {
+                    kr
+                })
+            }
+        });
+
+        match reservation {
+            Ok(()) => Ok(()),
+            Err(kr) => Err(anyhow::anyhow!(
+                "failed to reserve fixed mapping pool at {:#x} size {:#x}: kern_return_t={}",
+                FIXED_MAP_BASE,
+                FIXED_MAP_SIZE,
+                kr
+            )),
+        }
+    }
+
+    fn release_fixed_map_range(&self, addr: u64, size: u64) -> Result<()> {
+        let kr = unsafe { mach_vm_deallocate(nix::libc::mach_task_self(), addr, size) };
+        if kr == KERN_SUCCESS as i32 {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "failed to release fixed mapping pool range {:#x}..{:#x}: kern_return_t={}",
+                addr,
+                addr + size,
+                kr
+            ))
+        }
+    }
+
+    fn restore_fixed_map_range(&self, addr: u64, size: u64) -> Result<()> {
+        let mut requested = addr;
+        let kr = unsafe { mach_vm_allocate(nix::libc::mach_task_self(), &mut requested, size, 0) };
+        if kr == KERN_SUCCESS as i32 && requested == addr {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "failed to restore fixed mapping pool range {:#x}..{:#x}: kern_return_t={} actual={:#x}",
+                addr,
+                addr + size,
+                kr,
+                requested
+            ))
+        }
+    }
+
+    fn reserve_fixed_address(&mut self, size: u64, mask: Option<u64>) -> u64 {
+        if let Some(mask) = mask {
+            if mask > PAGE_ALIGN - 1 {
+                self.map_fixed_next = (self.map_fixed_next + mask) & !mask;
+            }
+        }
+        let addr = self.map_fixed_next;
+        self.map_fixed_next += size;
+        addr
+    }
+
+    fn write_out_address(&self, out_addr: u64, value: u64) {
+        unsafe { *(out_addr as *mut u64) = value };
     }
 }
 
@@ -262,6 +359,7 @@ impl TrapHandler for DefaultTrapHandler {
         let mut ret1: u64 = 0;
         let mut cflags: u64 = 0;
         let mut handled = false;
+        let mut released_fixed_map_range: Option<(u64, u64)> = None;
 
         // Stage 1: handle syscalls that need special handling.
         // Optionally also useful for tossing in debugging statements on specific syscalls.
@@ -296,9 +394,11 @@ impl TrapHandler for DefaultTrapHandler {
                 // fake fixed address
                 if args[3] & nix::libc::MAP_FIXED as u64 == 0 {
                     args[3] |= nix::libc::MAP_FIXED as u64;
-                    trace!("Fixing mmap address to {:x}", self.map_fixed_next);
-                    args[0] = self.map_fixed_next;
-                    self.map_fixed_next += args[1];
+                    let chosen = self.reserve_fixed_address(args[1], None);
+                    trace!("Fixing mmap address to {:x}", chosen);
+                    self.release_fixed_map_range(chosen, args[1])?;
+                    args[0] = chosen;
+                    released_fixed_map_range = Some((chosen, args[1]));
                 }
             }
             syscalls::TRAP_mach_vm_allocate => {
@@ -309,12 +409,15 @@ impl TrapHandler for DefaultTrapHandler {
                 // Check for VM_FLAGS_ANYWHERE being set
                 if args[3] & 1 != 0 {
                     args[3] &= !1;
-                    trace!(
-                        "Fixing mach_vm_allocate address to {:x}",
-                        self.map_fixed_next
-                    );
-                    unsafe { *(args[1] as *mut u64) = self.map_fixed_next };
-                    self.map_fixed_next += args[2];
+                    let chosen = self.reserve_fixed_address(args[2], None);
+                    trace!("Fixing mach_vm_allocate address to {:x}", chosen);
+                    self.release_fixed_map_range(chosen, args[2])?;
+                    self.write_out_address(args[1], chosen);
+                    (ret0, ret1, cflags) = forward_syscall(num, &args);
+                    if ret0 != KERN_SUCCESS {
+                        self.restore_fixed_map_range(chosen, args[2])?;
+                    }
+                    handled = true;
                 }
             }
             syscalls::TRAP_mach_vm_map => {
@@ -325,14 +428,15 @@ impl TrapHandler for DefaultTrapHandler {
                 // Check for VM_FLAGS_ANYWHERE being set
                 if args[4] & 1 != 0 {
                     args[4] &= !1;
-                    // If a mask is set greater than the 16k page we align to,
-                    // bump map_fixed_next to the next correctly aligned address.
-                    if args[3] > 0x3fff {
-                        self.map_fixed_next = (self.map_fixed_next + args[3]) & !args[3];
+                    let chosen = self.reserve_fixed_address(args[2], Some(args[3]));
+                    trace!("Fixing mach_vm_map address to {:x}", chosen);
+                    self.release_fixed_map_range(chosen, args[2])?;
+                    self.write_out_address(args[1], chosen);
+                    (ret0, ret1, cflags) = forward_syscall(num, &args);
+                    if ret0 != KERN_SUCCESS {
+                        self.restore_fixed_map_range(chosen, args[2])?;
                     }
-                    trace!("Fixing mach_vm_map address to {:x}", self.map_fixed_next);
-                    unsafe { *(args[1] as *mut u64) = self.map_fixed_next };
-                    self.map_fixed_next += args[2];
+                    handled = true;
                 }
             }
             syscalls::TRAP_mach_vm_protect => {
@@ -423,13 +527,17 @@ impl TrapHandler for DefaultTrapHandler {
                         // To get around this, emulate the map behavior with mmap.
                         // TODO: this assumes object == 0.
                         (*req).size = Self::align_size((*req).size);
+                        let released_fixed_range = if (*req).flags & 1 != 0 {
+                            Some((*req).size)
+                        } else {
+                            None
+                        };
                         if (*req).flags & 1 != 0 {
-                            trace!(
-                                "Fixing kernelrpc_mach_vm_map address to {:x}",
-                                self.map_fixed_next
-                            );
-                            (*req).address = self.map_fixed_next;
-                            self.map_fixed_next += (*req).size;
+                            let chosen =
+                                self.reserve_fixed_address((*req).size, Some((*req).mask));
+                            trace!("Fixing kernelrpc_mach_vm_map address to {:x}", chosen);
+                            self.release_fixed_map_range(chosen, (*req).size)?;
+                            (*req).address = chosen;
                         }
 
                         let address = (*req).address;
@@ -456,6 +564,9 @@ impl TrapHandler for DefaultTrapHandler {
                         (*reply).head.msgh_remote_port = 0;
                         (*reply).head.msgh_id = (*reply).head.msgh_id + 100;
                         if map_ret == nix::libc::MAP_FAILED {
+                            if let Some(size) = released_fixed_range {
+                                self.restore_fixed_map_range(address, size)?;
+                            }
                             (*reply).ret_code = KERN_DENIED as _;
                             (*reply).address = 0;
                             ret0 = KERN_DENIED;
@@ -516,6 +627,11 @@ impl TrapHandler for DefaultTrapHandler {
 
         if !handled {
             (ret0, ret1, cflags) = forward_syscall(num, &args);
+            if let Some((addr, size)) = released_fixed_map_range {
+                if cflags & (1 << 29) != 0 {
+                    self.restore_fixed_map_range(addr, size)?;
+                }
+            }
         }
 
         // Stage 2.5: map newly allocated memory into the VM as necessary.
