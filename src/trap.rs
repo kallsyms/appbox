@@ -15,7 +15,8 @@ const KERN_DENIED: u64 = 53;
 const KERN_NOT_FOUND: u64 = 56;
 const SVC_ESR: u64 = 0x5600_0080;
 const PAGE_ALIGN: u64 = 0x4000;
-const FIXED_MAP_BASE: u64 = 0x6_0000_0000;
+// macOS 27 reserves 0x1_8000_0000..~0x70_0000_0000 in every process (shared region).
+const FIXED_MAP_BASE: u64 = 0x80_0000_0000;
 const FIXED_MAP_SIZE: u64 = 0x1_0000_0000;
 
 static FIXED_MAP_POOL: OnceLock<std::result::Result<(), i32>> = OnceLock::new();
