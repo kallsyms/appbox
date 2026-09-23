@@ -54,6 +54,13 @@ impl VmManager {
             let exit_info = self.vcpu.get_exit_info();
             if exit_info.reason == av::ExitReason::EXCEPTION {
                 match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
+                    ExceptionClass::DataAbortLowerEl | ExceptionClass::InsAbortLowerEl
+                        if self
+                            .vma
+                            .fault_in_lazy_1to1(exit_info.exception.physical_address)? =>
+                    {
+                        continue;
+                    }
                     ExceptionClass::DataAbortLowerEl => {
                         if self.handle_dirty_fault()? {
                             continue;
@@ -111,5 +118,41 @@ impl VmManager {
 impl Drop for VmManager {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::VM_TEST_LOCK;
+    use mmap_fixed_fixed::MapOption;
+
+    const LDR_X1_X2: u32 = 0xf9400041;
+    const BRK_0: u32 = 0xd4200000;
+
+    #[test]
+    fn lazy_1to1_mapping_faults_in_on_execute_and_load() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Spans two lazy chunks: code in the first, data in the second.
+        let region = MemoryMap::new(0x20_0000, &[MapOption::MapReadable, MapOption::MapWritable])?;
+        let code = region.data() as *mut u32;
+        let data = unsafe { region.data().add(0x10_0000) } as *mut u64;
+        unsafe {
+            code.write(LDR_X1_X2);
+            code.add(1).write(BRK_0);
+            data.write(0x1234_5678_9abc_def0);
+        }
+
+        let mut vm = VmManager::new()?;
+        vm.vma
+            .map_1to1_lazy(region.data() as _, region.len(), av::MemPerms::RWX)?;
+        vm.vcpu.set_reg(av::Reg::PC, code as u64)?;
+        vm.vcpu.set_reg(av::Reg::X2, data as u64)?;
+
+        assert!(matches!(vm.run()?, VmRunResult::Brk));
+        assert_eq!(vm.vcpu.get_reg(av::Reg::X1)?, 0x1234_5678_9abc_def0);
+        assert_eq!(vm.vcpu.get_reg(av::Reg::PC)?, code as u64 + 4);
+        Ok(())
     }
 }

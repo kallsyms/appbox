@@ -1346,6 +1346,36 @@ pub struct PageTableManager {
     pub(crate) pgd: PageGlobalDirectory,
     pub(crate) allocs: BTreeMap<u64, Rc<RefCell<Page>>>,
     one_to_one_last: u64,
+    /// 1:1 ranges whose stage-2 mappings are deferred until first access, keyed by guest
+    /// physical start address.
+    lazy_one_to_one: BTreeMap<u64, LazyOneToOne>,
+}
+
+/// Granularity at which lazily mapped 1:1 ranges are faulted in.
+const LAZY_ONE_TO_ONE_CHUNK: u64 = 0x10_0000;
+const HOST_PAGE_SIZE: u64 = 0x4000;
+
+#[derive(Clone, Debug)]
+struct LazyOneToOne {
+    host_addr: u64,
+    size: u64,
+    faulted: Vec<bool>,
+}
+
+// Expanded from hv_unsafe_call in applevisor
+fn hv_map_1to1(host_addr: u64, guest_paddr: u64, size: usize) -> Result<()> {
+    let ret = unsafe {
+        applevisor_sys::hv_vm_map(
+            host_addr as _,
+            guest_paddr,
+            size,
+            Into::<applevisor_sys::hv_memory_flags_t>::into(av::MemPerms::RWX),
+        )
+    };
+    match ret {
+        x if x == applevisor_sys::hv_error_t::HV_SUCCESS as i32 => Ok(()),
+        code => Err(av::HypervisorError::from(code))?,
+    }
 }
 
 impl PageTableManager {
@@ -1358,6 +1388,7 @@ impl PageTableManager {
             pgd,
             allocs: BTreeMap::new(),
             one_to_one_last: 0x1_0000_0000,
+            lazy_one_to_one: BTreeMap::new(),
         })
     }
 
@@ -1441,7 +1472,86 @@ impl PageTableManager {
 
     /// Map the given address in the hypervisor's virtual address space into the same address in
     /// the virtual machine's address space.
+    ///
+    /// The host pages must not be ones SPTM has typed executable (`XNU_USER_EXEC`): handing
+    /// those to `hv_vm_map` panics the kernel (`VIOLATION_ILLEGAL_MAPPING_TYPE`) rather than
+    /// returning an error. That includes pages of a private, not-yet-written file mapping that
+    /// share physical memory with an executable mapping of the same file anywhere on the system
+    /// (e.g. the dyld shared cache). Use [`Self::map_1to1_lazy`] for those, which forces private
+    /// copies as the guest touches them.
     pub fn map_1to1(
+        &mut self,
+        addr: u64,
+        size: usize,
+        perms: av::MemPerms,
+        privileged: bool,
+    ) -> Result<()> {
+        let guest_paddr = self.one_to_one_last;
+        self.map_1to1_tables(addr, size, perms, privileged)?;
+        hv_map_1to1(addr, guest_paddr, size)
+    }
+
+    /// Like [`Self::map_1to1`], but the backing host memory is only mapped into the VM (in
+    /// [`LAZY_ONE_TO_ONE_CHUNK`] pieces) when the guest first touches it; see
+    /// [`Self::fault_in_lazy_1to1`].
+    pub fn map_1to1_lazy(
+        &mut self,
+        addr: u64,
+        size: usize,
+        perms: av::MemPerms,
+        privileged: bool,
+    ) -> Result<()> {
+        let guest_paddr = self.one_to_one_last;
+        self.map_1to1_tables(addr, size, perms, privileged)?;
+        let chunks = (size as u64).div_ceil(LAZY_ONE_TO_ONE_CHUNK) as usize;
+        self.lazy_one_to_one.insert(
+            guest_paddr,
+            LazyOneToOne {
+                host_addr: addr,
+                size: size as u64,
+                faulted: vec![false; chunks],
+            },
+        );
+        Ok(())
+    }
+
+    /// Maps the chunk of a lazy 1:1 range containing guest physical address `paddr` into the VM.
+    /// Returns `false` if `paddr` isn't in a lazy range, or its chunk was already mapped (so the
+    /// fault is not ours to handle).
+    pub fn fault_in_lazy_1to1(&mut self, paddr: u64) -> Result<bool> {
+        let Some((&range_paddr, range)) = self.lazy_one_to_one.range_mut(..=paddr).next_back()
+        else {
+            return Ok(false);
+        };
+        let offset = paddr - range_paddr;
+        if offset >= range.size {
+            return Ok(false);
+        }
+        let chunk = (offset / LAZY_ONE_TO_ONE_CHUNK) as usize;
+        if range.faulted[chunk] {
+            return Ok(false);
+        }
+
+        let chunk_offset = chunk as u64 * LAZY_ONE_TO_ONE_CHUNK;
+        let chunk_size = LAZY_ONE_TO_ONE_CHUNK.min(range.size - chunk_offset);
+        let host_addr = range.host_addr + chunk_offset;
+        // Lazy ranges are meant for private file mappings whose pages may still be shared with
+        // (and typed executable by) other mappings of the same file, which the kernel refuses to
+        // map into a VM. Writing each page forces a copy-on-write into a fresh private page.
+        for page in (host_addr..host_addr + chunk_size).step_by(HOST_PAGE_SIZE as usize) {
+            unsafe {
+                let ptr = page as *mut u8;
+                std::ptr::write_volatile(ptr, std::ptr::read_volatile(ptr));
+            }
+        }
+        hv_map_1to1(host_addr, range_paddr + chunk_offset, chunk_size as usize)?;
+        range.faulted[chunk] = true;
+        Ok(true)
+    }
+
+    /// Assigns guest physical addresses to a 1:1 range and adds it to the page tables, without
+    /// creating the stage-2 mapping.
+    fn map_1to1_tables(
         &mut self,
         addr: u64,
         size: usize,
@@ -1462,25 +1572,8 @@ impl PageTableManager {
             .checked_add(size as u64)
             .ok_or(MemoryError::Overflow(addr, size))?);
 
-        // Manually construct and map the physical memory for the mapping.
-        // N.B. done once for the whole mapping instead of per-page to keep the number of mappings down.
-        // Expanded from hv_unsafe_call in applevisor
         let guest_paddr = self.one_to_one_last;
         self.one_to_one_last += size as u64;
-        {
-            let ret = unsafe {
-                applevisor_sys::hv_vm_map(
-                    addr as _,
-                    guest_paddr,
-                    size,
-                    Into::<applevisor_sys::hv_memory_flags_t>::into(av::MemPerms::RWX),
-                )
-            };
-            match ret {
-                x if x == applevisor_sys::hv_error_t::HV_SUCCESS as i32 => Ok(()),
-                code => Err(av::HypervisorError::from(code)),
-            }
-        }?;
 
         // Iterates over the address of each page boundary and adds them to the page table.
         for addr in (range_start..range_end).step_by(VIRT_PAGE_SIZE) {
@@ -2013,6 +2106,23 @@ impl VirtMemAllocator {
             0xffff => self.upper_table.map(addr, size, perms, false),
             _ => Err(MemoryError::InvalidAddress(addr))?,
         }
+    }
+
+    /// Lazily maps a non-privileged 1:1 range; see [`PageTableManager::map_1to1_lazy`].
+    #[inline]
+    pub fn map_1to1_lazy(&mut self, addr: u64, size: usize, perms: av::MemPerms) -> Result<()> {
+        match addr >> 0x30 {
+            0x0000 => self.lower_table.map_1to1_lazy(addr, size, perms, false),
+            0xffff => self.upper_table.map_1to1_lazy(addr, size, perms, false),
+            _ => Err(MemoryError::InvalidAddress(addr))?,
+        }
+    }
+
+    /// Handles a stage-2 fault at guest physical address `paddr` if it belongs to a lazy 1:1
+    /// range; see [`PageTableManager::fault_in_lazy_1to1`].
+    pub fn fault_in_lazy_1to1(&mut self, paddr: u64) -> Result<bool> {
+        Ok(self.lower_table.fault_in_lazy_1to1(paddr)?
+            || self.upper_table.fault_in_lazy_1to1(paddr)?)
     }
 
     /// Maps a non-privileged virtual address range of size `size`, starting at address `addr` and

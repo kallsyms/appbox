@@ -24,6 +24,11 @@ pub struct SharedCache {
     pub reservation: Rc<MemoryMap>,
     pub slide: usize,
     pub mappings: Vec<Rc<MemoryMap>>,
+    // Subset of `mappings`. Until written, their file-backed pages are the same physical pages
+    // the host's own shared region executes, which SPTM types XNU_USER_EXEC; handing those to
+    // hv_vm_map panics the kernel (VIOLATION_ILLEGAL_MAPPING_TYPE). They're mapped into the VM
+    // lazily so only pages the guest touches get copied.
+    executable_mappings: Vec<Rc<MemoryMap>>,
     symbol_map: Option<SymbolMap>,
 }
 
@@ -88,6 +93,7 @@ impl SharedCache {
             reservation: Rc::new(reservation),
             slide,
             mappings: vec![],
+            executable_mappings: vec![],
             symbol_map: None,
         };
         cache.map_single_cache(cache_path)?;
@@ -289,7 +295,11 @@ impl SharedCache {
                 trace!("no slide info for mapping 0x{:x}", mapping_info.address);
             }
 
-            self.mappings.push(Rc::new(mapping));
+            let mapping = Rc::new(mapping);
+            if mapping_info.maxProt & VM_PROT_EXECUTE != 0 {
+                self.executable_mappings.push(mapping.clone());
+            }
+            self.mappings.push(mapping);
         }
 
         for subcache_path in subcache_paths(path, &cache, &cache_header)? {
@@ -306,8 +316,17 @@ impl SharedCache {
                 mapping.data(),
                 unsafe { mapping.data().add(mapping.len()) }
             );
-            vm.vma
-                .map_1to1(mapping.data() as _, mapping.len(), av::MemPerms::RWX)?;
+            if self
+                .executable_mappings
+                .iter()
+                .any(|executable| Rc::ptr_eq(executable, mapping))
+            {
+                vm.vma
+                    .map_1to1_lazy(mapping.data() as _, mapping.len(), av::MemPerms::RWX)?;
+            } else {
+                vm.vma
+                    .map_1to1(mapping.data() as _, mapping.len(), av::MemPerms::RWX)?;
+            }
         }
         Ok(())
     }
@@ -423,6 +442,7 @@ struct segment_command_64 {
 
 const MH_MAGIC_64: u32 = 0xfeedfacf;
 const LC_SEGMENT_64: u32 = 0x19;
+const VM_PROT_EXECUTE: u32 = 0x4;
 const SEG_LINKEDIT: &[u8; 16] = b"__LINKEDIT\0\0\0\0\0\0";
 const LC_REQ_DYLD: u32 = 0x8000_0000;
 const LC_DYLD_INFO: u32 = 0x22;
