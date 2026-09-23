@@ -1,4 +1,5 @@
 use crate::dyld;
+use crate::layout::GuestMallocPlacement;
 use crate::symbols::{self, MachOSymbolMap, Symbolication};
 use crate::vm::VmManager;
 use anyhow::{bail, Result};
@@ -49,6 +50,7 @@ pub struct Loader {
 
     map_fixed_next: usize,
     mappings: Vec<Rc<MemoryMap>>,
+    guest_malloc: Option<GuestMallocPlacement>,
 
     pub entry_point: u64,
     pub stack_pointer: u64,
@@ -56,12 +58,22 @@ pub struct Loader {
 
 impl Loader {
     fn new(executable: &Path, arguments: Vec<String>, environment: Vec<String>) -> Result<Self> {
-        Ok(Self::new_with_shared_cache(
+        // Done first so that retrying after an AddressSpaceConflict is cheap. Tests only load
+        // binaries, never run them, so skip reserving 24GiB (which usually fails depending on
+        // where the test process' own malloc landed).
+        let guest_malloc = if cfg!(test) {
+            None
+        } else {
+            GuestMallocPlacement::new()?
+        };
+        let mut loader = Self::new_with_shared_cache(
             executable,
             arguments,
             environment,
             dyld::SharedCache::new_system_cache()?,
-        ))
+        );
+        loader.guest_malloc = guest_malloc;
+        Ok(loader)
     }
 
     fn new_with_shared_cache(
@@ -79,6 +91,7 @@ impl Loader {
             symbol_maps: Vec::new(),
             map_fixed_next: 0x5_0000_0000,
             mappings: Vec::new(),
+            guest_malloc: None,
             entry_point: 0,
             stack_pointer: 0,
         }
@@ -98,6 +111,14 @@ impl Loader {
                 std::mem::forget(mapping.clone());
             }
         }
+    }
+
+    /// Whether a fixed guest mapping of `(addr, size)` is the guest's malloc heap reservation we
+    /// set aside for it, and may overwrite our placeholder. True at most once.
+    pub(crate) fn take_guest_malloc_reservation(&self, addr: u64, size: u64) -> bool {
+        self.guest_malloc
+            .as_ref()
+            .is_some_and(|placement| placement.take_reservation(addr, size))
     }
 
     pub fn symbolicate(&self, addr: u64) -> Option<Symbolication> {
@@ -350,13 +371,12 @@ impl Loader {
          *      Where arg[i] and env[i] point into the STRING AREA
          */
 
-        let applep = vec![
+        let mut applep = vec![
             // TODO: this should be absolute path
             format!("executable_path={}", self.executable.to_str().unwrap()),
             // Numbers are whatever a test program happened to be launched with.
             //format!("pfz=0x{:x}", 0xfff7bc000u32),
             //format!("stack_guard=0x{:x}", 0xfaf7ad82aef8002bu64),
-            //format!("malloc_entropy=0x{:x},0x{:x}", 0x90ccd126cb1ecd9u64, 0x51cba845df4738d5u64),
             format!("ptr_munge=0x{:x}", 0x44a5acc71e7f7fa2u64),
             //format!("main_stack=0x16fe00000,0x7fc000,0x16be00000,0x4000000"),
             //format!("executable_file=0x1a01000010,0x6e441eb"),
@@ -366,6 +386,12 @@ impl Loader {
             //format!("arm64e_abi=os"),
             //format!("th_port=0x103"),
         ];
+        if let Some(placement) = &self.guest_malloc {
+            applep.push(format!(
+                "malloc_entropy=0x{:x},0x{:x}",
+                placement.entropy[0], placement.entropy[1]
+            ));
+        }
         trace!("applep = {:?}", applep);
 
         let total_len = self.arguments.iter().map(|s| s.len() + 1).sum::<usize>()

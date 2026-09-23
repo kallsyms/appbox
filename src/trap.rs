@@ -1,7 +1,9 @@
 use crate::applevisor as av;
 use crate::hyperpom::crash::ExitKind;
 use crate::hyperpom::memory::VirtMemAllocator;
+use crate::layout::AddressSpaceConflict;
 use crate::loader::Loader;
+use crate::mach::{mach_vm_allocate, mach_vm_deallocate, mach_vm_map, VM_FLAGS_OVERWRITE};
 use crate::syscalls;
 use anyhow::{Context, Result};
 use log::{debug, error, trace, warn};
@@ -25,31 +27,6 @@ const FIXED_MAP_SIZE: u64 = 0x1_0000_0000;
 const PROT_EXEC: u64 = nix::libc::PROT_EXEC as u64;
 
 static FIXED_MAP_POOL: OnceLock<std::result::Result<(), i32>> = OnceLock::new();
-
-unsafe extern "C" {
-    fn mach_vm_allocate(
-        target: nix::libc::mach_port_t,
-        address: *mut u64,
-        size: u64,
-        flags: i32,
-    ) -> i32;
-
-    fn mach_vm_deallocate(target: nix::libc::mach_port_t, address: u64, size: u64) -> i32;
-
-    fn mach_vm_map(
-        target: nix::libc::mach_port_t,
-        address: *mut u64,
-        size: u64,
-        mask: u64,
-        flags: i32,
-        object: nix::libc::mach_port_t,
-        offset: u64,
-        copy: i32,
-        cur_protection: i32,
-        max_protection: i32,
-        inheritance: u32,
-    ) -> i32;
-}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -289,12 +266,7 @@ impl DefaultTrapHandler {
         let reservation = FIXED_MAP_POOL.get_or_init(|| {
             let mut addr = FIXED_MAP_BASE;
             let kr = unsafe {
-                mach_vm_allocate(
-                    nix::libc::mach_task_self(),
-                    &mut addr,
-                    FIXED_MAP_SIZE,
-                    0,
-                )
+                mach_vm_allocate(nix::libc::mach_task_self(), &mut addr, FIXED_MAP_SIZE, 0)
             };
             if kr == KERN_SUCCESS as i32 && addr == FIXED_MAP_BASE {
                 Ok(())
@@ -309,14 +281,13 @@ impl DefaultTrapHandler {
 
         match reservation {
             Ok(()) => Ok(()),
-            Err(kr) => Err(io::Error::from_raw_os_error(nix::libc::ENOMEM))
-                .map_err(anyhow::Error::from)
-                .context(format!(
-                    "failed to reserve fixed mapping pool at {:#x} size {:#x}: kern_return_t={}",
-                    FIXED_MAP_BASE,
-                    FIXED_MAP_SIZE,
-                    kr
-                )),
+            Err(kr) => Err(anyhow::Error::new(AddressSpaceConflict {
+                what: "the fixed mapping pool",
+            }))
+            .context(format!(
+                "failed to reserve fixed mapping pool at {:#x} size {:#x}: kern_return_t={}",
+                FIXED_MAP_BASE, FIXED_MAP_SIZE, kr
+            )),
         }
     }
 
@@ -485,6 +456,11 @@ impl TrapHandler for DefaultTrapHandler {
                         self.restore_fixed_map_range(chosen, args[2])?;
                     }
                     handled = true;
+                } else {
+                    let addr = unsafe { *(args[1] as *const u64) };
+                    if loader.take_guest_malloc_reservation(addr, args[2]) {
+                        args[4] |= VM_FLAGS_OVERWRITE as u64;
+                    }
                 }
             }
             syscalls::TRAP_mach_vm_protect => {
@@ -593,13 +569,18 @@ impl TrapHandler for DefaultTrapHandler {
                         // VM_FLAGS_OVERWRITE fails instead of clobbering host memory.
                         // max_protection is widened since the guest's mprotect and
                         // mach_vm_protect are no-ops on the host.
+                        let mut flags = req.flags;
+                        if flags & 1 == 0 && loader.take_guest_malloc_reservation(address, req.size)
+                        {
+                            flags |= VM_FLAGS_OVERWRITE;
+                        }
                         let mut mapped_address = address;
                         let kr = mach_vm_map(
                             nix::libc::mach_task_self(),
                             &mut mapped_address,
                             req.size,
                             req.mask,
-                            req.flags,
+                            flags,
                             0,
                             0,
                             0,
