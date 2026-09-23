@@ -35,6 +35,20 @@ unsafe extern "C" {
     ) -> i32;
 
     fn mach_vm_deallocate(target: nix::libc::mach_port_t, address: u64, size: u64) -> i32;
+
+    fn mach_vm_map(
+        target: nix::libc::mach_port_t,
+        address: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: i32,
+        object: nix::libc::mach_port_t,
+        offset: u64,
+        copy: i32,
+        cur_protection: i32,
+        max_protection: i32,
+        inheritance: u32,
+    ) -> i32;
 }
 
 #[derive(Clone, Copy)]
@@ -49,12 +63,13 @@ struct MachMsgHeader {
 }
 
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, packed(4))]
 struct MigReplyError {
     hdr: MachMsgHeader,
     ndr: u64,
     ret_code: u32,
 }
+const _: () = assert!(std::mem::size_of::<MigReplyError>() == 36);
 
 #[derive(Clone, Copy)]
 #[repr(C, packed(4))]
@@ -550,7 +565,7 @@ impl TrapHandler for DefaultTrapHandler {
                         let req_ptr = args[0] as *mut KernelRpcMachVmMapRequest;
                         let mut req = std::ptr::read_unaligned(req_ptr);
                         // In macOS 14, the above does not work for some reason (returning MACH_SEND_INVALID_REPLY), but only on replay.
-                        // To get around this, emulate the map behavior with mmap.
+                        // To get around this, perform the map ourselves and fake the reply.
                         // TODO: this assumes object == 0.
                         req.size = Self::align_size(req.size);
                         let released_fixed_range = if req.flags & 1 != 0 {
@@ -573,15 +588,24 @@ impl TrapHandler for DefaultTrapHandler {
                             cflags = 1 << 29;
                             return Ok(SyscallResult::cont(ret0, ret1, cflags));
                         }
-                        let map_ret = nix::libc::mmap(
-                            address as _,
-                            req.size as _,
-                            (req.cur_protection as u64 & !PROT_EXEC) as _,
-                            nix::libc::MAP_PRIVATE
-                                | nix::libc::MAP_ANONYMOUS
-                                | nix::libc::MAP_FIXED,
-                            -1,
+                        // Going through the kernel (rather than e.g. mmap(MAP_FIXED)) preserves
+                        // mach_vm_map semantics, notably that a fixed mapping without
+                        // VM_FLAGS_OVERWRITE fails instead of clobbering host memory.
+                        // max_protection is widened since the guest's mprotect and
+                        // mach_vm_protect are no-ops on the host.
+                        let mut mapped_address = address;
+                        let kr = mach_vm_map(
+                            nix::libc::mach_task_self(),
+                            &mut mapped_address,
+                            req.size,
+                            req.mask,
+                            req.flags,
                             0,
+                            0,
+                            0,
+                            req.cur_protection & !(PROT_EXEC as i32),
+                            nix::libc::PROT_READ | nix::libc::PROT_WRITE,
+                            req.inheritance as u32,
                         );
                         let reply_ptr = args[0] as *mut KernelRpcMachVmMapReply;
                         let mut reply = std::ptr::read_unaligned(reply_ptr);
@@ -589,18 +613,19 @@ impl TrapHandler for DefaultTrapHandler {
                         reply.head.msgh_size = std::mem::size_of::<KernelRpcMachVmMapReply>() as _;
                         reply.head.msgh_remote_port = 0;
                         reply.head.msgh_id += 100;
-                        if map_ret == nix::libc::MAP_FAILED {
+                        if kr != KERN_SUCCESS as i32 {
                             if let Some(size) = released_fixed_range {
                                 self.restore_fixed_map_range(address, size)?;
                             }
-                            reply.ret_code = KERN_DENIED as _;
-                            reply.address = 0;
-                            ret0 = KERN_DENIED;
+                            // MIG servers reply to failures with a bare mig_reply_error_t.
+                            reply.head.msgh_size = std::mem::size_of::<MigReplyError>() as _;
+                            reply.ret_code = kr as _;
+                            ret0 = KERN_SUCCESS;
                         } else {
-                            vma.map_1to1(address, req.size as _, av::MemPerms::RWX)?;
-                            self.record_mapping(address, req.size as _);
+                            vma.map_1to1(mapped_address, req.size as _, av::MemPerms::RWX)?;
+                            self.record_mapping(mapped_address, req.size as _);
                             reply.ret_code = KERN_SUCCESS as _;
-                            reply.address = address;
+                            reply.address = mapped_address;
                             ret0 = KERN_SUCCESS;
                         }
                         std::ptr::write_unaligned(reply_ptr, reply);
@@ -618,7 +643,7 @@ impl TrapHandler for DefaultTrapHandler {
                             // idk, maybe the remote bits (0x13=MACH_MSG_TYPE_COPY_SEND) gets reduced to
                             // MACH_MSG_TYPE_PORT_SEND (0x12)?
                             reply.hdr.msgh_bits = 0x1200;
-                            reply.hdr.msgh_size = 36;
+                            reply.hdr.msgh_size = std::mem::size_of::<MigReplyError>() as _;
                             reply.hdr.msgh_remote_port = 0;
                             reply.hdr.msgh_reserved = 0;
                             reply.hdr.msgh_id += 100;
