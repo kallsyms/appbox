@@ -401,7 +401,25 @@ struct linkedit_data_command {
     datasize: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct segment_command_64 {
+    cmd: u32,
+    cmdsize: u32,
+    segname: [u8; 16],
+    vmaddr: u64,
+    vmsize: u64,
+    fileoff: u64,
+    filesize: u64,
+    maxprot: u32,
+    initprot: u32,
+    nsects: u32,
+    flags: u32,
+}
+
 const MH_MAGIC_64: u32 = 0xfeedfacf;
+const LC_SEGMENT_64: u32 = 0x19;
+const SEG_LINKEDIT: &[u8; 16] = b"__LINKEDIT\0\0\0\0\0\0";
 const LC_REQ_DYLD: u32 = 0x8000_0000;
 const LC_DYLD_INFO: u32 = 0x22;
 const LC_DYLD_INFO_ONLY: u32 = LC_DYLD_INFO | LC_REQ_DYLD;
@@ -479,12 +497,6 @@ impl SymbolMap {
 struct ExportSymbol {
     addr: u64,
     name: String,
-}
-
-fn read_bytes_at(file: &File, offset: u64, size: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; size];
-    file.read_exact_at(&mut buf, offset)?;
-    Ok(buf)
 }
 
 fn read_cstring_at(file: &File, offset: u64, max_len: usize) -> Result<String> {
@@ -575,12 +587,17 @@ fn load_exports_symbols(
         let mut cmd_ptr =
             unsafe { (header as *const mach_header_64).add(1) as *const load_command };
         let mut export_info: Option<(u32, u32)> = None;
+        let mut linkedit: Option<segment_command_64> = None;
         for _ in 0..header.ncmds {
             let cmd = unsafe { &*cmd_ptr };
-            if cmd.cmd == LC_DYLD_EXPORTS_TRIE {
+            if cmd.cmd == LC_SEGMENT_64 {
+                let segment = unsafe { &*(cmd_ptr as *const segment_command_64) };
+                if &segment.segname == SEG_LINKEDIT {
+                    linkedit = Some(*segment);
+                }
+            } else if cmd.cmd == LC_DYLD_EXPORTS_TRIE {
                 let export_cmd = unsafe { &*(cmd_ptr as *const linkedit_data_command) };
                 export_info = Some((export_cmd.dataoff, export_cmd.datasize));
-                break;
             } else if cmd.cmd == LC_DYLD_INFO || cmd.cmd == LC_DYLD_INFO_ONLY {
                 let dyld_info = unsafe { &*(cmd_ptr as *const dyld_info_command) };
                 if dyld_info.export_size != 0 {
@@ -598,8 +615,21 @@ fn load_exports_symbols(
             continue;
         }
 
-        let data = read_bytes_at(cache_file, dataoff as u64, datasize as usize)?;
-        let exports = parse_exports_trie(&data)?;
+        let Some(linkedit) = linkedit else {
+            continue;
+        };
+        // The trie offset is a file offset, but linkedit may live in a different subcache file
+        // (e.g. .dyldlinkedit) than the main cache, so read it from the already-mapped segment.
+        let (dataoff, datasize) = (dataoff as u64, datasize as u64);
+        let linkedit_file_end = linkedit.fileoff + linkedit.filesize;
+        if dataoff < linkedit.fileoff || dataoff + datasize > linkedit_file_end {
+            warn!("export trie outside __LINKEDIT for image at 0x{:x}", load_addr);
+            continue;
+        }
+        let trie_addr = linkedit.vmaddr + slide as u64 + (dataoff - linkedit.fileoff);
+        let data =
+            unsafe { std::slice::from_raw_parts(trie_addr as *const u8, datasize as usize) };
+        let exports = parse_exports_trie(data)?;
         if exports.is_empty() {
             continue;
         }
@@ -895,6 +925,59 @@ mod tests {
 
         let cache = SharedCache::new(path)?;
         assert!(cache.mappings.len() > subcaches.len());
+        Ok(())
+    }
+
+    #[test]
+    fn system_cache_symbols_roundtrip() -> Result<()> {
+        extern "C" {
+            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> u64;
+            fn _dyld_get_shared_cache_range(length: *mut usize) -> u64;
+        }
+        const RTLD_DEFAULT: *mut std::ffi::c_void = -2isize as _;
+
+        let cache = SharedCache::new_system_cache()?;
+        let symbol_map = cache.symbol_map.as_ref().expect("no dyld symbols loaded");
+
+        let mut host_cache_len = 0;
+        let host_cache_base = unsafe { _dyld_get_shared_cache_range(&mut host_cache_len) };
+        assert_ne!(host_cache_base, 0);
+
+        for (name, image) in [
+            ("_malloc", "/usr/lib/system/libsystem_malloc.dylib"),
+            ("_write", "/usr/lib/system/libsystem_kernel.dylib"),
+        ] {
+            let addr = symbol_map
+                .symbols
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("{name} not found"))
+                .addr;
+
+            let c_name = std::ffi::CString::new(&name[1..]).unwrap();
+            let host_addr = unsafe { dlsym(RTLD_DEFAULT, c_name.as_ptr()) };
+            assert_eq!(
+                addr - cache.base_address() as u64,
+                host_addr - host_cache_base,
+                "{name} resolved to a different cache offset than the host's dlsym"
+            );
+
+            let symbolication = cache.symbolicate(addr).unwrap();
+            assert_eq!(symbolication.symbol_addr, addr);
+            assert_eq!(symbolication.image, image);
+            let names_at_addr: Vec<_> = symbol_map
+                .symbols
+                .iter()
+                .filter(|entry| entry.addr == addr)
+                .map(|entry| entry.name.as_str())
+                .collect();
+            assert!(
+                names_at_addr.contains(&symbolication.symbol.as_str())
+                    && names_at_addr.contains(&name),
+                "{name} symbolicated as {}",
+                symbolication.symbol
+            );
+        }
         Ok(())
     }
 

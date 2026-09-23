@@ -22,4 +22,7 @@ jobs:
         run: rustup toolchain install nightly --profile minimal
 
       - name: Load system shared cache
-        run: cargo test --lib dyld::tests::system_cache_loads_without_vm -- --exact --nocapture
+        run: >
+          cargo test --lib -- --exact --nocapture
+          dyld::tests::system_cache_loads_without_vm
+          dyld::tests::system_cache_symbols_roundtrip
