@@ -1493,7 +1493,7 @@ impl PageTableManager {
 
     /// Like [`Self::map_1to1`], but the backing host memory is only mapped into the VM (in
     /// [`LAZY_ONE_TO_ONE_CHUNK`] pieces) when the guest first touches it; see
-    /// [`Self::fault_in_lazy_1to1`].
+    /// [`Self::fault_in_lazy_1to1`]. The host range must be writable.
     pub fn map_1to1_lazy(
         &mut self,
         addr: u64,

@@ -659,7 +659,33 @@ impl TrapHandler for DefaultTrapHandler {
             syscalls::SYS_mmap => {
                 if cflags & (1 << 29) == 0 {
                     trace!("1:1 map of {:x} {:x} due to mmap", ret0, args[1]);
-                    vma.map_1to1(ret0, args[1] as _, av::MemPerms::RWX)?;
+                    let flags = args[3] as i32;
+                    // An unwritten page of a file mapping is the file's page-cache page, shared
+                    // with every other mapping of that file. If any process (including us) has
+                    // the file mapped executable, e.g. a dylib outside the shared cache, SPTM
+                    // types the page XNU_USER_EXEC, and handing it to hv_vm_map panics the kernel.
+                    // For private mappings, map lazily so pages get copied before reaching the VM.
+                    // Shared file mappings can't be copied without breaking sharing, so an
+                    // executable file mapped MAP_SHARED by the guest can still panic.
+                    if flags & nix::libc::MAP_ANON == 0 && flags & nix::libc::MAP_PRIVATE != 0 {
+                        // Lazy fault-in writes each page to force the copy.
+                        let ret = unsafe {
+                            nix::libc::mprotect(
+                                ret0 as _,
+                                args[1] as _,
+                                nix::libc::PROT_READ | nix::libc::PROT_WRITE,
+                            )
+                        };
+                        if ret != 0 {
+                            return Err(io::Error::last_os_error()).context(format!(
+                                "failed to make private file mapping {:#x} writable",
+                                ret0
+                            ));
+                        }
+                        vma.map_1to1_lazy(ret0, args[1] as _, av::MemPerms::RWX)?;
+                    } else {
+                        vma.map_1to1(ret0, args[1] as _, av::MemPerms::RWX)?;
+                    }
                     self.record_mapping(ret0, args[1] as _);
                 }
             }
