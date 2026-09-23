@@ -2505,6 +2505,19 @@ impl VirtMemAllocator {
         Ok(())
     }
 
+    /// Returns the host address backing virtual address `addr`.
+    pub fn host_addr(&self, addr: u64) -> Result<*const u8> {
+        let page_start = align_virt_page!(addr);
+        let page = match page_start >> 0x30 {
+            0x0000 => self.lower_table.get_page_by_addr(page_start),
+            0xffff => self.upper_table.get_page_by_addr(page_start),
+            _ => Err(MemoryError::InvalidAddress(addr))?,
+        }?;
+        let host_page = page.borrow().data.as_ref().unwrap().host_addr;
+        // SAFETY: the offset is within the page.
+        Ok(unsafe { host_page.add((addr - page_start) as usize) })
+    }
+
     /// Reads from virtual address `addr` into the slice `buf`. The number of bytes read is the
     /// size of `buf`.
     pub fn read(&self, addr: u64, buf: &mut [u8]) -> Result<usize> {

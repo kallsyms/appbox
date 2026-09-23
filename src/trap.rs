@@ -3,11 +3,13 @@ use crate::hyperpom::crash::ExitKind;
 use crate::hyperpom::memory::VirtMemAllocator;
 use crate::layout::AddressSpaceConflict;
 use crate::loader::Loader;
-use crate::mach::{mach_vm_allocate, mach_vm_deallocate, mach_vm_map, VM_FLAGS_OVERWRITE};
+use crate::mach::{
+    mach_vm_allocate, mach_vm_deallocate, mach_vm_map, mach_vm_read_overwrite, VM_FLAGS_OVERWRITE,
+};
 use crate::syscalls;
 use anyhow::{Context, Result};
 use log::{debug, error, trace, warn};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CStr;
 use std::io;
 use std::sync::OnceLock;
@@ -748,11 +750,11 @@ impl TrapHandler for DefaultTrapHandler {
 // Currently recurses up to 2 levels deep, as I can't think of any syscalls which would
 // pointer chase more than that.
 pub fn explore_pointers(vma: &VirtMemAllocator, entry_points: &[u64]) -> HashSet<u64> {
-    let mut valid_pages = HashSet::new();
+    let mut readable_pages = HashMap::new();
     let mut queue = entry_points
         .iter()
         .filter_map(|&addr| {
-            if check_ptr(vma, addr, &mut valid_pages) {
+            if check_ptr(vma, addr, &mut readable_pages) {
                 Some((addr, 0))
             } else {
                 None
@@ -768,13 +770,13 @@ pub fn explore_pointers(vma: &VirtMemAllocator, entry_points: &[u64]) -> HashSet
             // +0x200 can take us to a new, potentially unmapped page so we have to check.
             // But we only have to do this when crossing the page boundry, not every time.
             if (addr + 7) & !0xfff != addr & !0xfff {
-                if !check_ptr(vma, addr, &mut valid_pages) {
+                if !check_ptr(vma, addr, &mut readable_pages) {
                     break;
                 }
                 pages.insert((addr + 7) & !0xfff);
             }
             let maybe_ptr = vma.read_qword(addr).unwrap();
-            if !vma.read_byte(maybe_ptr).is_ok() {
+            if !readable_page(vma, maybe_ptr & !0xfff, &mut readable_pages) {
                 continue;
             }
             let ptr_page_addr = maybe_ptr & !0xfff;
@@ -790,16 +792,36 @@ pub fn explore_pointers(vma: &VirtMemAllocator, entry_points: &[u64]) -> HashSet
     pages
 }
 
-fn check_ptr(vma: &VirtMemAllocator, ptr: u64, valid_pages: &mut HashSet<u64>) -> bool {
-    if valid_pages.contains(&(ptr & !0xfff)) && valid_pages.contains(&((ptr + 7) & !0xfff)) {
-        return true;
-    }
-    if vma.read_qword(ptr).is_ok() {
-        valid_pages.insert(ptr & !0xfff);
-        valid_pages.insert((ptr + 7) & !0xfff);
-        return true;
-    }
-    false
+fn check_ptr(vma: &VirtMemAllocator, ptr: u64, readable_pages: &mut HashMap<u64, bool>) -> bool {
+    readable_page(vma, ptr & !0xfff, readable_pages)
+        && readable_page(vma, (ptr + 7) & !0xfff, readable_pages)
+}
+
+/// Whether `page` is mapped into the guest and readable on the host. Guest mappings can be
+/// inaccessible on the host (e.g. PROT_NONE guard ranges), and reading those through the
+/// VirtMemAllocator, which dereferences host memory directly, would crash.
+fn readable_page(
+    vma: &VirtMemAllocator,
+    page: u64,
+    readable_pages: &mut HashMap<u64, bool>,
+) -> bool {
+    *readable_pages.entry(page).or_insert_with(|| {
+        let Ok(host_addr) = vma.host_addr(page) else {
+            return false;
+        };
+        let mut byte = 0u8;
+        let mut read = 0u64;
+        let kr = unsafe {
+            mach_vm_read_overwrite(
+                nix::libc::mach_task_self(),
+                host_addr as u64,
+                1,
+                &mut byte as *mut u8 as u64,
+                &mut read,
+            )
+        };
+        kr == KERN_SUCCESS as i32
+    })
 }
 
 #[cfg(test)]
@@ -852,6 +874,24 @@ mod tests {
         let pages = explore_pointers(&vm.vma, &[page1]);
 
         assert_eq!(pages, HashSet::from([page1, page2, page3]));
+        Ok(())
+    }
+
+    #[test]
+    fn explore_pointers_skips_host_inaccessible_pages() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut vm = VmManager::new()?;
+        let page = 0x1000_0000;
+        vm.vma.map(page, 0x1000, av::MemPerms::RWX)?;
+
+        // Like a guest guard range: mapped into the guest, but PROT_NONE on the host.
+        let guard = mmap_fixed_fixed::MemoryMap::new(PAGE_ALIGN as usize, &[])?;
+        vm.vma
+            .map_1to1_lazy(guard.data() as u64, guard.len(), av::MemPerms::RWX)?;
+        vm.vma.write_qword(page, guard.data() as u64)?;
+
+        assert_eq!(explore_pointers(&vm.vma, &[page]), HashSet::from([page]));
         Ok(())
     }
 }
