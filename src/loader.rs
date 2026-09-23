@@ -58,13 +58,13 @@ pub struct Loader {
 
 impl Loader {
     fn new(executable: &Path, arguments: Vec<String>, environment: Vec<String>) -> Result<Self> {
-        // Done first so that retrying after an AddressSpaceConflict is cheap. Tests only load
-        // binaries, never run them, so skip reserving 24GiB (which usually fails depending on
-        // where the test process' own malloc landed).
+        // Done before anything else allocates host memory that could take the spot. Tests only
+        // load binaries, never run them, and aren't respawned with a pinned malloc layout, so
+        // skip it there.
         let guest_malloc = if cfg!(test) {
             None
         } else {
-            GuestMallocPlacement::new()?
+            Some(GuestMallocPlacement::new()?)
         };
         let mut loader = Self::new_with_shared_cache(
             executable,

@@ -38,11 +38,8 @@ fn main() -> Result<(), anyhow::Error> {
         .filter_level(args.verbose.log_level_filter())
         .init();
 
-    appbox::respawn::respawn(&Default::default())?;
-    run(args).inspect_err(appbox::respawn::exit_if_retryable)
-}
+    appbox::respawn::respawn()?;
 
-fn run(args: Args) -> Result<(), anyhow::Error> {
     let mut vm = VmManager::new()?;
 
     let mut argv = Vec::new();

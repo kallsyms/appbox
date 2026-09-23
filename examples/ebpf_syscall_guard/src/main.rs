@@ -127,11 +127,8 @@ fn main() -> Result<()> {
         .filter_level(args.verbose.log_level_filter())
         .init();
 
-    appbox::respawn::respawn(&Default::default())?;
-    run(args).inspect_err(appbox::respawn::exit_if_retryable)
-}
+    appbox::respawn::respawn()?;
 
-fn run(args: Args) -> Result<()> {
     let prog = load_bpf_program(&args)?;
     let mut bpf_vm = EbpfVmRaw::new(Some(&prog)).map_err(|e| anyhow!("rbpf: {e}"))?;
     bpf_vm

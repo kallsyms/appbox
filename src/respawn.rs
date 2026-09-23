@@ -8,28 +8,23 @@
 //! disabled and, before it runs, overwrites that entropy so the child's heap lands in a known spot.
 //! This also makes the host layout deterministic, which matters for record/replay.
 //!
-//! Pinning needs `task_for_pid` on the child, i.e. the `com.apple.security.cs.debugger` and
-//! `com.apple.security.get-task-allow` entitlements. Without them (or on macOS versions whose
-//! layout isn't known) the child keeps its random entropy, and conflicts are retried:
+//! Pinning needs `task_for_pid` on the child, so the binary must be signed with the
+//! `com.apple.security.cs.debugger` and `com.apple.security.get-task-allow` entitlements.
 //!
 //! ```no_run
 //! fn main() -> anyhow::Result<()> {
-//!     appbox::respawn::respawn(&Default::default())?;
-//!     if let Err(err) = run() {
-//!         appbox::respawn::exit_if_retryable(&err);
-//!         return Err(err);
-//!     }
+//!     appbox::respawn::respawn()?;
+//!     // ... create the VM, load and run the guest ...
 //!     Ok(())
 //! }
-//! # fn run() -> anyhow::Result<()> { Ok(()) }
 //! ```
 
 use std::ffi::CString;
 
 use anyhow::{bail, Context, Result};
-use log::{debug, warn};
+use log::debug;
 
-use crate::layout::{is_address_space_conflict, pinned_host_malloc_entropy, AddressSpaceConflict};
+use crate::layout::pinned_host_malloc_entropy;
 use crate::mach::{
     mach_port_deallocate, mach_vm_read_overwrite, mach_vm_region, mach_vm_write, task_for_pid,
     KERN_SUCCESS, VM_PROT_READ, VM_PROT_WRITE, VM_REGION_BASIC_INFO_64,
@@ -38,22 +33,9 @@ use crate::mach::{
 
 const RESPAWNED_ENV: &str = "APPBOX_RESPAWNED";
 
-/// Exit code a respawned child uses to ask for another attempt.
-pub const RETRY_EXIT_CODE: i32 = 200;
-
 // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/sys/spawn.h
 const POSIX_SPAWN_START_SUSPENDED: i16 = 0x0080;
 const _POSIX_SPAWN_DISABLE_ASLR: i16 = 0x0100;
-
-pub struct RespawnOptions {
-    pub max_attempts: usize,
-}
-
-impl Default for RespawnOptions {
-    fn default() -> Self {
-        Self { max_attempts: 100 }
-    }
-}
 
 /// Whether this process is a child started by [`respawn`].
 pub fn is_respawned() -> bool {
@@ -61,14 +43,15 @@ pub fn is_respawned() -> bool {
 }
 
 /// Runs the current executable (with the same arguments and environment) in a child process with
-/// ASLR disabled and its malloc entropy pinned, starting a new one whenever it exits with
-/// [`RETRY_EXIT_CODE`], then exits with the child's status. Only returns in the child, which should
-/// report retryable failures with [`exit_if_retryable`].
-pub fn respawn(options: &RespawnOptions) -> Result<()> {
+/// ASLR disabled and its malloc entropy pinned, then exits with the child's status. Returns
+/// immediately in the child.
+pub fn respawn() -> Result<()> {
     if is_respawned() {
         return Ok(());
     }
 
+    let entropy = pinned_host_malloc_entropy()
+        .context("host malloc layout unknown for this macOS version")?;
     let executable = CString::new(
         std::env::current_exe()?
             .into_os_string()
@@ -90,67 +73,36 @@ pub fn respawn(options: &RespawnOptions) -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("posix_spawnattr_setflags");
     }
 
-    let entropy = pinned_host_malloc_entropy();
-    if entropy.is_none() {
-        warn!("host malloc layout unknown for this macOS version; relying on retries");
+    let mut pid: nix::libc::pid_t = 0;
+    let ret = unsafe {
+        nix::libc::posix_spawn(
+            &mut pid,
+            executable.as_ptr(),
+            std::ptr::null(),
+            &attr,
+            argv.as_ptr(),
+            envp.as_ptr(),
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::from_raw_os_error(ret)).context("posix_spawn");
     }
-    let mut warned_pin_failure = false;
+    debug!("respawned as pid {}", pid);
+    let pid = nix::unistd::Pid::from_raw(pid);
 
-    for attempt in 1..=options.max_attempts {
-        let mut pid: nix::libc::pid_t = 0;
-        let ret = unsafe {
-            nix::libc::posix_spawn(
-                &mut pid,
-                executable.as_ptr(),
-                std::ptr::null(),
-                &attr,
-                argv.as_ptr(),
-                envp.as_ptr(),
-            )
-        };
-        if ret != 0 {
-            return Err(std::io::Error::from_raw_os_error(ret)).context("posix_spawn");
-        }
-        debug!("respawned as pid {} (attempt {})", pid, attempt);
-
-        if let Some(entropy) = entropy {
-            if let Err(err) = pin_malloc_entropy(pid, entropy) {
-                if !warned_pin_failure {
-                    warn!(
-                        "could not pin host malloc layout, relying on retries: {:#}",
-                        err
-                    );
-                    warned_pin_failure = true;
-                }
-            }
-        }
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGCONT)?;
-
-        use nix::sys::wait::{waitpid, WaitStatus};
-        match waitpid(nix::unistd::Pid::from_raw(pid), None)? {
-            WaitStatus::Exited(_, RETRY_EXIT_CODE) => {
-                warn!(
-                    "address space conflict, retrying in a new process (attempt {}/{})",
-                    attempt, options.max_attempts
-                );
-            }
-            WaitStatus::Exited(_, code) => std::process::exit(code),
-            WaitStatus::Signaled(_, signal, _) => std::process::exit(128 + signal as i32),
-            status => bail!("unexpected child wait status: {:?}", status),
-        }
+    use nix::sys::signal::{kill, Signal};
+    if let Err(err) = pin_malloc_entropy(pid.as_raw(), entropy) {
+        let _ = kill(pid, Signal::SIGKILL);
+        let _ = nix::sys::wait::waitpid(pid, None);
+        return Err(err.context("pinning the host malloc layout"));
     }
-    Err(anyhow::Error::new(AddressSpaceConflict {
-        what: "the guest",
-    }))
-    .context(format!("gave up after {} attempts", options.max_attempts))
-}
+    kill(pid, Signal::SIGCONT)?;
 
-/// In a child started by [`respawn`], exits with [`RETRY_EXIT_CODE`] if `err` is an
-/// [`AddressSpaceConflict`] so that the parent tries again.
-pub fn exit_if_retryable(err: &anyhow::Error) {
-    if is_respawned() && is_address_space_conflict(err) {
-        warn!("{:#}", err);
-        std::process::exit(RETRY_EXIT_CODE);
+    use nix::sys::wait::{waitpid, WaitStatus};
+    match waitpid(pid, None)? {
+        WaitStatus::Exited(_, code) => std::process::exit(code),
+        WaitStatus::Signaled(_, signal, _) => std::process::exit(128 + signal as i32),
+        status => bail!("unexpected child wait status: {:?}", status),
     }
 }
 

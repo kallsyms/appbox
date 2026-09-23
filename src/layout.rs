@@ -7,8 +7,8 @@
 use std::cell::Cell;
 use std::fmt;
 
-use anyhow::Result;
-use log::{debug, warn};
+use anyhow::{Context, Result};
+use log::debug;
 
 use crate::mach::{mach_vm_allocate, mach_vm_deallocate, KERN_SUCCESS, VM_FLAGS_FIXED};
 
@@ -20,8 +20,8 @@ unsafe extern "C" {
 
 /// The host's address space has no room for something that has to live at a particular address.
 ///
-/// The conflicting host allocations (e.g. the host's own malloc heap) are placed randomly at
-/// process startup, so retrying in a new process will usually succeed; see [`crate::respawn`].
+/// This usually means the host's own malloc heap is in the way, i.e. the process wasn't started
+/// through [`crate::respawn::respawn`].
 #[derive(Debug)]
 pub struct AddressSpaceConflict {
     pub(crate) what: &'static str,
@@ -31,18 +31,14 @@ impl fmt::Display for AddressSpaceConflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "no room in the host address space for {}; retry in a new process",
+            "no room in the host address space for {}; was the process started via \
+             appbox::respawn?",
             self.what
         )
     }
 }
 
 impl std::error::Error for AddressSpaceConflict {}
-
-/// Whether `err` (or anything in its chain) is an [`AddressSpaceConflict`].
-pub fn is_address_space_conflict(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| cause.is::<AddressSpaceConflict>())
-}
 
 // xzone malloc (libmalloc) reserves its "pointer range" with a fixed mach_vm_map at one of
 // `candidates` XZONE_GRANULE-spaced addresses starting at `first`, picked by
@@ -124,21 +120,10 @@ pub(crate) struct GuestMallocPlacement {
 
 impl GuestMallocPlacement {
     /// Picks a free spot for the guest's xzone malloc heap reservation and reserves it.
-    ///
-    /// Returns `Ok(None)` on macOS versions whose placement isn't known, in which case the guest
-    /// picks at random and may collide with the host.
-    pub(crate) fn new() -> Result<Option<Self>> {
-        let Some(macos_major) = macos_major_version() else {
-            warn!("could not determine macOS version; not controlling guest malloc placement");
-            return Ok(None);
-        };
-        let Some(window) = xzone_window(macos_major) else {
-            warn!(
-                "guest malloc placement unknown for macOS {}; guest malloc may collide with the host",
-                macos_major
-            );
-            return Ok(None);
-        };
+    pub(crate) fn new() -> Result<Self> {
+        let macos_major = macos_major_version().context("could not determine macOS version")?;
+        let window = xzone_window(macos_major)
+            .with_context(|| format!("guest malloc placement unknown for macOS {}", macos_major))?;
 
         for candidate in 0..window.candidates {
             let mut addr = window.first + candidate * XZONE_GRANULE;
@@ -159,13 +144,13 @@ impl GuestMallocPlacement {
             if unsafe { getentropy(random.as_mut_ptr() as _, 16) } != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
-            return Ok(Some(Self {
+            return Ok(Self {
                 entropy: [
                     random[0],
                     xzone_entropy(candidate, window.candidates, random[1]),
                 ],
                 reservation: Cell::new(Some((addr, XZONE_RESERVATION_SIZE))),
-            }));
+            });
         }
         Err(AddressSpaceConflict {
             what: "the guest's malloc heap",
