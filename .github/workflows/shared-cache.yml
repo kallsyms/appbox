@@ -1,0 +1,25 @@
+name: Shared cache compatibility
+
+# Hosted macOS runners lack nested virtualization, so this only exercises loading the
+# dyld shared cache from the latest macOS image; it can't boot a VM to run a binary.
+on:
+  schedule:
+    - cron: "0 12 * * 1"
+  workflow_dispatch:
+
+jobs:
+  load-shared-cache:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show OS and shared cache layout
+        run: |
+          sw_vers
+          ls -la /System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/
+
+      - name: Install toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Load system shared cache
+        run: cargo test --lib dyld::tests::system_cache_loads_without_vm -- --exact --nocapture
