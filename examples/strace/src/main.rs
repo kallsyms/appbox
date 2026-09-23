@@ -279,7 +279,17 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            VmRunResult::Brk => ExitKind::Continue,
+            // Nothing here sets breakpoints, so this is the guest trapping (e.g. abort()).
+            VmRunResult::Brk => {
+                for (idx, addr) in appbox::unwind_user_stack(&vm, 32).iter().enumerate() {
+                    let symbol = loader
+                        .symbolicate(*addr)
+                        .map(|s| format!("{}!{}+{:#x}", s.image, s.symbol, addr - s.symbol_addr))
+                        .unwrap_or_default();
+                    eprintln!("{:02} {:#018x} {}", idx, addr, symbol);
+                }
+                ExitKind::Crash("guest trap (brk)".to_string())
+            }
             VmRunResult::Other(exit_info) => match exit_info.reason {
                 av::ExitReason::EXCEPTION => {
                     match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
