@@ -29,6 +29,9 @@ pub struct SharedCache {
 
 unsafe impl Send for SharedCache {}
 
+const SYSTEM_CACHE_PATH: &str =
+    "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e";
+
 fn read_at<T: Copy>(file: &File, offset: u64) -> Result<T> {
     let mut buf: Vec<u8> = vec![0; std::mem::size_of::<T>()];
     file.read_exact_at(&mut buf, offset)?;
@@ -46,9 +49,7 @@ fn read_vec_at<T: Clone>(file: &File, offset: u64, count: usize) -> Result<Vec<T
 
 impl SharedCache {
     pub fn new_system_cache() -> Result<Self> {
-        Self::new(&PathBuf::from(
-            "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
-        ))
+        Self::new(Path::new(SYSTEM_CACHE_PATH))
     }
 
     pub fn new(cache_path: &Path) -> Result<Self> {
@@ -287,14 +288,7 @@ impl SharedCache {
             self.mappings.push(Rc::new(mapping));
         }
 
-        let subcaches: Vec<dyld_subcache_entry> = read_vec_at(
-            &cache,
-            cache_header.subCacheArrayOffset as _,
-            cache_header.subCacheArrayCount as _,
-        )?;
-
-        for (i, _) in subcaches.iter().enumerate() {
-            let subcache_path = path.with_extension(format!("{:02}", i + 1));
+        for subcache_path in subcache_paths(path, &cache, &cache_header)? {
             self.map_single_cache(&subcache_path)?;
         }
 
@@ -313,6 +307,52 @@ impl SharedCache {
         }
         Ok(())
     }
+}
+
+const DYLD_SHARED_CACHE_DEVELOPMENT_EXT: &str = ".development";
+
+// Mirrors the subcache discovery in Apple's dsc_extractor.cpp: the header grew over time, and
+// `mappingOffset` (the end of the header) tells us which fields/subcache entry format are present.
+// Newer caches store each subcache's file suffix (e.g. ".02.dylddata") in the entry itself;
+// older ones only have `dyld_subcache_entry_v1` and the suffix is the unpadded index.
+fn subcache_paths(
+    path: &Path,
+    cache: &File,
+    cache_header: &dyld_cache_header,
+) -> Result<Vec<PathBuf>> {
+    let header_len = cache_header.mappingOffset as usize;
+    if header_len < std::mem::offset_of!(dyld_cache_header, subCacheArrayCount)
+        || cache_header.subCacheArrayCount == 0
+    {
+        return Ok(vec![]);
+    }
+
+    let offset = cache_header.subCacheArrayOffset as u64;
+    let count = cache_header.subCacheArrayCount as usize;
+    let path_str = path.as_os_str().to_string_lossy();
+
+    if header_len <= std::mem::offset_of!(dyld_cache_header, cacheSubType) {
+        return Ok((1..=count)
+            .map(|i| PathBuf::from(format!("{path_str}.{i}")))
+            .collect());
+    }
+
+    let base_path = path_str
+        .strip_suffix(DYLD_SHARED_CACHE_DEVELOPMENT_EXT)
+        .unwrap_or(&path_str);
+    let entries: Vec<dyld_subcache_entry> = read_vec_at(cache, offset, count)?;
+    Ok(entries
+        .iter()
+        .map(|entry| {
+            let suffix: &[u8] = unsafe {
+                std::slice::from_raw_parts(entry.fileSuffix.as_ptr() as _, entry.fileSuffix.len())
+            };
+            let suffix = std::ffi::CStr::from_bytes_until_nul(suffix)
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_else(|_| String::from_utf8_lossy(suffix));
+            PathBuf::from(format!("{base_path}{suffix}"))
+        })
+        .collect())
 }
 
 #[repr(C)]
@@ -840,6 +880,22 @@ mod tests {
         assert_eq!(third.symbol_addr, 0x3000);
 
         assert!(symbol_map.image_for_address(0x5000).is_none());
+    }
+
+    #[test]
+    fn system_cache_loads_without_vm() -> Result<()> {
+        let path = Path::new(SYSTEM_CACHE_PATH);
+        let file = File::open(path)?;
+        let header: dyld_cache_header = read_at(&file, 0)?;
+        let subcaches = subcache_paths(path, &file, &header)?;
+        assert_eq!(subcaches.len(), header.subCacheArrayCount as usize);
+        for subcache in &subcaches {
+            assert!(subcache.exists(), "missing subcache {}", subcache.display());
+        }
+
+        let cache = SharedCache::new(path)?;
+        assert!(cache.mappings.len() > subcaches.len());
+        Ok(())
     }
 
     #[test]
