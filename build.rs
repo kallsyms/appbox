@@ -4,6 +4,9 @@ use std::path::PathBuf;
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/third_party/dyld_cache_format.h");
+    println!("cargo:rerun-if-changed=src/third_party/cpu_capabilities.h");
 
     bindgen::Builder::default()
         .header("src/third_party/dyld_cache_format.h")
@@ -14,6 +17,8 @@ fn main() {
 
     bindgen::Builder::default()
         .header("src/third_party/cpu_capabilities.h")
+        // The commpage layout is only exposed to PRIVATE (i.e. Apple-internal) builds.
+        .clang_arg("-DPRIVATE")
         .generate()
         .expect("Unable to generate commpage/cpu_capabilities bindings")
         .write_to_file(out_dir.join("commpage.rs"))

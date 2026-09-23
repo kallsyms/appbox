@@ -507,6 +507,9 @@ impl Loader {
             .write_byte(crate::commpage::_COMM_PAGE_PHYSICAL_CPUS, configured_cpus as u8)?;
         vm.vma
             .write_byte(crate::commpage::_COMM_PAGE_LOGICAL_CPUS, configured_cpus as u8)?;
+        // libmalloc sizes its per-cluster structures from this; zero overflows them.
+        // _COMM_PAGE_CPU_TO_CLUSTER is left zeroed, mapping every CPU to cluster 0.
+        vm.vma.write_byte(crate::commpage::_COMM_PAGE_CPU_CLUSTERS, 1)?;
 
         Ok(())
     }
