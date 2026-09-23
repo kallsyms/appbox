@@ -94,6 +94,16 @@ fn macos_major_version() -> Option<u32> {
     version.split('.').next()?.parse().ok()
 }
 
+/// The `malloc_entropy` to give the host process (see [`crate::respawn`]) so that its own xzone
+/// malloc heap lands at the top of the window, leaving the bottom for the guest's, and so that the
+/// host's malloc layout is deterministic. `None` if the window isn't known for this macOS version.
+///
+/// The values are kept short since they have to fit over the kernel-provided string.
+pub(crate) fn pinned_host_malloc_entropy() -> Option<[u64; 2]> {
+    let window = xzone_window(macos_major_version()?)?;
+    Some([0x5eed, window.candidates - 1])
+}
+
 /// Encodes `candidate` into `random` such that libmalloc picks it, keeping as much of the rest of
 /// the entropy random as possible.
 fn xzone_entropy(candidate: u64, candidates: u64, random: u64) -> u64 {

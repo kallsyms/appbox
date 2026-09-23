@@ -1,9 +1,16 @@
-//! Re-running the current program in a fresh process until its address space layout works out.
+//! Re-running the current program in a fresh process with a host address space layout that leaves
+//! room for the guest.
 //!
-//! Some host allocations we can't control (e.g. the host's own malloc heap) are placed randomly at
-//! startup and may leave no room for what the guest needs, which is reported as an
-//! [`AddressSpaceConflict`]. Since the layout differs in every process, the fix is to try again in
-//! a new one:
+//! Guest memory is mapped 1:1 into the host, so the guest's expectations about free address space
+//! must hold in the host process too. The host's own malloc heap is the main obstacle: libmalloc
+//! places it using the `malloc_entropy` the kernel passes in `apple[]`, randomly, in the same range
+//! the guest's malloc will want (see [`crate::layout`]). [`respawn`] starts a child with ASLR
+//! disabled and, before it runs, overwrites that entropy so the child's heap lands in a known spot.
+//! This also makes the host layout deterministic, which matters for record/replay.
+//!
+//! Pinning needs `task_for_pid` on the child, i.e. the `com.apple.security.cs.debugger` and
+//! `com.apple.security.get-task-allow` entitlements. Without them (or on macOS versions whose
+//! layout isn't known) the child keeps its random entropy, and conflicts are retried:
 //!
 //! ```no_run
 //! fn main() -> anyhow::Result<()> {
@@ -22,27 +29,29 @@ use std::ffi::CString;
 use anyhow::{bail, Context, Result};
 use log::{debug, warn};
 
-use crate::layout::{is_address_space_conflict, AddressSpaceConflict};
+use crate::layout::{is_address_space_conflict, pinned_host_malloc_entropy, AddressSpaceConflict};
+use crate::mach::{
+    mach_port_deallocate, mach_vm_read_overwrite, mach_vm_region, mach_vm_write, task_for_pid,
+    KERN_SUCCESS, VM_PROT_READ, VM_PROT_WRITE, VM_REGION_BASIC_INFO_64,
+    VM_REGION_BASIC_INFO_COUNT_64,
+};
 
 const RESPAWNED_ENV: &str = "APPBOX_RESPAWNED";
 
 /// Exit code a respawned child uses to ask for another attempt.
 pub const RETRY_EXIT_CODE: i32 = 200;
 
-// https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/sys/spawn.h#L62
+// https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/sys/spawn.h
+const POSIX_SPAWN_START_SUSPENDED: i16 = 0x0080;
 const _POSIX_SPAWN_DISABLE_ASLR: i16 = 0x0100;
 
 pub struct RespawnOptions {
     pub max_attempts: usize,
-    pub disable_aslr: bool,
 }
 
 impl Default for RespawnOptions {
     fn default() -> Self {
-        Self {
-            max_attempts: 100,
-            disable_aslr: false,
-        }
+        Self { max_attempts: 100 }
     }
 }
 
@@ -51,10 +60,10 @@ pub fn is_respawned() -> bool {
     std::env::var_os(RESPAWNED_ENV).is_some()
 }
 
-/// Runs the current executable (with the same arguments and environment) in a child process,
-/// starting a new one whenever it exits with [`RETRY_EXIT_CODE`], then exits with the child's
-/// status. Only returns in the child, which should report retryable failures with
-/// [`exit_if_retryable`].
+/// Runs the current executable (with the same arguments and environment) in a child process with
+/// ASLR disabled and its malloc entropy pinned, starting a new one whenever it exits with
+/// [`RETRY_EXIT_CODE`], then exits with the child's status. Only returns in the child, which should
+/// report retryable failures with [`exit_if_retryable`].
 pub fn respawn(options: &RespawnOptions) -> Result<()> {
     if is_respawned() {
         return Ok(());
@@ -76,11 +85,16 @@ pub fn respawn(options: &RespawnOptions) -> Result<()> {
     if unsafe { nix::libc::posix_spawnattr_init(&mut attr) } != 0 {
         return Err(std::io::Error::last_os_error()).context("posix_spawnattr_init");
     }
-    if options.disable_aslr
-        && unsafe { nix::libc::posix_spawnattr_setflags(&mut attr, _POSIX_SPAWN_DISABLE_ASLR) } != 0
-    {
+    let flags = POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_DISABLE_ASLR;
+    if unsafe { nix::libc::posix_spawnattr_setflags(&mut attr, flags) } != 0 {
         return Err(std::io::Error::last_os_error()).context("posix_spawnattr_setflags");
     }
+
+    let entropy = pinned_host_malloc_entropy();
+    if entropy.is_none() {
+        warn!("host malloc layout unknown for this macOS version; relying on retries");
+    }
+    let mut warned_pin_failure = false;
 
     for attempt in 1..=options.max_attempts {
         let mut pid: nix::libc::pid_t = 0;
@@ -98,6 +112,19 @@ pub fn respawn(options: &RespawnOptions) -> Result<()> {
             return Err(std::io::Error::from_raw_os_error(ret)).context("posix_spawn");
         }
         debug!("respawned as pid {} (attempt {})", pid, attempt);
+
+        if let Some(entropy) = entropy {
+            if let Err(err) = pin_malloc_entropy(pid, entropy) {
+                if !warned_pin_failure {
+                    warn!(
+                        "could not pin host malloc layout, relying on retries: {:#}",
+                        err
+                    );
+                    warned_pin_failure = true;
+                }
+            }
+        }
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGCONT)?;
 
         use nix::sys::wait::{waitpid, WaitStatus};
         match waitpid(nix::unistd::Pid::from_raw(pid), None)? {
@@ -127,6 +154,103 @@ pub fn exit_if_retryable(err: &anyhow::Error) {
     }
 }
 
+/// Overwrites the `malloc_entropy` apple[] string of suspended process `pid`, which the kernel
+/// placed on its stack at exec.
+fn pin_malloc_entropy(pid: nix::libc::pid_t, entropy: [u64; 2]) -> Result<()> {
+    let mut task: nix::libc::mach_port_t = 0;
+    let kr = unsafe { task_for_pid(nix::libc::mach_task_self(), pid, &mut task) };
+    if kr != KERN_SUCCESS {
+        bail!(
+            "task_for_pid failed (kern_return_t={}); needs the com.apple.security.cs.debugger \
+             and com.apple.security.get-task-allow entitlements",
+            kr
+        );
+    }
+    let result = overwrite_malloc_entropy(task, entropy);
+    unsafe { mach_port_deallocate(nix::libc::mach_task_self(), task) };
+    result
+}
+
+fn overwrite_malloc_entropy(task: nix::libc::mach_port_t, entropy: [u64; 2]) -> Result<()> {
+    const KEY: &[u8] = b"malloc_entropy=";
+    // The stack is small this early; skip anything big (e.g. the shared region).
+    const MAX_REGION_SIZE: u64 = 64 << 20;
+
+    let replacement = format!("malloc_entropy=0x{:x},0x{:x}\0", entropy[0], entropy[1]);
+    let mut addr = 0u64;
+    loop {
+        let mut size = 0u64;
+        let mut info = [0i32; VM_REGION_BASIC_INFO_COUNT_64 as usize];
+        let mut count = VM_REGION_BASIC_INFO_COUNT_64;
+        let mut object_name = 0;
+        let kr = unsafe {
+            mach_vm_region(
+                task,
+                &mut addr,
+                &mut size,
+                VM_REGION_BASIC_INFO_64,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut object_name,
+            )
+        };
+        if kr != KERN_SUCCESS {
+            bail!("malloc_entropy not found in child");
+        }
+        // Only look in writable memory (the stack): the string also appears as a literal in any
+        // binary that, like appbox, formats it.
+        let protection = info[0];
+        let rw = VM_PROT_READ | VM_PROT_WRITE;
+        if protection & rw == rw && size <= MAX_REGION_SIZE {
+            let mut data = vec![0u8; size as usize];
+            let mut read = 0u64;
+            let kr = unsafe {
+                mach_vm_read_overwrite(task, addr, size, data.as_mut_ptr() as u64, &mut read)
+            };
+            if kr == KERN_SUCCESS {
+                let found = data.windows(KEY.len()).enumerate().find_map(|(offset, w)| {
+                    if w != KEY {
+                        return None;
+                    }
+                    let len = data[offset..].iter().position(|&b| b == 0)?;
+                    is_kernel_entropy_string(&data[offset..offset + len]).then_some((offset, len))
+                });
+                if let Some((offset, original_len)) = found {
+                    if replacement.len() - 1 > original_len {
+                        bail!("replacement malloc_entropy longer than the original");
+                    }
+                    let kr = unsafe {
+                        mach_vm_write(
+                            task,
+                            addr + offset as u64,
+                            replacement.as_ptr() as usize,
+                            replacement.len() as u32,
+                        )
+                    };
+                    if kr != KERN_SUCCESS {
+                        bail!("mach_vm_write failed: kern_return_t={}", kr);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        addr += size;
+    }
+}
+
+/// Whether `s` looks like the kernel's `malloc_entropy=0x<hex>,0x<hex>`.
+fn is_kernel_entropy_string(s: &[u8]) -> bool {
+    let Some(values) = s.strip_prefix(b"malloc_entropy=") else {
+        return false;
+    };
+    let values: Vec<_> = values.split(|&b| b == b',').collect();
+    values.len() == 2
+        && values.iter().all(|v| {
+            v.strip_prefix(b"0x")
+                .is_some_and(|hex| !hex.is_empty() && hex.iter().all(u8::is_ascii_hexdigit))
+        })
+}
+
 struct CStringArray {
     _owned: Vec<CString>,
     pointers: Vec<*mut nix::libc::c_char>,
@@ -151,5 +275,20 @@ impl CStringArray {
 
     fn as_ptr(&self) -> *const *mut nix::libc::c_char {
         self.pointers.as_ptr()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_kernel_entropy_string() {
+        assert!(is_kernel_entropy_string(
+            b"malloc_entropy=0x1ba92ad87cbf923b,0x54025c9efff41442"
+        ));
+        assert!(!is_kernel_entropy_string(b"malloc_entropy=0x{:x},0x{:x}"));
+        assert!(!is_kernel_entropy_string(b"malloc_entropy=0x1"));
+        assert!(!is_kernel_entropy_string(b"malloc_entropy=0x,0x2"));
     }
 }
