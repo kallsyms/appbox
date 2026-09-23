@@ -35,7 +35,16 @@ const SYSTEM_CACHE_PATH: &str =
 fn read_at<T: Copy>(file: &File, offset: u64) -> Result<T> {
     let mut buf: Vec<u8> = vec![0; std::mem::size_of::<T>()];
     file.read_exact_at(&mut buf, offset)?;
-    Ok(unsafe { *(buf.as_ptr() as *const T) })
+    Ok(unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const T) })
+}
+
+// Backed by u64s so structs with u64 fields (and trailing flexible arrays, which prevent
+// copying them out with `read_at`) can be referenced in place without misalignment.
+fn read_u64_aligned_bytes(file: &File, offset: u64, len: usize) -> Result<Vec<u64>> {
+    let mut buf = vec![0u64; len.div_ceil(std::mem::size_of::<u64>())];
+    let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, len) };
+    file.read_exact_at(bytes, offset)?;
+    Ok(buf)
 }
 
 fn read_vec_at<T: Clone>(file: &File, offset: u64, count: usize) -> Result<Vec<T>> {
@@ -178,18 +187,13 @@ impl SharedCache {
                 let slide_version: u32 = read_at(&cache, mapping_info.slideInfoFileOffset)?;
                 match slide_version {
                     3 => {
-                        // This is to get around the fact that the slide info has a flexible array
-                        // member at the end, which means the struct is not Copy and can't be
-                        // simply derefed.
-                        // Have to create a vec with the actual data (including the flexible
-                        // array), bring that up to keep it alive, then cast the vec contents.
-                        let sib = {
-                            let mut buf: Vec<u8> = vec![0; mapping_info.slideInfoFileSize as usize];
-                            cache.read_exact_at(&mut buf, mapping_info.slideInfoFileOffset)?;
-                            buf
-                        };
+                        let sib = read_u64_aligned_bytes(
+                            &cache,
+                            mapping_info.slideInfoFileOffset,
+                            mapping_info.slideInfoFileSize as usize,
+                        )?;
                         let slide_info: &dyld_cache_slide_info3 = unsafe {
-                            &*(sib.as_ptr() as *const _ as *const dyld_cache_slide_info3)
+                            &*(sib.as_ptr() as *const dyld_cache_slide_info3)
                         };
 
                         // https://github.com/apple-oss-distributions/dyld/blob/18d3cb0f6b46707fee6d315cccccf7af8a8dbe57/cache-builder/dyld_cache_format.h#L339
@@ -233,13 +237,13 @@ impl SharedCache {
                         }
                     }
                     5 => {
-                        let sib = {
-                            let mut buf: Vec<u8> = vec![0; mapping_info.slideInfoFileSize as usize];
-                            cache.read_exact_at(&mut buf, mapping_info.slideInfoFileOffset)?;
-                            buf
-                        };
+                        let sib = read_u64_aligned_bytes(
+                            &cache,
+                            mapping_info.slideInfoFileOffset,
+                            mapping_info.slideInfoFileSize as usize,
+                        )?;
                         let slide_info: &dyld_cache_slide_info5 = unsafe {
-                            &*(sib.as_ptr() as *const _ as *const dyld_cache_slide_info5)
+                            &*(sib.as_ptr() as *const dyld_cache_slide_info5)
                         };
                         for (i, &delta) in unsafe {
                             slide_info
