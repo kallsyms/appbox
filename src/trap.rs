@@ -57,35 +57,44 @@ struct MigReplyError {
 }
 
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, packed(4))]
+struct MachMsgPortDescriptor {
+    name: u32,
+    _pad1: u32,
+    _pad2: u16,
+    disposition: u8,
+    type_: u8,
+}
+
+// MIG request/reply layouts for mach_vm_map (mach_vm.defs), which MIG packs to 4 bytes.
+#[derive(Clone, Copy)]
+#[repr(C, packed(4))]
 struct KernelRpcMachVmMapRequest {
     head: MachMsgHeader,
+    descriptor_count: u32,
+    object: MachMsgPortDescriptor,
     ndr: [u8; 8],
-    target: u32,
-    _pad0: u32,
     address: u64,
     size: u64,
     mask: u64,
     flags: i32,
-    _pad1: u32,
-    object: u32,
-    _pad2: u32,
     offset: u64,
     copy: i32,
     cur_protection: i32,
     max_protection: i32,
     inheritance: i32,
 }
+const _: () = assert!(std::mem::size_of::<KernelRpcMachVmMapRequest>() == 100);
 
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, packed(4))]
 struct KernelRpcMachVmMapReply {
     head: MachMsgHeader,
     ndr: [u8; 8],
     ret_code: u32,
-    _pad0: u32,
     address: u64,
 }
+const _: () = assert!(std::mem::size_of::<KernelRpcMachVmMapReply>() == 44);
 
 pub struct SyscallContext {
     pub num: u64,
