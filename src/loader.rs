@@ -48,6 +48,7 @@ pub struct Loader {
     pub symbol_maps: Vec<MachOSymbolMap>,
 
     map_fixed_next: usize,
+    mappings: Vec<Rc<MemoryMap>>,
 
     pub entry_point: u64,
     pub stack_pointer: u64,
@@ -77,8 +78,25 @@ impl Loader {
             mh: 0,
             symbol_maps: Vec::new(),
             map_fixed_next: 0x5_0000_0000,
+            mappings: Vec::new(),
             entry_point: 0,
             stack_pointer: 0,
+        }
+    }
+
+    /// Leaks the `MemoryMap`s we own that overlap a range the guest has unmapped. Dropping them
+    /// would unmap the range again, clobbering whatever the host has since mapped there.
+    pub(crate) fn leak_mappings_overlapping(&self, addr: u64, size: u64) {
+        let owned = self
+            .mappings
+            .iter()
+            .chain(&self.shared_cache.mappings)
+            .chain(std::iter::once(&self.shared_cache.reservation));
+        for mapping in owned {
+            let start = mapping.data() as u64;
+            if start < addr + size && addr < start + mapping.len() as u64 {
+                std::mem::forget(mapping.clone());
+            }
         }
     }
 
@@ -114,6 +132,7 @@ impl Loader {
         }
         let mapping = Rc::new(MemoryMap::new(size, &options)?);
         self.map_fixed_next += mapping.len();
+        self.mappings.push(mapping.clone());
         vm.mappings.push(mapping.clone());
         vm.vma
             .map_1to1(mapping.data() as _, mapping.len(), av::MemPerms::RWX)?;

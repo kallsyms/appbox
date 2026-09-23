@@ -1355,11 +1355,19 @@ pub struct PageTableManager {
 const LAZY_ONE_TO_ONE_CHUNK: u64 = 0x10_0000;
 const HOST_PAGE_SIZE: u64 = 0x4000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LazyPage {
+    Pending,
+    Mapped,
+    Unmapped,
+}
+
+/// Tracked per host page, since the guest may unmap parts of a lazy range before (or after) they
+/// are faulted in.
 #[derive(Clone, Debug)]
 struct LazyOneToOne {
     host_addr: u64,
-    size: u64,
-    faulted: Vec<bool>,
+    pages: Vec<LazyPage>,
 }
 
 // Expanded from hv_unsafe_call in applevisor
@@ -1501,15 +1509,16 @@ impl PageTableManager {
         perms: av::MemPerms,
         privileged: bool,
     ) -> Result<()> {
+        if size as u64 % HOST_PAGE_SIZE != 0 {
+            return Err(MemoryError::UnalignedSize(size))?;
+        }
         let guest_paddr = self.one_to_one_last;
         self.map_1to1_tables(addr, size, perms, privileged)?;
-        let chunks = (size as u64).div_ceil(LAZY_ONE_TO_ONE_CHUNK) as usize;
         self.lazy_one_to_one.insert(
             guest_paddr,
             LazyOneToOne {
                 host_addr: addr,
-                size: size as u64,
-                faulted: vec![false; chunks],
+                pages: vec![LazyPage::Pending; size / HOST_PAGE_SIZE as usize],
             },
         );
         Ok(())
@@ -1519,34 +1528,93 @@ impl PageTableManager {
     /// Returns `false` if `paddr` isn't in a lazy range, or its chunk was already mapped (so the
     /// fault is not ours to handle).
     pub fn fault_in_lazy_1to1(&mut self, paddr: u64) -> Result<bool> {
-        let Some((&range_paddr, range)) = self.lazy_one_to_one.range_mut(..=paddr).next_back()
-        else {
+        let Some((range_paddr, range, page)) = self.lazy_page(paddr) else {
             return Ok(false);
         };
-        let offset = paddr - range_paddr;
-        if offset >= range.size {
-            return Ok(false);
-        }
-        let chunk = (offset / LAZY_ONE_TO_ONE_CHUNK) as usize;
-        if range.faulted[chunk] {
+        if range.pages[page] != LazyPage::Pending {
             return Ok(false);
         }
 
-        let chunk_offset = chunk as u64 * LAZY_ONE_TO_ONE_CHUNK;
-        let chunk_size = LAZY_ONE_TO_ONE_CHUNK.min(range.size - chunk_offset);
-        let host_addr = range.host_addr + chunk_offset;
-        // Lazy ranges are meant for private file mappings whose pages may still be shared with
-        // (and typed executable by) other mappings of the same file, which the kernel refuses to
-        // map into a VM. Writing each page forces a copy-on-write into a fresh private page.
-        for page in (host_addr..host_addr + chunk_size).step_by(HOST_PAGE_SIZE as usize) {
-            unsafe {
-                let ptr = page as *mut u8;
-                std::ptr::write_volatile(ptr, std::ptr::read_volatile(ptr));
+        let pages_per_chunk = (LAZY_ONE_TO_ONE_CHUNK / HOST_PAGE_SIZE) as usize;
+        let chunk_start = page / pages_per_chunk * pages_per_chunk;
+        let chunk_end = (chunk_start + pages_per_chunk).min(range.pages.len());
+        let mut page = chunk_start;
+        while page < chunk_end {
+            if range.pages[page] != LazyPage::Pending {
+                page += 1;
+                continue;
+            }
+            let run_start = page;
+            while page < chunk_end && range.pages[page] == LazyPage::Pending {
+                // Lazy ranges are meant for private file mappings whose pages may still be
+                // shared with (and typed executable by) other mappings of the same file, which
+                // the kernel refuses to map into a VM. Writing each page forces a copy-on-write
+                // into a fresh private page.
+                unsafe {
+                    let ptr = (range.host_addr + page as u64 * HOST_PAGE_SIZE) as *mut u8;
+                    std::ptr::write_volatile(ptr, std::ptr::read_volatile(ptr));
+                }
+                range.pages[page] = LazyPage::Mapped;
+                page += 1;
+            }
+            let run_offset = run_start as u64 * HOST_PAGE_SIZE;
+            hv_map_1to1(
+                range.host_addr + run_offset,
+                range_paddr + run_offset,
+                (page - run_start) * HOST_PAGE_SIZE as usize,
+            )?;
+        }
+        Ok(true)
+    }
+
+    /// Finds the lazy range and host page index containing guest physical address `paddr`.
+    fn lazy_page(&mut self, paddr: u64) -> Option<(u64, &mut LazyOneToOne, usize)> {
+        let (&range_paddr, range) = self.lazy_one_to_one.range_mut(..=paddr).next_back()?;
+        let page = ((paddr - range_paddr) / HOST_PAGE_SIZE) as usize;
+        (page < range.pages.len()).then_some((range_paddr, range, page))
+    }
+
+    /// Removes a 1:1 range from the page tables and the VM. Pages in the range that aren't
+    /// mapped, or aren't 1:1 mappings, are skipped.
+    pub fn unmap_1to1(&mut self, addr: u64, size: usize) -> Result<()> {
+        if addr & (HOST_PAGE_SIZE - 1) != 0 {
+            return Err(MemoryError::UnalignedAddress(addr))?;
+        }
+        let range_end = addr
+            .checked_add(size as u64)
+            .ok_or(MemoryError::Overflow(addr, size))?;
+        let mut host_page_paddrs = Vec::new();
+        for page_addr in (addr..range_end).step_by(VIRT_PAGE_SIZE) {
+            let Ok(page) = self.get_page_by_addr(page_addr) else {
+                continue;
+            };
+            let paddr = match page.borrow().data.as_ref() {
+                Some(data) if data.parent.is_none() => data.guest_addr,
+                _ => continue,
+            };
+            self.remove_page(page_addr)?;
+            let host_page_paddr = paddr & !(HOST_PAGE_SIZE - 1);
+            if host_page_paddrs.last() != Some(&host_page_paddr) {
+                host_page_paddrs.push(host_page_paddr);
             }
         }
-        hv_map_1to1(host_addr, range_paddr + chunk_offset, chunk_size as usize)?;
-        range.faulted[chunk] = true;
-        Ok(true)
+
+        for paddr in host_page_paddrs {
+            let was_mapped = match self.lazy_page(paddr) {
+                Some((_, range, page)) => {
+                    let state = std::mem::replace(&mut range.pages[page], LazyPage::Unmapped);
+                    state == LazyPage::Mapped
+                }
+                None => true,
+            };
+            if was_mapped {
+                let ret = unsafe { applevisor_sys::hv_vm_unmap(paddr, HOST_PAGE_SIZE as usize) };
+                if ret != applevisor_sys::hv_error_t::HV_SUCCESS as i32 {
+                    Err(av::HypervisorError::from(ret))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Assigns guest physical addresses to a 1:1 range and adds it to the page tables, without
@@ -1649,62 +1717,69 @@ impl PageTableManager {
             .ok_or(MemoryError::Overflow(addr, size))?);
         // Iterates over the address of each page boundary and removes them from the page table.
         for addr in (range_start..range_end).step_by(VIRT_PAGE_SIZE) {
-            let pud_idx = (addr >> 39 & 0x1ff) as usize;
-            let pud = self
-                .pgd
-                .objects
-                .get_mut(&pud_idx)
-                .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
-            let pmd_idx = (addr >> 30 & 0x1ff) as usize;
-            let pmd = pud
-                .objects
-                .get_mut(&pmd_idx)
-                .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
-            let pt_idx = (addr >> 21 & 0x1ff) as usize;
-            let pt_cell = pmd
-                .objects
-                .get_mut(&pt_idx)
-                .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
-            let page_idx = (addr >> 12 & 0x1ff) as usize;
-            let mut pt = pt_cell.borrow_mut();
-            let page = pt
-                .objects
-                .remove(&page_idx)
-                .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
-            self.allocs.remove(&addr);
-            let mut page_ref = page.borrow_mut();
-            let page_data = page_ref.data.take().unwrap();
-            Self::del_entry(page_idx, &mut pt.entries)?;
+            let page_data = self.remove_page(addr)?;
             self.slab.free(page_data)?;
-            // Checks if the page table is empty after removing the page.
-            let is_pt_object_empty = pt.objects.is_empty();
-            // Drops unused references to please the borrow checker.
-            drop(pt);
-            if is_pt_object_empty {
-                Self::del_entry(pt_idx, &mut pmd.entries)?;
-                // It's ok to unwrap here since we've checked that the entry exists.
-                let pt_rc = pmd.objects.remove(&pt_idx).unwrap();
-                // We can unwrap here, because the parent PMD is the only object with a strong
-                // reference to pt_rc and we know that it still exists because it always outlives
-                // its children.
-                let pt_cell = Rc::try_unwrap(pt_rc).expect("could not unwrap pt_rc");
-                let pt = pt_cell.into_inner();
-                self.slab.free(pt.entries)?;
-            }
-            if pmd.objects.is_empty() {
-                Self::del_entry(pmd_idx, &mut pud.entries)?;
-                // It's ok to unwrap here since we've checked that the entry exists.
-                let pmd = pud.objects.remove(&pmd_idx).unwrap();
-                self.slab.free(pmd.entries)?;
-            }
-            if pud.objects.is_empty() {
-                Self::del_entry(pud_idx, &mut self.pgd.entries)?;
-                // It's ok to unwrap here since we've checked that the entry exists.
-                let pud = self.pgd.objects.remove(&pud_idx).unwrap();
-                self.slab.free(pud.entries)?;
-            }
         }
         Ok(())
+    }
+
+    /// Removes the page at `addr` from the page table, freeing page tables that become empty,
+    /// and returns the page's data.
+    fn remove_page(&mut self, addr: u64) -> Result<SlabObject> {
+        let pud_idx = (addr >> 39 & 0x1ff) as usize;
+        let pud = self
+            .pgd
+            .objects
+            .get_mut(&pud_idx)
+            .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
+        let pmd_idx = (addr >> 30 & 0x1ff) as usize;
+        let pmd = pud
+            .objects
+            .get_mut(&pmd_idx)
+            .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
+        let pt_idx = (addr >> 21 & 0x1ff) as usize;
+        let pt_cell = pmd
+            .objects
+            .get_mut(&pt_idx)
+            .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
+        let page_idx = (addr >> 12 & 0x1ff) as usize;
+        let mut pt = pt_cell.borrow_mut();
+        let page = pt
+            .objects
+            .remove(&page_idx)
+            .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
+        self.allocs.remove(&addr);
+        let mut page_ref = page.borrow_mut();
+        let page_data = page_ref.data.take().unwrap();
+        Self::del_entry(page_idx, &mut pt.entries)?;
+        // Checks if the page table is empty after removing the page.
+        let is_pt_object_empty = pt.objects.is_empty();
+        // Drops unused references to please the borrow checker.
+        drop(pt);
+        if is_pt_object_empty {
+            Self::del_entry(pt_idx, &mut pmd.entries)?;
+            // It's ok to unwrap here since we've checked that the entry exists.
+            let pt_rc = pmd.objects.remove(&pt_idx).unwrap();
+            // We can unwrap here, because the parent PMD is the only object with a strong
+            // reference to pt_rc and we know that it still exists because it always outlives
+            // its children.
+            let pt_cell = Rc::try_unwrap(pt_rc).expect("could not unwrap pt_rc");
+            let pt = pt_cell.into_inner();
+            self.slab.free(pt.entries)?;
+        }
+        if pmd.objects.is_empty() {
+            Self::del_entry(pmd_idx, &mut pud.entries)?;
+            // It's ok to unwrap here since we've checked that the entry exists.
+            let pmd = pud.objects.remove(&pmd_idx).unwrap();
+            self.slab.free(pmd.entries)?;
+        }
+        if pud.objects.is_empty() {
+            Self::del_entry(pud_idx, &mut self.pgd.entries)?;
+            // It's ok to unwrap here since we've checked that the entry exists.
+            let pud = self.pgd.objects.remove(&pud_idx).unwrap();
+            self.slab.free(pud.entries)?;
+        }
+        Ok(page_data)
     }
 
     /// Finds a [`Page`] by its address and returns a reference to it.
@@ -2114,6 +2189,16 @@ impl VirtMemAllocator {
         match addr >> 0x30 {
             0x0000 => self.lower_table.map_1to1_lazy(addr, size, perms, false),
             0xffff => self.upper_table.map_1to1_lazy(addr, size, perms, false),
+            _ => Err(MemoryError::InvalidAddress(addr))?,
+        }
+    }
+
+    /// Removes a 1:1 range from the VM; see [`PageTableManager::unmap_1to1`].
+    #[inline]
+    pub fn unmap_1to1(&mut self, addr: u64, size: usize) -> Result<()> {
+        match addr >> 0x30 {
+            0x0000 => self.lower_table.unmap_1to1(addr, size),
+            0xffff => self.upper_table.unmap_1to1(addr, size),
             _ => Err(MemoryError::InvalidAddress(addr))?,
         }
     }

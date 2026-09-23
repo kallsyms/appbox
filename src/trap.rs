@@ -361,6 +361,23 @@ impl DefaultTrapHandler {
         addr
     }
 
+    fn unmap_from_vm(
+        &mut self,
+        vma: &mut VirtMemAllocator,
+        loader: &Loader,
+        addr: u64,
+        size: u64,
+    ) -> Result<()> {
+        let start = addr & !(PAGE_ALIGN - 1);
+        let size = Self::align_size(addr + size) - start;
+        trace!("1:1 unmap of {:x} {:x}", start, size);
+        // TODO: handle partial unmapping
+        self.remove_mapping(start, size);
+        loader.leak_mappings_overlapping(start, size);
+        vma.unmap_1to1(start, size as usize)?;
+        Ok(())
+    }
+
     fn write_out_address(&self, out_addr: u64, value: u64) {
         unsafe { *(out_addr as *mut u64) = value };
     }
@@ -409,15 +426,6 @@ impl TrapHandler for DefaultTrapHandler {
         match num {
             syscalls::SYS_exit => {
                 return Ok(SyscallResult::exit(ExitKind::Exit));
-            }
-            syscalls::SYS_munmap => {
-                // TODO: actually remove from vma.
-                // TODO: handle partial unmapping
-                self.remove_mapping(args[0], args[1]);
-                ret0 = 0;
-                ret1 = 0;
-                cflags = 0;
-                handled = true;
             }
             syscalls::SYS_mprotect => {
                 ret0 = 0;
@@ -480,14 +488,6 @@ impl TrapHandler for DefaultTrapHandler {
                 }
             }
             syscalls::TRAP_mach_vm_protect => {
-                ret0 = 0;
-                ret1 = 0;
-                cflags = 0;
-                handled = true;
-            }
-            syscalls::TRAP_mach_vm_deallocate => {
-                // TODO: handle partial unmapping
-                self.remove_mapping(args[1], args[2]);
                 ret0 = 0;
                 ret1 = 0;
                 cflags = 0;
@@ -690,6 +690,17 @@ impl TrapHandler for DefaultTrapHandler {
 
         // Stage 2.5: map newly allocated memory into the VM as necessary.
         match num {
+            syscalls::SYS_munmap => {
+                if cflags & (1 << 29) == 0 {
+                    self.unmap_from_vm(vma, loader, args[0], args[1])?;
+                }
+            }
+            syscalls::TRAP_mach_vm_deallocate => {
+                if ret0 == KERN_SUCCESS && args[0] == unsafe { nix::libc::mach_task_self() } as u64
+                {
+                    self.unmap_from_vm(vma, loader, args[1], args[2])?;
+                }
+            }
             syscalls::SYS_mmap => {
                 if cflags & (1 << 29) == 0 {
                     trace!("1:1 map of {:x} {:x} due to mmap", ret0, args[1]);

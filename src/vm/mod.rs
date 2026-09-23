@@ -130,6 +130,90 @@ mod tests {
     const LDR_X1_X2: u32 = 0xf9400041;
     const BRK_0: u32 = 0xd4200000;
 
+    const HOST_PAGE: usize = 0x4000;
+
+    fn host_map(addr: Option<*mut u8>, size: usize) -> Result<MemoryMap> {
+        let mut options = vec![MapOption::MapReadable, MapOption::MapWritable];
+        if let Some(addr) = addr {
+            options.push(MapOption::MapAddr(addr));
+        }
+        Ok(MemoryMap::new(size, &options)?)
+    }
+
+    #[test]
+    fn unmap_1to1_then_remap_sees_new_memory() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let code_region = host_map(None, HOST_PAGE)?;
+        let code = code_region.data() as *mut u32;
+        unsafe {
+            code.write(LDR_X1_X2);
+            code.add(1).write(BRK_0);
+        }
+        let data_region = host_map(None, HOST_PAGE)?;
+        let data_addr = data_region.data();
+        unsafe { (data_addr as *mut u64).write(1) };
+
+        let mut vm = VmManager::new()?;
+        vm.vma
+            .map_1to1(code as u64, code_region.len(), av::MemPerms::RWX)?;
+        vm.vma
+            .map_1to1(data_addr as u64, HOST_PAGE, av::MemPerms::RWX)?;
+        let cpsr = vm.vcpu.get_reg(av::Reg::CPSR)?;
+        let mut run_load = |vm: &mut VmManager| -> Result<VmRunResult> {
+            vm.vcpu.set_reg(av::Reg::CPSR, cpsr)?;
+            vm.vcpu.set_reg(av::Reg::PC, code as u64)?;
+            vm.vcpu.set_reg(av::Reg::X2, data_addr as u64)?;
+            vm.run()
+        };
+
+        assert!(matches!(run_load(&mut vm)?, VmRunResult::Brk));
+        assert_eq!(vm.vcpu.get_reg(av::Reg::X1)?, 1);
+
+        vm.vma.unmap_1to1(data_addr as u64, HOST_PAGE)?;
+        drop(data_region);
+        assert!(matches!(run_load(&mut vm)?, VmRunResult::Other(_)));
+
+        let new_data_region = host_map(Some(data_addr), HOST_PAGE)?;
+        unsafe { (new_data_region.data() as *mut u64).write(2) };
+        vm.vma
+            .map_1to1(data_addr as u64, HOST_PAGE, av::MemPerms::RWX)?;
+        assert!(matches!(run_load(&mut vm)?, VmRunResult::Brk));
+        assert_eq!(vm.vcpu.get_reg(av::Reg::X1)?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_1to1_fault_in_skips_unmapped_pages() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // One lazy chunk: code in page 0, data in page 2, everything else unmapped (on the host
+        // too, so faulting the chunk in would crash if it touched those pages).
+        let region = host_map(None, 0x10_0000)?;
+        let code = region.data() as *mut u32;
+        let data = unsafe { region.data().add(2 * HOST_PAGE) } as *mut u64;
+        unsafe {
+            code.write(LDR_X1_X2);
+            code.add(1).write(BRK_0);
+            data.write(0x1234);
+        }
+
+        let mut vm = VmManager::new()?;
+        vm.vma
+            .map_1to1_lazy(region.data() as _, region.len(), av::MemPerms::RWX)?;
+        for (start, end) in [(HOST_PAGE, 2 * HOST_PAGE), (3 * HOST_PAGE, region.len())] {
+            let addr = unsafe { region.data().add(start) };
+            vm.vma.unmap_1to1(addr as u64, end - start)?;
+            assert_eq!(unsafe { nix::libc::munmap(addr as _, end - start) }, 0);
+        }
+        vm.vcpu.set_reg(av::Reg::PC, code as u64)?;
+        vm.vcpu.set_reg(av::Reg::X2, data as u64)?;
+
+        assert!(matches!(vm.run()?, VmRunResult::Brk));
+        assert_eq!(vm.vcpu.get_reg(av::Reg::X1)?, 0x1234);
+        Ok(())
+    }
+
     #[test]
     fn lazy_1to1_mapping_faults_in_on_execute_and_load() -> Result<()> {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
