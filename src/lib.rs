@@ -6,6 +6,7 @@ pub mod gdb;
 pub mod layout;
 pub mod loader;
 mod mach;
+pub mod respawn;
 pub mod symbols;
 pub mod syscalls;
 pub mod trap;
