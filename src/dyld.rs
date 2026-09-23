@@ -198,9 +198,8 @@ impl SharedCache {
                             mapping_info.slideInfoFileOffset,
                             mapping_info.slideInfoFileSize as usize,
                         )?;
-                        let slide_info: &dyld_cache_slide_info3 = unsafe {
-                            &*(sib.as_ptr() as *const dyld_cache_slide_info3)
-                        };
+                        let slide_info: &dyld_cache_slide_info3 =
+                            unsafe { &*(sib.as_ptr() as *const dyld_cache_slide_info3) };
 
                         // https://github.com/apple-oss-distributions/dyld/blob/18d3cb0f6b46707fee6d315cccccf7af8a8dbe57/cache-builder/dyld_cache_format.h#L339
                         for (i, &delta) in unsafe {
@@ -248,9 +247,8 @@ impl SharedCache {
                             mapping_info.slideInfoFileOffset,
                             mapping_info.slideInfoFileSize as usize,
                         )?;
-                        let slide_info: &dyld_cache_slide_info5 = unsafe {
-                            &*(sib.as_ptr() as *const dyld_cache_slide_info5)
-                        };
+                        let slide_info: &dyld_cache_slide_info5 =
+                            unsafe { &*(sib.as_ptr() as *const dyld_cache_slide_info5) };
                         for (i, &delta) in unsafe {
                             slide_info
                                 .page_starts
@@ -647,12 +645,14 @@ fn load_exports_symbols(
         let (dataoff, datasize) = (dataoff as u64, datasize as u64);
         let linkedit_file_end = linkedit.fileoff + linkedit.filesize;
         if dataoff < linkedit.fileoff || dataoff + datasize > linkedit_file_end {
-            warn!("export trie outside __LINKEDIT for image at 0x{:x}", load_addr);
+            warn!(
+                "export trie outside __LINKEDIT for image at 0x{:x}",
+                load_addr
+            );
             continue;
         }
         let trie_addr = linkedit.vmaddr + slide as u64 + (dataoff - linkedit.fileoff);
-        let data =
-            unsafe { std::slice::from_raw_parts(trie_addr as *const u8, datasize as usize) };
+        let data = unsafe { std::slice::from_raw_parts(trie_addr as *const u8, datasize as usize) };
         let exports = parse_exports_trie(data)?;
         if exports.is_empty() {
             continue;
