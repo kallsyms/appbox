@@ -18,6 +18,11 @@ const PAGE_ALIGN: u64 = 0x4000;
 // macOS 27 reserves 0x1_8000_0000..~0x70_0000_0000 in every process (shared region).
 const FIXED_MAP_BASE: u64 = 0x80_0000_0000;
 const FIXED_MAP_SIZE: u64 = 0x1_0000_0000;
+// Guest memory is mapped into the VM as RWX regardless of host protections. A page the host
+// has mapped executable is typed XNU_USER_EXEC by SPTM, and handing one to hv_vm_map panics the
+// kernel (VIOLATION_ILLEGAL_MAPPING_TYPE). The host never executes guest memory, so drop
+// execute permission from host-side mappings made on the guest's behalf.
+const PROT_EXEC: u64 = nix::libc::PROT_EXEC as u64;
 
 static FIXED_MAP_POOL: OnceLock<std::result::Result<(), i32>> = OnceLock::new();
 
@@ -397,6 +402,7 @@ impl TrapHandler for DefaultTrapHandler {
                 handled = true;
             }
             syscalls::SYS_mmap => {
+                args[2] &= !PROT_EXEC;
                 // page align size
                 args[1] = Self::align_size(args[1]);
                 // fake fixed address
@@ -429,6 +435,8 @@ impl TrapHandler for DefaultTrapHandler {
                 }
             }
             syscalls::TRAP_mach_vm_map => {
+                // cur_protection
+                args[5] &= !PROT_EXEC;
                 // TODO: ensure task is ourselves
                 // page align size
                 args[2] = Self::align_size(args[2]);
@@ -559,7 +567,7 @@ impl TrapHandler for DefaultTrapHandler {
                         let map_ret = nix::libc::mmap(
                             address as _,
                             req.size as _,
-                            req.cur_protection as _,
+                            (req.cur_protection as u64 & !PROT_EXEC) as _,
                             nix::libc::MAP_PRIVATE
                                 | nix::libc::MAP_ANONYMOUS
                                 | nix::libc::MAP_FIXED,
