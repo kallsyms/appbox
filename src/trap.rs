@@ -1139,7 +1139,9 @@ impl TrapHandler for DefaultTrapHandler {
                     handled = true;
                 } else {
                     let addr = unsafe { *(args[1] as *const u64) };
-                    if loader.take_guest_malloc_reservation(addr, args[2]) {
+                    if let Some(reservation) = loader.take_guest_malloc_reservation(addr, args[2])
+                    {
+                        self.journal_reservation_taken(reservation);
                         args[4] |= VM_FLAGS_OVERWRITE as u64;
                     }
                 }
@@ -1251,9 +1253,13 @@ impl TrapHandler for DefaultTrapHandler {
                         // max_protection is widened since the guest's mprotect and
                         // mach_vm_protect are no-ops on the host.
                         let mut flags = req.flags;
-                        if flags & 1 == 0 && loader.take_guest_malloc_reservation(address, req.size)
-                        {
-                            flags |= VM_FLAGS_OVERWRITE;
+                        if flags & 1 == 0 {
+                            if let Some(reservation) =
+                                loader.take_guest_malloc_reservation(address, req.size)
+                            {
+                                self.journal_reservation_taken(reservation);
+                                flags |= VM_FLAGS_OVERWRITE;
+                            }
                         }
                         if flags & VM_FLAGS_OVERWRITE != 0 {
                             self.journal_removing(vma, address, req.size);

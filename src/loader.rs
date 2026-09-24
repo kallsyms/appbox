@@ -1,5 +1,5 @@
 use crate::dyld;
-use crate::layout::GuestMallocPlacement;
+use crate::layout::{GuestMallocPlacement, Reservation};
 use crate::symbols::{self, MachOSymbolMap, Symbolication};
 use crate::vm::VmManager;
 use anyhow::{bail, Context, Result};
@@ -140,11 +140,12 @@ impl Loader {
     }
 
     /// Whether a fixed guest mapping of `(addr, size)` is the guest's malloc heap reservation we
-    /// set aside for it, and may overwrite our placeholder. True at most once.
-    pub(crate) fn take_guest_malloc_reservation(&self, addr: u64, size: u64) -> bool {
+    /// set aside for it, and may overwrite our placeholder. Returns it at most once (until it's
+    /// given back).
+    pub(crate) fn take_guest_malloc_reservation(&self, addr: u64, size: u64) -> Option<Reservation> {
         self.guest_malloc
             .as_ref()
-            .is_some_and(|placement| placement.take_reservation(addr, size))
+            .and_then(|placement| placement.take_reservation(addr, size))
     }
 
     pub fn symbolicate(&self, addr: u64) -> Option<Symbolication> {

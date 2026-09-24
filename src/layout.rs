@@ -4,13 +4,16 @@
 //! must also be free on the host. Most guest allocations go through us and can be placed wherever
 //! we like, but some are made at fixed addresses the guest chooses itself.
 
-use std::cell::Cell;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use log::debug;
 
-use crate::mach::{mach_vm_allocate, mach_vm_deallocate, KERN_SUCCESS, VM_FLAGS_FIXED};
+use crate::mach::{
+    mach_vm_allocate, mach_vm_deallocate, KERN_SUCCESS, VM_FLAGS_FIXED, VM_FLAGS_OVERWRITE,
+};
 
 const GIB: u64 = 1 << 30;
 
@@ -115,7 +118,38 @@ fn xzone_entropy(candidate: u64, candidates: u64, random: u64) -> u64 {
 #[derive(Debug)]
 pub(crate) struct GuestMallocPlacement {
     pub(crate) entropy: [u64; 2],
-    reservation: Cell<Option<(u64, u64)>>,
+    reservation: Reservation,
+}
+
+/// The guest malloc heap's range, reserved on the host until the guest takes it.
+#[derive(Clone, Debug)]
+pub(crate) struct Reservation {
+    addr: u64,
+    size: u64,
+    taken: Arc<AtomicBool>,
+}
+
+impl Reservation {
+    /// Reserves the range again, for the guest to take again, once the guest's mapping of it is
+    /// gone (e.g. undone by restoring a checkpoint).
+    pub(crate) fn give_back(&self) -> Result<()> {
+        let mut addr = self.addr;
+        let kr = unsafe {
+            mach_vm_allocate(
+                nix::libc::mach_task_self(),
+                &mut addr,
+                self.size,
+                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+            )
+        };
+        anyhow::ensure!(
+            kr == KERN_SUCCESS,
+            "reserving {:#x} for the guest's malloc heap again: kern_return_t={kr}",
+            self.addr
+        );
+        self.taken.store(false, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 impl GuestMallocPlacement {
@@ -149,7 +183,11 @@ impl GuestMallocPlacement {
                     random[0],
                     xzone_entropy(candidate, window.candidates, random[1]),
                 ],
-                reservation: Cell::new(Some((addr, XZONE_RESERVATION_SIZE))),
+                reservation: Reservation {
+                    addr,
+                    size: XZONE_RESERVATION_SIZE,
+                    taken: Arc::new(AtomicBool::new(false)),
+                },
             });
         }
         Err(AddressSpaceConflict {
@@ -158,22 +196,27 @@ impl GuestMallocPlacement {
         .into())
     }
 
-    /// If `(addr, size)` is our reservation, hands it over to the guest: returns true (once),
-    /// meaning the caller may overwrite the range.
-    pub(crate) fn take_reservation(&self, addr: u64, size: u64) -> bool {
-        if self.reservation.get() == Some((addr, size)) {
-            self.reservation.set(None);
-            true
-        } else {
-            false
-        }
+    /// If `(addr, size)` is our reservation, hands it over to the guest: returns it (while not
+    /// already taken), meaning the caller may overwrite the range.
+    pub(crate) fn take_reservation(&self, addr: u64, size: u64) -> Option<Reservation> {
+        let reservation = &self.reservation;
+        ((reservation.addr, reservation.size) == (addr, size)
+            && !reservation.taken.swap(true, Ordering::Relaxed))
+        .then(|| reservation.clone())
     }
 }
 
 impl Drop for GuestMallocPlacement {
     fn drop(&mut self) {
-        if let Some((addr, size)) = self.reservation.get() {
-            unsafe { mach_vm_deallocate(nix::libc::mach_task_self(), addr, size) };
+        let reservation = &self.reservation;
+        if !reservation.taken.load(Ordering::Relaxed) {
+            unsafe {
+                mach_vm_deallocate(
+                    nix::libc::mach_task_self(),
+                    reservation.addr,
+                    reservation.size,
+                )
+            };
         }
     }
 }

@@ -18,6 +18,7 @@ use log::debug;
 use crate::applevisor as av;
 use crate::fds::GuestFds;
 use crate::hyperpom::memory::VirtMemAllocator;
+use crate::layout::Reservation;
 use crate::mach::{
     mach_vm_allocate, mach_vm_deallocate, KERN_SUCCESS, VM_FLAGS_FIXED, VM_FLAGS_OVERWRITE,
 };
@@ -60,6 +61,8 @@ enum Undo {
         addr: u64,
         contents: Vec<u8>,
     },
+    /// It took the malloc heap reservation.
+    ReservationTaken(Reservation),
     FdOpened(i32),
     /// Descriptor `fd` was closed (or replaced); `stash` is a duplicate of what it was.
     FdClosed {
@@ -226,6 +229,7 @@ impl DefaultTrapHandler {
                     self.restore_fixed_map_range(addr, size)?;
                 }
             }
+            Undo::ReservationTaken(reservation) => reservation.give_back()?,
             Undo::Removed { addr, contents } => {
                 let size = contents.len() as u64;
                 let mut allocated = addr;
@@ -271,6 +275,10 @@ impl DefaultTrapHandler {
         if let Some(interval) = self.checkpoints.last_mut() {
             interval.undo.push(undo);
         }
+    }
+
+    pub(crate) fn journal_reservation_taken(&mut self, reservation: Reservation) {
+        self.journal(Undo::ReservationTaken(reservation));
     }
 
     /// Journals the guest mapping memory at `addr..addr + size`.
