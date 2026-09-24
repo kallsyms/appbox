@@ -22,7 +22,7 @@ const PROC_PIDLISTFDS: i32 = 1;
 const PROC_FDINFO_SIZE: usize = 8;
 
 /// The host process's open descriptors.
-fn open_fds() -> Vec<i32> {
+pub(crate) fn open_fds() -> Vec<i32> {
     let pid = std::process::id() as i32;
     let size = unsafe {
         nix::libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
@@ -97,6 +97,38 @@ pub(crate) fn affects_fds(num: u64, args: &[u64; 16]) -> bool {
         )
 }
 
+/// The descriptors syscall `num` created, given what it returned.
+pub(crate) fn created_fds(
+    vma: &VirtMemAllocator,
+    num: u64,
+    args: &[u64; 16],
+    (ret0, ret1, flags): SyscallReturn,
+) -> Vec<i32> {
+    if flags & (1 << 29) != 0 {
+        return Vec::new();
+    }
+    if returns_fd(num, args) {
+        return vec![ret0 as i32];
+    }
+    match num {
+        syscalls::SYS_pipe => vec![ret0 as i32, ret1 as i32],
+        syscalls::SYS_socketpair => match vma.read_qword(args[3]) {
+            Ok(pair) => vec![pair as i32, (pair >> 32) as i32],
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Whether syscall `num` closes its first argument.
+pub(crate) fn closes_fd(num: u64) -> bool {
+    matches!(
+        num,
+        syscalls::SYS_close | syscalls::SYS_close_nocancel | syscalls::SYS_guarded_close_np
+    )
+}
+
+#[derive(Clone)]
 pub(crate) struct GuestFds {
     fds: BTreeSet<i32>,
     /// Descriptor syscalls that guest threads are blocked in, whose results are tracked once the
@@ -123,29 +155,16 @@ impl GuestFds {
         vma: &VirtMemAllocator,
         num: u64,
         args: &[u64; 16],
-        (ret0, ret1, flags): SyscallReturn,
+        ret: SyscallReturn,
     ) {
-        if flags & (1 << 29) != 0 {
-            return;
+        self.fds.extend(created_fds(vma, num, args, ret));
+        if ret.2 & (1 << 29) == 0 && closes_fd(num) {
+            self.fds.remove(&(args[0] as i32));
         }
-        if returns_fd(num, args) {
-            self.fds.insert(ret0 as i32);
-            return;
-        }
-        match num {
-            syscalls::SYS_pipe => {
-                self.fds.extend([ret0 as i32, ret1 as i32]);
-            }
-            syscalls::SYS_socketpair => {
-                if let Ok(pair) = vma.read_qword(args[3]) {
-                    self.fds.extend([pair as i32, (pair >> 32) as i32]);
-                }
-            }
-            syscalls::SYS_close | syscalls::SYS_close_nocancel | syscalls::SYS_guarded_close_np => {
-                self.fds.remove(&(args[0] as i32));
-            }
-            _ => {}
-        }
+    }
+
+    pub(crate) fn contains_fd(&self, fd: i32) -> bool {
+        self.fds.contains(&fd)
     }
 
     /// Notes that thread `id` is blocked in syscall `num`, if it could affect descriptors.
@@ -184,7 +203,7 @@ impl GuestFds {
 
     #[cfg(test)]
     fn contains(&self, fd: i32) -> bool {
-        self.fds.contains(&fd)
+        self.contains_fd(fd)
     }
 }
 

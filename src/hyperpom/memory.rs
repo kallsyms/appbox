@@ -8,7 +8,7 @@ use rhexdump as rh;
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{hash_map::Entry, BTreeMap, HashMap, VecDeque};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::io::prelude::*;
 use std::path::Path;
@@ -1346,9 +1346,14 @@ pub struct PageTableManager {
     pub(crate) pgd: PageGlobalDirectory,
     pub(crate) allocs: BTreeMap<u64, Rc<RefCell<Page>>>,
     one_to_one_last: u64,
-    /// 1:1 ranges whose stage-2 mappings are deferred until first access, keyed by guest
-    /// physical start address.
-    lazy_one_to_one: BTreeMap<u64, LazyOneToOne>,
+    /// 1:1 ranges, keyed by guest physical start address. Lazy ones' stage-2 mappings are
+    /// deferred until first access.
+    one_to_one: BTreeMap<u64, OneToOne>,
+    /// Guest physical addresses of 1:1 host pages currently write-protected in the VM (see
+    /// [`Self::write_protect_1to1`]).
+    write_protected: BTreeSet<u64>,
+    /// Whether lazily mapped pages start out write-protected.
+    write_protecting: bool,
 }
 
 /// Granularity at which lazily mapped 1:1 ranges are faulted in.
@@ -1362,12 +1367,32 @@ enum LazyPage {
     Unmapped,
 }
 
-/// Tracked per host page, since the guest may unmap parts of a lazy range before (or after) they
-/// are faulted in.
+/// Tracked per host page, since the guest may unmap parts of a range, and parts of a lazy range
+/// before (or after) they are faulted in.
 #[derive(Clone, Debug)]
-struct LazyOneToOne {
+struct OneToOne {
     host_addr: u64,
     pages: Vec<LazyPage>,
+}
+
+/// Sets the VM's permissions on a 1:1 range, which is always readable and executable.
+fn hv_protect(guest_paddr: u64, size: usize, writable: bool) -> Result<()> {
+    let perms = if writable {
+        av::MemPerms::RWX
+    } else {
+        av::MemPerms::RX
+    };
+    let ret = unsafe {
+        applevisor_sys::hv_vm_protect(
+            guest_paddr,
+            size,
+            Into::<applevisor_sys::hv_memory_flags_t>::into(perms),
+        )
+    };
+    match ret {
+        x if x == applevisor_sys::hv_error_t::HV_SUCCESS as i32 => Ok(()),
+        code => Err(av::HypervisorError::from(code))?,
+    }
 }
 
 // Expanded from hv_unsafe_call in applevisor
@@ -1396,7 +1421,9 @@ impl PageTableManager {
             pgd,
             allocs: BTreeMap::new(),
             one_to_one_last: 0x1_0000_0000,
-            lazy_one_to_one: BTreeMap::new(),
+            one_to_one: BTreeMap::new(),
+            write_protected: BTreeSet::new(),
+            write_protecting: false,
         })
     }
 
@@ -1496,7 +1523,16 @@ impl PageTableManager {
     ) -> Result<()> {
         let guest_paddr = self.one_to_one_last;
         self.map_1to1_tables(addr, size, perms, privileged)?;
-        hv_map_1to1(addr, guest_paddr, size)
+        hv_map_1to1(addr, guest_paddr, size)?;
+        let pages = (size as u64).div_ceil(HOST_PAGE_SIZE) as usize;
+        self.one_to_one.insert(
+            guest_paddr,
+            OneToOne {
+                host_addr: addr,
+                pages: vec![LazyPage::Mapped; pages],
+            },
+        );
+        Ok(())
     }
 
     /// Like [`Self::map_1to1`], but the backing host memory is only mapped into the VM (in
@@ -1514,9 +1550,9 @@ impl PageTableManager {
         }
         let guest_paddr = self.one_to_one_last;
         self.map_1to1_tables(addr, size, perms, privileged)?;
-        self.lazy_one_to_one.insert(
+        self.one_to_one.insert(
             guest_paddr,
-            LazyOneToOne {
+            OneToOne {
                 host_addr: addr,
                 pages: vec![LazyPage::Pending; size / HOST_PAGE_SIZE as usize],
             },
@@ -1538,6 +1574,7 @@ impl PageTableManager {
         let pages_per_chunk = (LAZY_ONE_TO_ONE_CHUNK / HOST_PAGE_SIZE) as usize;
         let chunk_start = page / pages_per_chunk * pages_per_chunk;
         let chunk_end = (chunk_start + pages_per_chunk).min(range.pages.len());
+        let mut mapped_runs = Vec::new();
         let mut page = chunk_start;
         while page < chunk_end {
             if range.pages[page] != LazyPage::Pending {
@@ -1558,18 +1595,119 @@ impl PageTableManager {
                 page += 1;
             }
             let run_offset = run_start as u64 * HOST_PAGE_SIZE;
-            hv_map_1to1(
-                range.host_addr + run_offset,
-                range_paddr + run_offset,
-                (page - run_start) * HOST_PAGE_SIZE as usize,
-            )?;
+            let run_size = (page - run_start) * HOST_PAGE_SIZE as usize;
+            hv_map_1to1(range.host_addr + run_offset, range_paddr + run_offset, run_size)?;
+            mapped_runs.push((range_paddr + run_offset, run_size));
+        }
+        if self.write_protecting {
+            for (paddr, size) in mapped_runs {
+                hv_protect(paddr, size, false)?;
+                for page_paddr in (paddr..paddr + size as u64).step_by(HOST_PAGE_SIZE as usize) {
+                    self.write_protected.insert(page_paddr);
+                }
+            }
         }
         Ok(true)
     }
 
+    /// Write-protects every 1:1 host page mapped into the VM, and those lazily mapped from now
+    /// on, until [`Self::stop_write_protecting_1to1`]. A guest write to one then faults (see
+    /// [`Self::take_write_fault`]).
+    pub fn write_protect_1to1(&mut self) -> Result<()> {
+        self.write_protecting = true;
+        for (&range_paddr, range) in &self.one_to_one {
+            let mut page = 0;
+            while page < range.pages.len() {
+                let needs_protecting = |p: usize| {
+                    range.pages[p] == LazyPage::Mapped
+                        && !self
+                            .write_protected
+                            .contains(&(range_paddr + p as u64 * HOST_PAGE_SIZE))
+                };
+                if !needs_protecting(page) {
+                    page += 1;
+                    continue;
+                }
+                let run_start = page;
+                while page < range.pages.len() && needs_protecting(page) {
+                    page += 1;
+                }
+                hv_protect(
+                    range_paddr + run_start as u64 * HOST_PAGE_SIZE,
+                    (page - run_start) * HOST_PAGE_SIZE as usize,
+                    false,
+                )?;
+                for p in run_start..page {
+                    self.write_protected
+                        .insert(range_paddr + p as u64 * HOST_PAGE_SIZE);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Makes every 1:1 host page writable again, and stops write-protecting new ones.
+    pub fn stop_write_protecting_1to1(&mut self) -> Result<()> {
+        self.write_protecting = false;
+        for paddr in std::mem::take(&mut self.write_protected) {
+            hv_protect(paddr, HOST_PAGE_SIZE as usize, true)?;
+        }
+        Ok(())
+    }
+
+    /// Handles a stage-2 fault at guest physical address `paddr` if it's a write to a page
+    /// [`Self::write_protect_1to1`] protected: makes the page writable, returning its host
+    /// address.
+    pub fn take_write_fault(&mut self, paddr: u64) -> Result<Option<u64>> {
+        let page_paddr = paddr & !(HOST_PAGE_SIZE - 1);
+        if !self.write_protected.remove(&page_paddr) {
+            return Ok(None);
+        }
+        hv_protect(page_paddr, HOST_PAGE_SIZE as usize, true)?;
+        let (range_paddr, range) = self
+            .one_to_one
+            .range(..=page_paddr)
+            .next_back()
+            .expect("protected pages are in 1:1 ranges");
+        Ok(Some(range.host_addr + (page_paddr - range_paddr)))
+    }
+
+    /// The host pages of every 1:1 mapping currently mapped into the VM.
+    #[cfg(test)]
+    pub(crate) fn mapped_one_to_one_host_pages(&self) -> Vec<u64> {
+        self.one_to_one
+            .values()
+            .flat_map(|range| {
+                range
+                    .pages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, state)| **state == LazyPage::Mapped)
+                    .map(|(page, _)| range.host_addr + page as u64 * HOST_PAGE_SIZE)
+            })
+            .collect()
+    }
+
+    /// The host pages backing the 1:1 mappings in the virtual range `addr..addr + size`.
+    pub fn one_to_one_host_pages(&self, addr: u64, size: usize) -> Vec<u64> {
+        let end = addr.saturating_add(size as u64);
+        let mut pages = Vec::new();
+        let mut page_addr = addr & !(HOST_PAGE_SIZE - 1);
+        while page_addr < end {
+            let is_one_to_one = self
+                .get_page_by_addr(page_addr)
+                .is_ok_and(|page| page.borrow().data.as_ref().is_some_and(|d| d.parent.is_none()));
+            if is_one_to_one {
+                pages.push(page_addr);
+            }
+            page_addr += HOST_PAGE_SIZE;
+        }
+        pages
+    }
+
     /// Finds the lazy range and host page index containing guest physical address `paddr`.
-    fn lazy_page(&mut self, paddr: u64) -> Option<(u64, &mut LazyOneToOne, usize)> {
-        let (&range_paddr, range) = self.lazy_one_to_one.range_mut(..=paddr).next_back()?;
+    fn lazy_page(&mut self, paddr: u64) -> Option<(u64, &mut OneToOne, usize)> {
+        let (&range_paddr, range) = self.one_to_one.range_mut(..=paddr).next_back()?;
         let page = ((paddr - range_paddr) / HOST_PAGE_SIZE) as usize;
         (page < range.pages.len()).then_some((range_paddr, range, page))
     }
@@ -1607,6 +1745,7 @@ impl PageTableManager {
                 }
                 None => true,
             };
+            self.write_protected.remove(&paddr);
             if was_mapped {
                 let ret = unsafe { applevisor_sys::hv_vm_unmap(paddr, HOST_PAGE_SIZE as usize) };
                 if ret != applevisor_sys::hv_error_t::HV_SUCCESS as i32 {
@@ -2030,6 +2169,20 @@ pub struct VirtMemAllocator {
     pub(crate) upper_table: PageTableManager,
     /// Page table for the lower virtual address range.
     pub(crate) lower_table: PageTableManager,
+    /// See [`Self::checkpoint_memory`]: oldest first.
+    memory_intervals: Vec<MemoryInterval>,
+    next_memory_checkpoint: u64,
+}
+
+/// A state of guest memory that [`VirtMemAllocator::restore_memory`] can go back to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MemoryCheckpoint(u64);
+
+/// The guest memory written since a checkpoint (and before the next), as it was at the
+/// checkpoint, by host page.
+struct MemoryInterval {
+    checkpoint: MemoryCheckpoint,
+    undo: BTreeMap<u64, Box<[u8]>>,
 }
 
 impl Clone for VirtMemAllocator {
@@ -2084,7 +2237,136 @@ impl VirtMemAllocator {
         Ok(Self {
             upper_table,
             lower_table,
+            memory_intervals: Vec::new(),
+            next_memory_checkpoint: 0,
         })
+    }
+
+    /// Records the current state of guest memory, to [`Self::restore_memory`] later.
+    ///
+    /// Covers the guest's 1:1 mappings (memory it maps and the images appbox loads), which it
+    /// tracks copy-on-write: they're write-protected in the VM, and each page's contents are saved
+    /// when the guest first writes to it after a checkpoint. Writes that don't go through the VM
+    /// (the host's, e.g. a syscall filling a buffer) must be announced with
+    /// [`Self::log_host_write`] first. Mappings made or removed after a checkpoint aren't undone
+    /// by restoring it; that's up to whoever made them.
+    pub fn checkpoint_memory(&mut self) -> Result<MemoryCheckpoint> {
+        self.write_protect_1to1()?;
+        let checkpoint = MemoryCheckpoint(self.next_memory_checkpoint);
+        self.next_memory_checkpoint += 1;
+        self.memory_intervals.push(MemoryInterval {
+            checkpoint,
+            undo: BTreeMap::new(),
+        });
+        Ok(checkpoint)
+    }
+
+    /// Saves a host page's contents for the current interval, unless already saved.
+    fn save_page(&mut self, host_page: u64) {
+        let Some(interval) = self.memory_intervals.last_mut() else {
+            return;
+        };
+        interval.undo.entry(host_page).or_insert_with(|| {
+            // SAFETY: 1:1 mapped host memory, which the guest isn't running to change.
+            unsafe { std::slice::from_raw_parts(host_page as *const u8, HOST_PAGE_SIZE as usize) }
+                .into()
+        });
+    }
+
+    /// Handles a stage-2 fault at `paddr` if it's a guest write to a page write-protected for
+    /// checkpoints: saves the page and makes it writable.
+    pub fn handle_checkpoint_write_fault(&mut self, paddr: u64) -> Result<bool> {
+        if self.memory_intervals.is_empty() {
+            return Ok(false);
+        }
+        let Some(host_page) = self.take_write_fault(paddr)? else {
+            return Ok(false);
+        };
+        self.save_page(host_page);
+        Ok(true)
+    }
+
+    /// Announces a write to guest memory `addr..addr + size` that won't go through the VM, so
+    /// that checkpoints can undo it. Call it before writing.
+    pub fn log_host_write(&mut self, addr: u64, size: usize) {
+        if self.memory_intervals.is_empty() {
+            return;
+        }
+        for page in self.one_to_one_host_pages(addr, size) {
+            self.save_page(page);
+        }
+    }
+
+    /// Whether memory checkpoints are being kept.
+    pub fn checkpointing(&self) -> bool {
+        !self.memory_intervals.is_empty()
+    }
+
+    fn interval_index(&self, checkpoint: MemoryCheckpoint) -> Option<usize> {
+        self.memory_intervals
+            .iter()
+            .position(|interval| interval.checkpoint == checkpoint)
+    }
+
+    /// Puts guest memory back how it was at `checkpoint`, discarding later checkpoints. Returns
+    /// false if there's no such checkpoint.
+    pub fn restore_memory(&mut self, checkpoint: MemoryCheckpoint) -> Result<bool> {
+        let Some(index) = self.interval_index(checkpoint) else {
+            return Ok(false);
+        };
+        // Newest first, so a page's oldest saved contents are what's left.
+        for interval in self.memory_intervals[index..].iter().rev() {
+            for (&host_page, contents) in &interval.undo {
+                // Pages since unmapped aren't the guest's any more.
+                if self
+                    .one_to_one_host_pages(host_page, HOST_PAGE_SIZE as usize)
+                    .is_empty()
+                {
+                    continue;
+                }
+                // SAFETY: 1:1 mapped host memory, which the guest isn't running to change.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        contents.as_ptr(),
+                        host_page as *mut u8,
+                        HOST_PAGE_SIZE as usize,
+                    )
+                };
+            }
+        }
+        self.memory_intervals.truncate(index + 1);
+        self.memory_intervals[index].undo.clear();
+        self.write_protect_1to1()?;
+        Ok(true)
+    }
+
+    /// Forgets `checkpoint`, which can't be restored any more (but those around it still can).
+    /// Returns false if there's no such checkpoint.
+    pub fn discard_memory_checkpoint(&mut self, checkpoint: MemoryCheckpoint) -> Result<bool> {
+        let Some(index) = self.interval_index(checkpoint) else {
+            return Ok(false);
+        };
+        let interval = self.memory_intervals.remove(index);
+        if index > 0 {
+            // The previous interval now runs on to the next checkpoint. Its saved contents are
+            // older, so they win.
+            let previous = &mut self.memory_intervals[index - 1].undo;
+            for (host_page, contents) in interval.undo {
+                previous.entry(host_page).or_insert(contents);
+            }
+        }
+        if self.memory_intervals.is_empty() {
+            self.stop_write_protecting_1to1()?;
+        }
+        Ok(true)
+    }
+
+    /// The memory checkpoints' saved pages' total size.
+    pub fn checkpointed_bytes(&self) -> usize {
+        self.memory_intervals
+            .iter()
+            .map(|interval| interval.undo.len() * HOST_PAGE_SIZE as usize)
+            .sum()
     }
 
     /// Modifies different system registers to:
@@ -2205,6 +2487,35 @@ impl VirtMemAllocator {
             0x0000 => self.lower_table.unmap_1to1(addr, size),
             0xffff => self.upper_table.unmap_1to1(addr, size),
             _ => Err(MemoryError::InvalidAddress(addr))?,
+        }
+    }
+
+    /// See [`PageTableManager::write_protect_1to1`].
+    pub fn write_protect_1to1(&mut self) -> Result<()> {
+        self.lower_table.write_protect_1to1()?;
+        self.upper_table.write_protect_1to1()
+    }
+
+    /// See [`PageTableManager::stop_write_protecting_1to1`].
+    pub fn stop_write_protecting_1to1(&mut self) -> Result<()> {
+        self.lower_table.stop_write_protecting_1to1()?;
+        self.upper_table.stop_write_protecting_1to1()
+    }
+
+    /// See [`PageTableManager::take_write_fault`].
+    pub fn take_write_fault(&mut self, paddr: u64) -> Result<Option<u64>> {
+        match self.lower_table.take_write_fault(paddr)? {
+            Some(host) => Ok(Some(host)),
+            None => self.upper_table.take_write_fault(paddr),
+        }
+    }
+
+    /// See [`PageTableManager::one_to_one_host_pages`].
+    pub fn one_to_one_host_pages(&self, addr: u64, size: usize) -> Vec<u64> {
+        match addr >> 0x30 {
+            0x0000 => self.lower_table.one_to_one_host_pages(addr, size),
+            0xffff => self.upper_table.one_to_one_host_pages(addr, size),
+            _ => Vec::new(),
         }
     }
 

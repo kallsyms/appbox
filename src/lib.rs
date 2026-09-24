@@ -5,6 +5,7 @@ pub mod commpage;
 pub mod debug;
 pub mod dyld;
 pub mod dyld_cache_format;
+pub mod checkpoint;
 pub mod exec;
 mod fds;
 pub mod gdb;

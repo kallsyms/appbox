@@ -26,8 +26,8 @@ const KERN_NOT_FOUND: u64 = 56;
 const SVC_ESR: u64 = 0x5600_0080;
 const PAGE_ALIGN: u64 = 0x4000;
 // macOS 27 reserves 0x1_8000_0000..~0x70_0000_0000 in every process (shared region).
-const FIXED_MAP_BASE: u64 = 0x80_0000_0000;
-const FIXED_MAP_SIZE: u64 = 0x1_0000_0000;
+pub(crate) const FIXED_MAP_BASE: u64 = 0x80_0000_0000;
+pub(crate) const FIXED_MAP_SIZE: u64 = 0x1_0000_0000;
 // Guest memory is mapped into the VM as RWX regardless of host protections. A page the host
 // has mapped executable is typed XNU_USER_EXEC by SPTM, and handing one to hv_vm_map panics the
 // kernel (VIOLATION_ILLEGAL_MAPPING_TYPE). The host never executes guest memory, so drop
@@ -247,14 +247,17 @@ pub fn forward_syscall(num: u64, args: &[u64; 16]) -> (u64, u64, u64) {
 }
 
 pub struct DefaultTrapHandler {
-    map_fixed_next: u64,
-    mappings: Vec<(u64, usize)>,
+    pub(crate) map_fixed_next: u64,
+    pub(crate) mappings: Vec<(u64, usize)>,
     pub(crate) threads: Threads,
     pub(crate) pthread: Option<PthreadRegistration>,
     pub(crate) workq: Workqueue,
-    fds: GuestFds,
-    signals: [GuestSigaction; NSIG],
-    exit_status: Option<i32>,
+    pub(crate) fds: GuestFds,
+    pub(crate) signals: [GuestSigaction; NSIG],
+    pub(crate) exit_status: Option<i32>,
+    /// See [`crate::checkpoint`]: oldest first.
+    pub(crate) checkpoints: Vec<crate::checkpoint::HandlerInterval>,
+    pub(crate) next_checkpoint: u64,
     /// See [`Self::take_guest_memory_changes`].
     guest_memory_changes: GuestMemoryChanges,
     /// See [`Self::set_quantum`].
@@ -278,7 +281,7 @@ pub struct GuestMemoryChanges {
     pub writes: Vec<(u64, u64)>,
 }
 
-const NSIG: usize = 32;
+pub(crate) const NSIG: usize = 32;
 const PSTATE_MODE_MASK: u64 = 0b1111;
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
@@ -362,6 +365,8 @@ impl DefaultTrapHandler {
             signals: [GuestSigaction::default(); NSIG],
             exit_status: None,
             guest_memory_changes: GuestMemoryChanges::default(),
+            checkpoints: Vec::new(),
+            next_checkpoint: 0,
             quantum: Some(DEFAULT_QUANTUM),
             slice_timer_armed: false,
         })
@@ -373,6 +378,7 @@ impl DefaultTrapHandler {
     }
 
     fn record_mapping(&mut self, addr: u64, size: usize) {
+        self.journal_created(addr, size as u64);
         self.mappings.push((addr, size));
     }
 
@@ -475,6 +481,8 @@ impl DefaultTrapHandler {
         self.threads.retain_only_current();
         self.reset_workq();
         self.fds.close_on_exec();
+        // They're of the old image.
+        self.checkpoints.clear();
         self.pthread = None;
         // The timer goes with the old VM.
         self.slice_timer_armed = false;
@@ -541,7 +549,7 @@ impl DefaultTrapHandler {
         }
     }
 
-    fn restore_fixed_map_range(&self, addr: u64, size: u64) -> Result<()> {
+    pub(crate) fn restore_fixed_map_range(&self, addr: u64, size: u64) -> Result<()> {
         let mut requested = addr;
         let kr = unsafe { mach_vm_allocate(nix::libc::mach_task_self(), &mut requested, size, 0) };
         if kr == KERN_SUCCESS as i32 && requested == addr {
@@ -847,6 +855,32 @@ impl DefaultTrapHandler {
         Ok(())
     }
 
+    /// Journals what a syscall about to be forwarded will remove, for checkpoints to undo.
+    fn journal_before_forwarding(&mut self, vma: &VirtMemAllocator, num: u64, args: &[u64; 16]) {
+        let task_self = unsafe { nix::libc::mach_task_self() } as u64;
+        let overwrites = |flags: u64| flags & VM_FLAGS_OVERWRITE as u64 != 0;
+        match num {
+            // mmap is always MAP_FIXED by now, which replaces whatever was there.
+            syscalls::SYS_munmap | syscalls::SYS_mmap => {
+                self.journal_removing(vma, args[0], args[1])
+            }
+            syscalls::TRAP_mach_vm_deallocate if args[0] == task_self => {
+                self.journal_removing(vma, args[1], args[2])
+            }
+            syscalls::TRAP_mach_vm_allocate if overwrites(args[3]) => {
+                let addr = unsafe { *(args[1] as *const u64) };
+                self.journal_removing(vma, addr, args[2]);
+            }
+            syscalls::TRAP_mach_vm_map if overwrites(args[4]) => {
+                let addr = unsafe { *(args[1] as *const u64) };
+                self.journal_removing(vma, addr, args[2]);
+            }
+            syscalls::SYS_dup2 if args[0] != args[1] => self.journal_closing(args[1] as i32),
+            _ if crate::fds::closes_fd(num) => self.journal_closing(args[0] as i32),
+            _ => {}
+        }
+    }
+
     fn write_out_address(&self, out_addr: u64, value: u64) {
         unsafe { *(out_addr as *mut u64) = value };
     }
@@ -877,6 +911,14 @@ impl TrapHandler for DefaultTrapHandler {
             num,
             args
         );
+
+        // The host (the kernel, or this handler) writes guest memory the arguments point to
+        // directly, which checkpoints must hear about first.
+        if vma.checkpointing() {
+            for page in explore_pointers(vma, &args) {
+                vma.log_host_write(page, 0x1000);
+            }
+        }
 
         let mut ret0: u64 = 0;
         let mut ret1: u64 = 0;
@@ -1213,6 +1255,9 @@ impl TrapHandler for DefaultTrapHandler {
                         {
                             flags |= VM_FLAGS_OVERWRITE;
                         }
+                        if flags & VM_FLAGS_OVERWRITE != 0 {
+                            self.journal_removing(vma, address, req.size);
+                        }
                         let mut mapped_address = address;
                         let kr = mach_vm_map(
                             nix::libc::mach_task_self(),
@@ -1299,6 +1344,9 @@ impl TrapHandler for DefaultTrapHandler {
             _ => {}
         }
 
+        if !handled && self.checkpointing() {
+            self.journal_before_forwarding(vma, num, &args);
+        }
         if !handled {
             // The VM side of (un)mapping below has to follow its host side immediately.
             let may_block = !matches!(
@@ -1312,6 +1360,9 @@ impl TrapHandler for DefaultTrapHandler {
             let id = self.threads.current();
             match self.threads.forward(vcpu, num, &args, may_block)? {
                 Forwarded::Returned(ret) => {
+                    if self.checkpointing() {
+                        self.journal_opened(crate::fds::created_fds(vma, num, &args, ret));
+                    }
                     self.fds.track(vma, num, &args, ret);
                     (ret0, ret1, cflags) = ret;
                 }
@@ -1478,7 +1529,7 @@ fn readable_page(
 /// Copies guest memory at `addr` into `buf`, translating through the guest's page tables and
 /// without risking a fault on the host. `None` if any of it isn't mapped into the guest or isn't
 /// readable on the host.
-fn read_guest(vma: &VirtMemAllocator, addr: u64, buf: &mut [u8]) -> Option<()> {
+pub(crate) fn read_guest(vma: &VirtMemAllocator, addr: u64, buf: &mut [u8]) -> Option<()> {
     let mut done = 0;
     while done < buf.len() {
         let cur = addr.checked_add(done as u64)?;

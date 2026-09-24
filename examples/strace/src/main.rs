@@ -350,7 +350,7 @@ fn main() -> Result<()> {
                 }
                 ExitKind::Continue
             }
-            VmRunResult::HardwareBreakpoint | VmRunResult::Step => {
+            VmRunResult::HardwareBreakpoint | VmRunResult::Step | VmRunResult::Watchpoint { .. } => {
                 ExitKind::Crash("unexpected debug exception".to_string())
             }
             VmRunResult::Other(exit_info) => match exit_info.reason {
