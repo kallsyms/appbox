@@ -57,9 +57,14 @@ fn guest(name: &str) -> PathBuf {
 }
 
 fn run(args: &[&Path]) -> Output {
+    run_strace(&[], args)
+}
+
+fn run_strace(strace_args: &[&str], args: &[&Path]) -> Output {
     // Its own process group, so a timeout also kills the respawned child and anything the guest
     // spawned.
     let child = Command::new(strace())
+        .args(strace_args)
         .args(args)
         .process_group(0)
         .stdout(Stdio::piped())
@@ -176,4 +181,27 @@ fn dispatch() {
         ],
         &["<switched to thread"],
     );
+}
+
+#[test]
+fn exec_applies_close_on_exec() {
+    let trace = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cloexec.trace");
+    let _ = std::fs::remove_file(&trace);
+    // The trace file is the embedder's own close-on-exec descriptor, which must survive.
+    let output = run_strace(&["-o", trace.to_str().unwrap()], &[&guest("cloexec")]);
+    assert_output(
+        &output,
+        0,
+        &[
+            "O_CLOEXEC: closed",
+            "plain: open",
+            "FD_CLOEXEC set: closed",
+            "pipe: open",
+            "F_DUPFD_CLOEXEC: closed",
+        ],
+        &[],
+    );
+    let trace = std::fs::read_to_string(trace).unwrap();
+    let after_exec = &trace[trace.find("\nexec ").expect("no exec in trace")..];
+    assert!(after_exec.contains("VM exited: Exit"), "{trace}");
 }

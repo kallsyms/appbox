@@ -1,5 +1,6 @@
 use crate::applevisor as av;
 use crate::exec::ExecRequest;
+use crate::fds::GuestFds;
 use crate::hyperpom::crash::ExitKind;
 use crate::hyperpom::memory::VirtMemAllocator;
 use crate::layout::AddressSpaceConflict;
@@ -250,6 +251,7 @@ pub struct DefaultTrapHandler {
     pub(crate) threads: Threads,
     pub(crate) pthread: Option<PthreadRegistration>,
     pub(crate) workq: Workqueue,
+    fds: GuestFds,
     signals: [GuestSigaction; NSIG],
     exit_status: Option<i32>,
     /// See [`Self::take_guest_memory_changes`].
@@ -347,6 +349,7 @@ impl DefaultTrapHandler {
             threads: Threads::new()?,
             pthread: None,
             workq: Workqueue::default(),
+            fds: GuestFds::new(),
             signals: [GuestSigaction::default(); NSIG],
             exit_status: None,
             guest_memory_changes: GuestMemoryChanges::default(),
@@ -409,6 +412,7 @@ impl DefaultTrapHandler {
         self.release_guest_memory();
         self.threads.retain_only_current();
         self.reset_workq();
+        self.fds.close_on_exec();
         self.pthread = None;
         // Like the kernel: caught signals revert to their default action, ignored ones stay so.
         for action in &mut self.signals {
@@ -553,6 +557,14 @@ impl DefaultTrapHandler {
             if let Some(switch) = self.threads.switch_to_next(vcpu, from)? {
                 if !self.deliver_kevents(vcpu, vma, switch.to)? {
                     continue;
+                }
+                if self.fds.is_pending(switch.to) {
+                    let ret = (
+                        vcpu.get_reg(av::Reg::X0)?,
+                        vcpu.get_reg(av::Reg::X1)?,
+                        vcpu.get_reg(av::Reg::CPSR)?,
+                    );
+                    self.fds.resumed(vma, switch.to, ret);
                 }
                 return Ok(SyscallResult::switched(switch));
             }
@@ -1234,8 +1246,14 @@ impl TrapHandler for DefaultTrapHandler {
             );
             let id = self.threads.current();
             match self.threads.forward(vcpu, num, &args, may_block)? {
-                Forwarded::Returned(ret) => (ret0, ret1, cflags) = ret,
-                Forwarded::Blocked => return self.schedule(vcpu, vma, Some(id)),
+                Forwarded::Returned(ret) => {
+                    self.fds.track(vma, num, &args, ret);
+                    (ret0, ret1, cflags) = ret;
+                }
+                Forwarded::Blocked => {
+                    self.fds.blocked(id, num, &args);
+                    return self.schedule(vcpu, vma, Some(id));
+                }
             }
             if matches!(
                 num,

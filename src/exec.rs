@@ -5,8 +5,8 @@
 //! [`ExitKind::Exec`](crate::hyperpom::crash::ExitKind::Exec), and the caller runs [`exec`] to load
 //! the new image into a fresh VM, as the kernel would.
 //!
-//! File descriptors are shared with the host, so close-on-exec isn't applied: the host's own
-//! descriptors can't be told apart from the guest's.
+//! File descriptors are shared with the host, so close-on-exec is only applied to the ones the
+//! guest owns (see fds.rs).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

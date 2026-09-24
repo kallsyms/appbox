@@ -6,6 +6,7 @@ pub mod debug;
 pub mod dyld;
 pub mod dyld_cache_format;
 pub mod exec;
+mod fds;
 pub mod gdb;
 pub mod layout;
 pub mod loader;
