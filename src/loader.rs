@@ -47,6 +47,12 @@ pub struct Loader {
     pub stack_pointer: u64,
 }
 
+// SAFETY: a loaded Loader is only read, from however many threads, apart from its MemoryMaps'
+// reference counts, which change only under the trap handler's lock (when the guest unmaps them;
+// see `leak_mappings_overlapping`) or with no other thread left (e.g. on exec).
+unsafe impl Send for Loader {}
+unsafe impl Sync for Loader {}
+
 /// The arm64 slice of a thin or fat Mach-O: its file offset, header and load commands.
 pub(crate) fn arm64_slice(data: &[u8]) -> Result<(u64, MachHeader, Vec<MachCommand>)> {
     let ofile = OFile::parse(&mut Cursor::new(data))

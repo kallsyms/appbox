@@ -446,7 +446,6 @@ impl DefaultTrapHandler {
     /// Handles the watcher reporting that `source`'s host kqueue has events.
     pub(crate) fn kevents_pending(
         &mut self,
-        vcpu: &av::Vcpu,
         vma: &mut VirtMemAllocator,
         source: EventSource,
     ) -> Result<()> {
@@ -454,13 +453,12 @@ impl DefaultTrapHandler {
             return Ok(());
         };
         queue.host_pending = true;
-        self.service(vcpu, vma, source, Vec::new())
+        self.service(vma, source, Vec::new())
     }
 
     /// `__workq_kernreturn(options, item, arg2, arg3)`.
     pub(crate) fn workq_kernreturn(
         &mut self,
-        vcpu: &av::Vcpu,
         vma: &mut VirtMemAllocator,
         args: &[u64; 16],
     ) -> Result<WorkqReturn> {
@@ -475,14 +473,14 @@ impl DefaultTrapHandler {
             WQOPS_QUEUE_NEWSPISUPP | WQOPS_SETUP_DISPATCH | WQOPS_SET_EVENT_MANAGER_PRIORITY => {
                 Ok(0)
             }
-            // Only one thread runs at a time anyway.
+            // Threads are never too many for the (virtual) CPUs they run on.
             WQOPS_SHOULD_NARROW => Ok(0),
             WQOPS_QUEUE_REQTHREADS | WQOPS_QUEUE_REQTHREADS2 => {
                 match (request_flags(priority), count) {
                     (Some(flags), 1..) => {
                         for _ in 0..count {
                             let (reused, stack) = self.workq_thread_stack(vma)?;
-                            self.start_workq_thread(vcpu, vma, reused, stack, flags)?;
+                            self.start_workq_thread(vma, reused, stack, flags)?;
                         }
                         Ok(0)
                     }
@@ -494,13 +492,13 @@ impl DefaultTrapHandler {
                 return Ok(WorkqReturn::Descheduled);
             }
             WQOPS_THREAD_KEVENT_RETURN if serviced == Some(EventSource::Workq) => {
-                self.return_from_events(vcpu, vma, EventSource::Workq, item, count)?;
+                self.return_from_events(vma, EventSource::Workq, item, count)?;
                 return Ok(WorkqReturn::Descheduled);
             }
             WQOPS_THREAD_WORKLOOP_RETURN
                 if matches!(serviced, Some(EventSource::Workloop(_))) =>
             {
-                self.return_from_events(vcpu, vma, serviced.unwrap(), item, count)?;
+                self.return_from_events(vma, serviced.unwrap(), item, count)?;
                 return Ok(WorkqReturn::Descheduled);
             }
             _ => Err(nix::libc::EINVAL),
@@ -517,7 +515,6 @@ impl DefaultTrapHandler {
     /// then parks it, to be given more events straight away if there are any.
     fn return_from_events(
         &mut self,
-        vcpu: &av::Vcpu,
         vma: &mut VirtMemAllocator,
         source: EventSource,
         changes: u64,
@@ -549,7 +546,7 @@ impl DefaultTrapHandler {
         queue.servicer = None;
         queue.host_pending = queue.kqueue.is_some();
         self.park_workq_thread();
-        self.service(vcpu, vma, source, errors)
+        self.service(vma, source, errors)
     }
 
     /// Registers an ordinary (not `EVFILT_WORKLOOP`) change on `source`'s host kqueue, returning
@@ -586,7 +583,6 @@ impl DefaultTrapHandler {
     /// [`Self::deliver_kevents`]): by then, other threads may have dealt with some of them.
     fn service(
         &mut self,
-        vcpu: &av::Vcpu,
         vma: &mut VirtMemAllocator,
         source: EventSource,
         errors: Vec<KeventQos>,
@@ -606,7 +602,7 @@ impl DefaultTrapHandler {
 
         let (reused, stack) = self.workq_thread_stack(vma)?;
         let flags = WQ_FLAG_THREAD_NEWSPI | WQ_FLAG_THREAD_KEVENT;
-        let id = self.start_workq_thread(vcpu, vma, reused, stack, flags)?;
+        let id = self.start_workq_thread(vma, reused, stack, flags)?;
         self.workq.queues.get_mut(&source).unwrap().servicer = Some(id);
         self.workq.deliveries.insert(id, Delivery { source, errors });
         debug!("{source:?}: bound thread {id}");
@@ -726,7 +722,6 @@ impl DefaultTrapHandler {
     /// with upcall `flags` (and no kevents, which [`Self::deliver_kevents`] adds).
     fn start_workq_thread(
         &mut self,
-        vcpu: &av::Vcpu,
         vma: &mut VirtMemAllocator,
         reused: Option<ThreadId>,
         stack: u64,
@@ -741,15 +736,13 @@ impl DefaultTrapHandler {
             } else {
                 WQ_FLAG_THREAD_REUSE
             };
-        let template = Registers::save_at_syscall(vcpu)?;
         let tsd = addrs.pthread + registration.tsd_offset as u64;
         let regs = |port: u32| {
             let mut regs = Registers {
                 pc: registration.wq_thread,
                 sp: addrs.pthread & !15,
-                // The EL0 mode the other threads run in, without condition flags.
-                cpsr: template.cpsr & !(0b1111 << 28),
-                fpcr: template.fpcr,
+                cpsr: registration.thread_cpsr,
+                fpcr: registration.thread_fpcr,
                 tpidrro: tsd,
                 ..Default::default()
             };
@@ -773,7 +766,7 @@ impl DefaultTrapHandler {
                 Ok(id)
             }
             None => {
-                let id = self.threads.spawn(regs)?;
+                let id = self.spawn_thread(regs)?;
                 if registration.mach_thread_self_offset != 0 {
                     let port = self.threads.port(id) as u64;
                     let addr = tsd + registration.mach_thread_self_offset as u64;
@@ -855,7 +848,7 @@ impl DefaultTrapHandler {
             let knote = self.workloop_sync_knote(id, ident);
             knote.waiter = Some((waiter, errors as u64));
             self.threads.block_current(vcpu)?;
-            self.service(vcpu, vma, source, Vec::new())?;
+            self.service(vma, source, Vec::new())?;
             return Ok(WorkqReturn::Descheduled);
         }
 
@@ -865,7 +858,7 @@ impl DefaultTrapHandler {
             // Waiting for events isn't supported; they're always polled.
             received = self.poll_workloop(source, eventlist, nevents, data_out, data_available, flags, vma)?;
         }
-        self.service(vcpu, vma, source, Vec::new())?;
+        self.service(vma, source, Vec::new())?;
         Ok(WorkqReturn::Done(Ok(received)))
     }
 

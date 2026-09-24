@@ -117,6 +117,33 @@ emulated. A thread's EL0 state (GPRs, SIMD/FP, SP, PC/PSTATE, TPIDR/TPIDRRO) is 
 restored when switching. Threads switch when one blocks, yields or exits, or when its time slice
 ends (see below).
 
+### Or a vCPU each, in parallel (opt-in)
+
+`appbox::threading::use_parallel_vcpus()` gives each guest thread a vCPU of its own, on a host
+thread of its own, so threads really run at once. The cost is determinism: no record/replay and
+no checkpoints. It's an environment variable (`APPBOX_THREADING`), so every process a guest
+spawns inherits it, and so does the image it execs.
+
+The two models share nearly all their code:
+- The thread states and transitions in `Threads` are the same. A thread becoming runnable
+  (woken, unparked, created, or its syscall done) just also nudges that thread's mailbox, where
+  its host thread waits whenever it can't run. The host thread then takes the thread's registers
+  and does the same switch-in work the time-shared scheduler would (delivering kevents, finishing
+  a blocked syscall's bookkeeping).
+- The trap handler is shared behind a mutex. `handle_syscall` releases it while a thread waits.
+- Syscall proxies stay. A syscall that can block goes to the thread's proxy, which replies to the
+  thread's mailbox; one that can't runs directly on the caller.
+- A small pump thread handles workqueue kevents, since no scheduler polls for them.
+
+The embedder writes one loop for a guest thread's vCPU (a `ThreadRunner`), and
+`DefaultTrapHandler::run` runs it for every thread. `SharedVm::stop` kicks all the vCPUs out when
+one thread ends the process.
+
+Two things surfaced that time-sharing had hidden:
+- Every vCPU needs the same system registers. `TCR_EL1.TBI0` (without which libobjc crashes) used
+  to be set on the first vCPU only, by the loader.
+- Stale stage-1 TLB entries need an inner-shareable invalidation after page tables change.
+
 ### Proxy threads for syscalls
 
 Each guest thread has a host proxy thread that runs its forwarded syscalls. The kernel then

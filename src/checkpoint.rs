@@ -125,6 +125,10 @@ impl DefaultTrapHandler {
     /// contents, or anything done through another process.
     pub fn checkpoint(&mut self, vm: &mut VmManager) -> Result<Checkpoint> {
         ensure!(
+            self.threads.model() == crate::threading::ThreadingModel::TimeShared,
+            "checkpoints need time-shared threading"
+        );
+        ensure!(
             !self.threads.others_alive() && !self.workq.has_event_sources(),
             "checkpoints need a single-threaded guest without a workqueue"
         );

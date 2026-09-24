@@ -4,7 +4,7 @@
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{mpsc, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -44,6 +44,9 @@ fn strace() -> &'static Path {
 
 /// Compiles `tests/guests/<name>.c`.
 fn guest(name: &str) -> PathBuf {
+    // Tests sharing a guest mustn't compile it over each other.
+    static COMPILING: Mutex<()> = Mutex::new(());
+    let _compiling = COMPILING.lock().unwrap_or_else(|e| e.into_inner());
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/guests/{name}.c"));
     let binary = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("guest-{name}"));
     let status = Command::new("xcrun")
@@ -215,4 +218,73 @@ fn preemption() {
         &["worker ran while main spun: yes"],
         &["<preempted, switched to thread"],
     );
+}
+
+/// Runs the guest with each of its threads on a vCPU of its own.
+fn run_parallel(args: &[&Path]) -> Output {
+    run_strace(&["--parallel"], args)
+}
+
+#[test]
+fn parallel_pthreads() {
+    let output = run_parallel(&[&guest("pthreads")]);
+    assert_output(
+        &output,
+        0,
+        &["counter=40000/40000 joins=60/60 distinct_ports=1"],
+        &["threading: Parallel"],
+    );
+}
+
+#[test]
+fn parallel_dispatch() {
+    let output = run_parallel(&[&guest("dispatch")]);
+    assert_output(
+        &output,
+        0,
+        &[
+            "dispatch_async: ok",
+            "group: 100/100",
+            "serial order: ok",
+            "dispatch_after: ok",
+            "timer source: ok",
+            "read source: ok",
+            "read: x",
+            "mach receive source: ok",
+            "mach message id: 1234",
+            "main queue: ok",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn parallel_threads_run_at_once() {
+    // Without preemption: the worker can only run while main spins on another vCPU.
+    let output = run_strace(&["--parallel", "--quantum", "0"], &[&guest("preempt")]);
+    assert_output(&output, 0, &["worker ran while main spun: yes"], &[]);
+}
+
+#[test]
+fn parallel_exec() {
+    let output = run_parallel(&[
+        Path::new("/usr/bin/env"),
+        Path::new("/bin/echo"),
+        Path::new("exec works"),
+    ]);
+    assert_output(&output, 0, &["exec works"], &["exec \"/bin/echo\""]);
+}
+
+#[test]
+fn parallel_threading_carries_over_to_spawned_processes() {
+    let output = run_parallel(&[&guest("spawn")]);
+    assert_output(
+        &output,
+        3,
+        &["child says hi", "echo exited 0", "false exited 1"],
+        &[],
+    );
+    let trace = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(trace.matches("threading: Parallel").count(), 3, "{trace}");
+    assert!(!trace.contains("threading: TimeShared"), "{trace}");
 }

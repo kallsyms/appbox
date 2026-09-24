@@ -10,6 +10,7 @@ use crate::mach::{
     VM_FLAGS_OVERWRITE,
 };
 use crate::syscalls;
+use crate::threading::ThreadingModel;
 use crate::threads::{Forwarded, Registers, ThreadId, ThreadSwitch, Threads, MAIN_THREAD};
 use crate::vm::VmManager;
 use crate::workq::{WorkqReturn, Workqueue, KEVENT_FLAG_WORKQ};
@@ -113,6 +114,9 @@ pub struct SyscallResult {
     /// Set if a different guest thread is now on the vCPU (whose registers are already in
     /// place, so there's nothing to write back).
     pub thread_switch: Option<ThreadSwitch>,
+    /// In parallel: the thread can't run until woken, which its host thread waits for (see
+    /// [`crate::runner::GuestThread::handle_syscall`]).
+    pub(crate) waiting: bool,
 }
 
 impl SyscallResult {
@@ -124,6 +128,22 @@ impl SyscallResult {
             exit: ExitKind::Continue,
             write_back: true,
             thread_switch: None,
+            waiting: false,
+        }
+    }
+
+    /// A thread's syscall returned while it waited, and its registers are already in place.
+    pub fn resumed(ret0: u64, ret1: u64, cflags: u64) -> Self {
+        Self {
+            write_back: false,
+            ..Self::cont(ret0, ret1, cflags)
+        }
+    }
+
+    pub(crate) fn waiting() -> Self {
+        Self {
+            waiting: true,
+            ..Self::cont(0, 0, 0)
         }
     }
 
@@ -135,6 +155,7 @@ impl SyscallResult {
             exit,
             write_back: false,
             thread_switch: None,
+            waiting: false,
         }
     }
 
@@ -146,6 +167,7 @@ impl SyscallResult {
             exit: ExitKind::Continue,
             write_back: false,
             thread_switch: Some(switch),
+            waiting: false,
         }
     }
 }
@@ -264,6 +286,9 @@ pub struct DefaultTrapHandler {
     quantum: Option<Duration>,
     /// Whether the vCPU's timer is set to end the current thread's time slice.
     slice_timer_armed: bool,
+    /// In parallel, once running (see [`crate::runner`]): what starting threads' host threads
+    /// takes.
+    pub(crate) runtime: Option<crate::runner::Runtime>,
 }
 
 /// How long a guest thread runs before others get a turn, if it doesn't block first.
@@ -309,6 +334,10 @@ pub(crate) struct PthreadRegistration {
     pub(crate) dispatch_queue_offset: u64,
     pub(crate) tsd_offset: u32,
     pub(crate) mach_thread_self_offset: u32,
+    /// The EL0 PSTATE (without condition flags) and FPCR new threads start with: the
+    /// registering thread's.
+    pub(crate) thread_cpsr: u64,
+    pub(crate) thread_fpcr: u64,
 }
 
 const PTHREAD_REGISTRATION_DATA_SIZE: usize = 56;
@@ -367,8 +396,11 @@ impl DefaultTrapHandler {
             guest_memory_changes: GuestMemoryChanges::default(),
             checkpoints: Vec::new(),
             next_checkpoint: 0,
-            quantum: Some(DEFAULT_QUANTUM),
+            // In parallel, threads don't take turns.
+            quantum: (crate::threading::model() == ThreadingModel::TimeShared)
+                .then_some(DEFAULT_QUANTUM),
             slice_timer_armed: false,
+            runtime: None,
         })
     }
 
@@ -619,9 +651,11 @@ impl DefaultTrapHandler {
         Ok(addr)
     }
 
-    /// Puts the next thread to run on the vCPU, which no thread is on, waiting for one to become
-    /// runnable if needed. `from` is the thread that was on it, unless it exited. Ends the
-    /// process if no thread can ever run again.
+    /// Takes the current thread (which blocked, parked or exited: `from`, unless it exited) off
+    /// the vCPU. Time-shared, puts the next thread to run on it, waiting for one to become
+    /// runnable if needed; in parallel, the caller's host thread waits for its own thread to
+    /// become runnable instead (see [`crate::runner`]). Ends the process if no thread can ever
+    /// run again.
     fn schedule(
         &mut self,
         vcpu: &av::Vcpu,
@@ -630,26 +664,24 @@ impl DefaultTrapHandler {
     ) -> Result<SyscallResult> {
         loop {
             for source in self.threads.take_kevents_pending() {
-                self.kevents_pending(vcpu, vma, source)?;
-            }
-            if let Some(switch) = self.threads.switch_to_next(vcpu, from)? {
-                if !self.deliver_kevents(vcpu, vma, switch.to)? {
-                    continue;
-                }
-                if self.fds.is_pending(switch.to) {
-                    let ret = (
-                        vcpu.get_reg(av::Reg::X0)?,
-                        vcpu.get_reg(av::Reg::X1)?,
-                        vcpu.get_reg(av::Reg::CPSR)?,
-                    );
-                    self.fds.resumed(vma, switch.to, ret);
-                }
-                self.arm_slice_timer(vcpu, true)?;
-                return Ok(SyscallResult::switched(switch));
+                self.kevents_pending(vma, source)?;
             }
             // As with the kernel, the process ends with its last thread. Parked workqueue threads
             // only count while something could wake them.
-            if !self.threads.any_alive() && !self.workq.has_event_sources() {
+            let ended = !self.threads.any_alive() && !self.workq.has_event_sources();
+            if self.threads.model() == ThreadingModel::Parallel && !ended {
+                return Ok(match from {
+                    Some(_) => SyscallResult::waiting(),
+                    None => SyscallResult::exit(ExitKind::ThreadExit),
+                });
+            }
+            if let Some(switch) = self.threads.switch_to_next(vcpu, from)? {
+                if !self.switched_in(vcpu, vma, switch.to)? {
+                    continue;
+                }
+                return Ok(SyscallResult::switched(switch));
+            }
+            if ended {
                 self.exit_status = Some(0);
                 return Ok(SyscallResult::exit(ExitKind::Exit));
             }
@@ -657,24 +689,73 @@ impl DefaultTrapHandler {
         }
     }
 
+    /// Finishes putting thread `to` on `vcpu`, whose registers are now its: delivers any kevents
+    /// due to it, and completes what it blocked in. Returns false if it had nothing to do after
+    /// all, and is parked again.
+    pub(crate) fn switched_in(
+        &mut self,
+        vcpu: &av::Vcpu,
+        vma: &mut VirtMemAllocator,
+        to: ThreadId,
+    ) -> Result<bool> {
+        vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, self.threads.tsd())?;
+        if !self.deliver_kevents(vcpu, vma, to)? {
+            return Ok(false);
+        }
+        if self.fds.is_pending(to) {
+            let ret = (
+                vcpu.get_reg(av::Reg::X0)?,
+                vcpu.get_reg(av::Reg::X1)?,
+                vcpu.get_reg(av::Reg::CPSR)?,
+            );
+            self.fds.resumed(vma, to, ret);
+        }
+        self.arm_slice_timer(vcpu, true)?;
+        Ok(true)
+    }
+
+    /// Adds a guest thread, runnable with the registers `regs` gets from its thread port, and in
+    /// parallel starts its host thread.
+    pub(crate) fn spawn_thread(&mut self, regs: impl FnOnce(u32) -> Registers) -> Result<ThreadId> {
+        let id = self.threads.spawn(regs)?;
+        if self.threads.model() == ThreadingModel::Parallel {
+            crate::runner::start_host_thread(self, id)?;
+        }
+        Ok(id)
+    }
+
     /// `__bsdthread_register(threadstart, wqthread, pthsize, data, data_size, dq_offset)`:
     /// records libpthread's entry points and offsets. Returns the supported features.
     fn bsdthread_register(
         &mut self,
+        vcpu: &av::Vcpu,
         vma: &mut VirtMemAllocator,
         args: &[u64; 16],
-    ) -> std::result::Result<u64, i32> {
+    ) -> Result<std::result::Result<u64, i32>> {
         if self.pthread.is_some() {
-            return Err(nix::libc::EINVAL);
+            return Ok(Err(nix::libc::EINVAL));
         }
         let (data, data_size) = (args[3], args[4] as usize);
-        let mut registration = PthreadRegistration {
+        let registering = Registers::save_at_syscall(vcpu)?;
+        let registration = PthreadRegistration {
             thread_start: args[0],
             wq_thread: args[1],
             pthread_size: args[2] as u32,
             dispatch_queue_offset: args[5],
+            thread_cpsr: registering.cpsr & !(0b1111 << 28),
+            thread_fpcr: registering.fpcr,
             ..Default::default()
         };
+        Ok(self.register_pthread(vma, registration, data, data_size))
+    }
+
+    fn register_pthread(
+        &mut self,
+        vma: &mut VirtMemAllocator,
+        mut registration: PthreadRegistration,
+        data: u64,
+        data_size: usize,
+    ) -> std::result::Result<u64, i32> {
         if data != 0 {
             // struct _pthread_registration_data (packed); see libpthread's kern_internal.h.
             let mut raw = [0u8; PTHREAD_REGISTRATION_DATA_SIZE];
@@ -722,7 +803,7 @@ impl DefaultTrapHandler {
         }
         let tsd = pthread + registration.tsd_offset as u64;
         let creator = Registers::save_at_syscall(vcpu)?;
-        let id = self.threads.spawn(|port| {
+        let id = self.spawn_thread(|port| {
             let mut regs = Registers {
                 pc: registration.thread_start,
                 sp: stack,
@@ -1015,7 +1096,7 @@ impl DefaultTrapHandler {
                 }
             }
             syscalls::SYS_bsdthread_register => {
-                match self.bsdthread_register(vma, &args) {
+                match self.bsdthread_register(vcpu, vma, &args)? {
                     Ok(features) => ret0 = features,
                     Err(errno) => {
                         ret0 = errno as u64;
@@ -1042,7 +1123,7 @@ impl DefaultTrapHandler {
             }
             syscalls::SYS_workq_kernreturn => {
                 let id = self.threads.current();
-                match self.workq_kernreturn(vcpu, vma, &args)? {
+                match self.workq_kernreturn(vma, &args)? {
                     WorkqReturn::Done(Ok(ret)) => ret0 = ret,
                     WorkqReturn::Done(Err(errno)) => {
                         ret0 = errno as u64;

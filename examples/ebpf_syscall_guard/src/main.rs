@@ -206,6 +206,7 @@ fn main() -> Result<()> {
                     _ => result.exit,
                 }
             }
+            VmRunResult::Stopped => ExitKind::Exit,
             VmRunResult::Timer => {
                 handler.handle_timer(&mut vm)?;
                 ExitKind::Continue

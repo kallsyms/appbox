@@ -1,8 +1,11 @@
-//! Guest threads, time-shared on the VM's one vCPU.
+//! Guest threads, time-shared on the VM's one vCPU, or each on a vCPU of its own (see
+//! [`crate::threading`]).
 //!
-//! Only one guest thread runs at a time; the others are saved register states. That keeps the
-//! guest's execution deterministic apart from where threads are switched, which callers can
-//! record.
+//! Time-shared, only one guest thread runs at a time; the others are saved register states. That
+//! keeps the guest's execution deterministic apart from where threads are switched, which callers
+//! can record. In parallel, each guest thread runs on its own host thread and vCPU, which waits
+//! on the thread's mailbox whenever the thread can't run, and takes its registers from here once
+//! it can: the same states and transitions, but every runnable thread runs at once.
 //!
 //! Each guest thread has a host "proxy" thread that runs its forwarded syscalls, so the kernel
 //! sees one thread per guest thread: thread ports, ulock ownership, per-thread signal masks, QoS
@@ -16,6 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::applevisor as av;
+use crate::threading::{self, ThreadingModel};
 use crate::trap::forward_syscall;
 use crate::workq::EventSource;
 
@@ -138,14 +142,20 @@ fn set_simd_fp_reg(vcpu: &av::Vcpu, reg: av::SimdFpReg, value: u128) -> Result<(
 struct Job {
     num: u64,
     args: [u64; 16],
+    /// Where to send its [`Message::Completed`].
+    reply: Sender<Message>,
 }
 
-/// Something the scheduler waits for.
+/// Something the scheduler (or, in parallel, a thread's host thread) waits for.
 pub(crate) enum Message {
     /// A proxy finished a syscall.
     Completed(ThreadId, SyscallReturn),
     /// A kqueue backing the guest's workqueue or one of its workloops has events to deliver.
     KeventsPending(EventSource),
+    /// In parallel: the thread has been made runnable.
+    Runnable,
+    /// In parallel: the process is ending, so the thread's host thread should stop.
+    Stop,
 }
 
 /// A host thread that runs one guest thread's forwarded syscalls.
@@ -156,7 +166,7 @@ struct Proxy {
 }
 
 impl Proxy {
-    fn spawn(id: ThreadId, messages: Sender<Message>) -> Result<Self> {
+    fn spawn(id: ThreadId) -> Result<Self> {
         let (jobs, pending) = channel::<Job>();
         let (port_tx, port_rx) = channel();
         std::thread::Builder::new()
@@ -165,9 +175,7 @@ impl Proxy {
                 let _ = port_tx.send(unsafe { nix::libc::mach_thread_self() });
                 for job in pending {
                     let ret = forward_syscall(job.num, &job.args);
-                    if messages.send(Message::Completed(id, ret)).is_err() {
-                        break;
-                    }
+                    let _ = job.reply.send(Message::Completed(id, ret));
                 }
             })
             .context("spawning syscall proxy thread")?;
@@ -191,6 +199,8 @@ struct Thread {
     proxy: Proxy,
     tsd: u64,
     state: State,
+    /// In parallel: where the thread's host thread waits.
+    mailbox: Option<Sender<Message>>,
 }
 
 /// A change of which guest thread is on the vCPU.
@@ -213,13 +223,18 @@ pub(crate) enum Forwarded {
 const BLOCKING_THRESHOLD: Duration = Duration::from_millis(1);
 
 pub(crate) struct Threads {
+    model: ThreadingModel,
     threads: BTreeMap<ThreadId, Thread>,
-    /// `None` between taking the current thread off the vCPU and scheduling another.
+    /// `None` between taking the current thread off the vCPU and scheduling another. In
+    /// parallel, the thread whose syscall is being handled.
     current: Option<ThreadId>,
     next_id: ThreadId,
-    messages: Receiver<Message>,
+    /// `None` once taken by [`Self::take_messages`].
+    messages: Option<Receiver<Message>>,
     messages_tx: Sender<Message>,
     kevents_pending: BTreeSet<EventSource>,
+    /// In parallel: threads' mailboxes that no host thread has taken yet.
+    unclaimed_mailboxes: BTreeMap<ThreadId, Receiver<Message>>,
 }
 
 fn apply_return(regs: &mut Registers, (ret0, ret1, flags): SyscallReturn) {
@@ -231,19 +246,119 @@ fn apply_return(regs: &mut Registers, (ret0, ret1, flags): SyscallReturn) {
 impl Threads {
     pub(crate) fn new() -> Result<Self> {
         let (messages_tx, messages) = channel();
-        let main = Thread {
-            proxy: Proxy::spawn(MAIN_THREAD, messages_tx.clone())?,
-            tsd: 0,
-            state: State::Running,
-        };
-        Ok(Self {
-            threads: BTreeMap::from([(MAIN_THREAD, main)]),
+        let mut threads = Self {
+            model: threading::model(),
+            threads: BTreeMap::new(),
             current: Some(MAIN_THREAD),
             next_id: MAIN_THREAD + 1,
-            messages,
+            messages: Some(messages),
             messages_tx,
             kevents_pending: BTreeSet::new(),
-        })
+            unclaimed_mailboxes: BTreeMap::new(),
+        };
+        threads.add(MAIN_THREAD, 0, State::Running)?;
+        Ok(threads)
+    }
+
+    fn add(&mut self, id: ThreadId, tsd: u64, state: State) -> Result<()> {
+        let mailbox = self.new_mailbox(id);
+        let proxy = Proxy::spawn(id)?;
+        self.threads.insert(
+            id,
+            Thread {
+                proxy,
+                tsd,
+                state,
+                mailbox,
+            },
+        );
+        Ok(())
+    }
+
+    /// In parallel, gives thread `id` a new mailbox, to be claimed with
+    /// [`Self::claim_mailbox`].
+    fn new_mailbox(&mut self, id: ThreadId) -> Option<Sender<Message>> {
+        if self.model != ThreadingModel::Parallel {
+            return None;
+        }
+        let (sender, receiver) = channel();
+        self.unclaimed_mailboxes.insert(id, receiver);
+        Some(sender)
+    }
+
+    pub(crate) fn model(&self) -> ThreadingModel {
+        self.model
+    }
+
+    /// In parallel: the mailbox thread `id`'s host thread waits on.
+    pub(crate) fn claim_mailbox(&mut self, id: ThreadId) -> Option<Receiver<Message>> {
+        self.unclaimed_mailboxes.remove(&id)
+    }
+
+    /// In parallel: gives the current thread a new mailbox (e.g. to run on another host thread
+    /// after an exec), returning it.
+    pub(crate) fn rebind_current_mailbox(&mut self) -> Option<Receiver<Message>> {
+        let id = self.current();
+        let mailbox = self.new_mailbox(id);
+        self.current_thread().mailbox = mailbox;
+        self.claim_mailbox(id)
+    }
+
+    /// In parallel: makes `id` the thread whose syscall is being handled.
+    pub(crate) fn set_current(&mut self, id: ThreadId) {
+        self.current = Some(id);
+    }
+
+    /// Takes the channel kevents (and, time-shared, threads' syscalls) are reported on, for
+    /// someone else to wait on (in parallel, where no scheduler does), replacing it.
+    pub(crate) fn take_messages(&mut self) -> Receiver<Message> {
+        let (messages_tx, messages) = channel();
+        self.messages_tx = messages_tx;
+        self.messages.take();
+        messages
+    }
+
+    /// In parallel: tells every thread's host thread to stop, and whoever took the messages.
+    pub(crate) fn stop_all(&self) {
+        for mailbox in self.threads.values().filter_map(|thread| thread.mailbox.as_ref()) {
+            let _ = mailbox.send(Message::Stop);
+        }
+        let _ = self.messages_tx.send(Message::Stop);
+    }
+
+    /// Thread `id` becomes runnable with `regs`. In parallel, its host thread is told.
+    fn make_runnable(&mut self, id: ThreadId, regs: Registers) {
+        let thread = self.threads.get_mut(&id).expect("thread exists");
+        thread.state = State::Runnable(regs);
+        if let Some(mailbox) = &thread.mailbox {
+            let _ = mailbox.send(Message::Runnable);
+        }
+    }
+
+    /// In parallel: puts thread `id` (the caller's) on its vCPU, if it's runnable, returning the
+    /// registers it resumes with.
+    pub(crate) fn take_runnable(&mut self, id: ThreadId) -> Option<Registers> {
+        let thread = self.threads.get_mut(&id)?;
+        if !matches!(thread.state, State::Runnable(_)) {
+            return None;
+        }
+        let State::Runnable(regs) = std::mem::replace(&mut thread.state, State::Running) else {
+            unreachable!();
+        };
+        self.current = Some(id);
+        Some(regs)
+    }
+
+    /// In parallel: thread `id`'s forwarded syscall returned `ret`.
+    pub(crate) fn completed(&mut self, id: ThreadId, ret: SyscallReturn) {
+        let Some(thread) = self.threads.get_mut(&id) else {
+            return;
+        };
+        if let State::Blocked(regs) = &mut thread.state {
+            let mut regs = std::mem::take(regs);
+            apply_return(&mut regs, ret);
+            thread.state = State::Runnable(regs);
+        }
     }
 
     /// The thread on the vCPU.
@@ -275,18 +390,13 @@ impl Threads {
     }
 
     /// Adds a thread, runnable with the registers `regs` gets from its thread port.
+    /// In parallel, its host thread is to be started with [`Self::claim_mailbox`].
     pub(crate) fn spawn(&mut self, regs: impl FnOnce(u32) -> Registers) -> Result<ThreadId> {
         let id = self.next_id;
-        let proxy = Proxy::spawn(id, self.messages_tx.clone())?;
-        let regs = regs(proxy.port);
-        self.threads.insert(
-            id,
-            Thread {
-                proxy,
-                tsd: regs.tpidrro,
-                state: State::Runnable(regs),
-            },
-        );
+        self.add(id, 0, State::Parked)?;
+        let regs = regs(self.threads[&id].proxy.port);
+        self.threads.get_mut(&id).unwrap().tsd = regs.tpidrro;
+        self.threads.get_mut(&id).unwrap().state = State::Runnable(regs);
         self.next_id += 1;
         Ok(id)
     }
@@ -296,7 +406,7 @@ impl Threads {
         let thread = self.threads.get_mut(&id).expect("parked thread exists");
         debug_assert!(matches!(thread.state, State::Parked));
         thread.tsd = regs.tpidrro;
-        thread.state = State::Runnable(regs);
+        self.make_runnable(id, regs);
     }
 
     /// A thread's port name.
@@ -323,18 +433,38 @@ impl Threads {
         may_block: bool,
     ) -> Result<Forwarded> {
         let id = self.current();
+        if self.model == ThreadingModel::Parallel {
+            // Nothing waits on another thread here: a syscall that can't block runs on the
+            // caller, and one that can on the thread's proxy, which tells the thread's host
+            // thread once it's done.
+            if !may_block {
+                return Ok(Forwarded::Returned(forward_syscall(num, args)));
+            }
+            let thread = self.current_thread();
+            let reply = thread.mailbox.clone().expect("parallel threads have mailboxes");
+            thread
+                .proxy
+                .jobs
+                .send(Job { num, args: *args, reply })
+                .context("syscall proxy thread exited")?;
+            thread.state = State::Blocked(Registers::save_at_syscall(vcpu)?);
+            self.current = None;
+            return Ok(Forwarded::Blocked);
+        }
+        let reply = self.messages_tx.clone();
         self.current_thread()
             .proxy
             .jobs
-            .send(Job { num, args: *args })
+            .send(Job { num, args: *args, reply })
             .context("syscall proxy thread exited")?;
 
         let mut waited_long = !may_block;
         loop {
+            let messages = self.messages.as_ref().expect("time-shared threads keep messages");
             let message = if waited_long {
-                Some(self.messages.recv().context("syscall proxies exited")?)
+                Some(messages.recv().context("syscall proxies exited")?)
             } else {
-                match self.messages.recv_timeout(BLOCKING_THRESHOLD) {
+                match messages.recv_timeout(BLOCKING_THRESHOLD) {
                     Ok(message) => Some(message),
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => anyhow::bail!("syscall proxies exited"),
@@ -366,12 +496,13 @@ impl Threads {
                 if let State::Blocked(regs) = &mut thread.state {
                     let mut regs = std::mem::take(regs);
                     apply_return(&mut regs, ret);
-                    thread.state = State::Runnable(regs);
+                    self.make_runnable(id, regs);
                 }
             }
             Message::KeventsPending(source) => {
                 self.kevents_pending.insert(source);
             }
+            Message::Runnable | Message::Stop => {}
         }
     }
 
@@ -392,14 +523,15 @@ impl Threads {
     /// Handles whatever has happened meanwhile (syscalls finishing, kevents arriving), without
     /// waiting.
     pub(crate) fn poll(&mut self) {
-        while let Ok(message) = self.messages.try_recv() {
+        while let Some(Ok(message)) = self.messages.as_ref().map(Receiver::try_recv) {
             self.handle(message);
         }
     }
 
     /// Waits for a syscall to finish or kevents to arrive.
     pub(crate) fn wait(&mut self) -> Result<()> {
-        let message = self.messages.recv().context("syscall proxies exited")?;
+        let messages = self.messages.as_ref().context("messages taken")?;
+        let message = messages.recv().context("syscall proxies exited")?;
         self.handle(message);
         Ok(())
     }
@@ -456,7 +588,10 @@ impl Threads {
     /// if another thread could run instead (or might, once kevents are delivered). Returns
     /// whether it did.
     pub(crate) fn yield_current(&mut self, vcpu: &av::Vcpu, ret: SyscallReturn) -> Result<bool> {
-        if self.next_runnable().is_none() && self.kevents_pending.is_empty() {
+        // In parallel, everything that could run already is.
+        if self.model == ThreadingModel::Parallel
+            || (self.next_runnable().is_none() && self.kevents_pending.is_empty())
+        {
             return Ok(false);
         }
         let mut regs = Registers::save_at_syscall(vcpu)?;

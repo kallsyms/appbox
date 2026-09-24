@@ -1,4 +1,4 @@
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::macos::fs::MetadataExt;
@@ -34,7 +34,7 @@ pub struct SharedCache {
     executable_pages_shared: bool,
     /// Loaded on first use: it's large (every symbol the cache exports, millions), and only
     /// needed to symbolicate.
-    symbol_map: OnceCell<Option<SymbolMap>>,
+    symbol_map: OnceLock<Option<SymbolMap>>,
     cache_path: PathBuf,
 }
 
@@ -115,7 +115,7 @@ impl SharedCache {
             mappings: vec![],
             executable_mappings: vec![],
             executable_pages_shared,
-            symbol_map: OnceCell::new(),
+            symbol_map: OnceLock::new(),
             cache_path: cache_path.to_path_buf(),
         };
         cache.map_single_cache(cache_path)?;

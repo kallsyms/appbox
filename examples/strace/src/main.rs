@@ -4,15 +4,15 @@ use log::{debug, warn};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use appbox::applevisor as av;
 use appbox::hyperpom::crash::ExitKind;
 use appbox::hyperpom::error::ExceptionError;
 use appbox::hyperpom::exceptions::ExceptionClass;
-use appbox::trap::{
-    read_syscall_context, write_syscall_result, DefaultTrapHandler, SyscallResult, TrapHandler,
-};
+use appbox::loader::Loader;
+use appbox::runner::{GuestThread, ThreadRunner};
+use appbox::trap::{read_syscall_context, write_syscall_result, DefaultTrapHandler, SyscallResult};
 use appbox::vm::{VmManager, VmRunResult};
 
 #[derive(Clone, Copy)]
@@ -221,6 +221,11 @@ pub struct Args {
     #[clap(long)]
     pub quantum: Option<u64>,
 
+    /// Run each guest thread on a vCPU of its own, all at once, rather than taking turns on one
+    /// (see appbox::threading). Guests this spawns do the same.
+    #[clap(long)]
+    pub parallel: bool,
+
     /// Target executable
     #[clap(required = true)]
     pub executable: String,
@@ -245,6 +250,9 @@ fn print_stack(
     Ok(())
 }
 
+/// The trace output, which every guest thread writes to.
+type Trace = Mutex<Box<dyn Write + Send>>;
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -252,10 +260,13 @@ fn main() -> Result<()> {
         .filter_level(args.verbose.log_level_filter())
         .init();
 
+    if args.parallel {
+        appbox::threading::use_parallel_vcpus();
+    }
     appbox::respawn::respawn()?;
 
     // Not stdout, which is the guest's (and a spawned guest's may well be a pipe its parent reads).
-    let mut trace: Box<dyn Write> = match &args.output {
+    let trace: Arc<Trace> = Arc::new(Mutex::new(match &args.output {
         Some(path) => Box::new(
             std::fs::OpenOptions::new()
                 .create(true)
@@ -263,7 +274,9 @@ fn main() -> Result<()> {
                 .open(path)?,
         ),
         None => Box::new(std::io::stderr()),
-    };
+    }));
+
+    writeln!(trace.lock().unwrap(), "threading: {:?}", appbox::threading::model())?;
 
     // Processes the guest spawns get their own copy of this program, running the spawned guest.
     let (executable, argv, envp) = match appbox::respawn::spawned_guest()? {
@@ -276,7 +289,7 @@ fn main() -> Result<()> {
     };
 
     let mut vm = VmManager::new()?;
-    let mut loader = appbox::loader::load_macho(&mut vm, &executable, argv, envp)?;
+    let mut loader = Arc::new(appbox::loader::load_macho(&mut vm, &executable, argv, envp)?);
 
     vm.vcpu.set_reg(av::Reg::PC, loader.entry_point)?;
     vm.vcpu
@@ -287,6 +300,45 @@ fn main() -> Result<()> {
         handler.set_quantum((quantum > 0).then(|| std::time::Duration::from_micros(quantum)));
     }
 
+    let runner: Arc<ThreadRunner> = {
+        let trace = trace.clone();
+        Arc::new(move |vm: &mut VmManager, thread: &mut GuestThread, loader: &Loader| {
+            run_thread(vm, thread, loader, &trace)
+        })
+    };
+    loop {
+        let exit;
+        (exit, handler) = handler.run(&mut vm, &loader, &runner)?;
+        match exit {
+            ExitKind::Exec(request) => {
+                writeln!(trace.lock().unwrap(), "exec {:?} {:?}", request.path, request.argv)?;
+                let old = Arc::into_inner(loader).expect("no guest threads are left");
+                let new;
+                (vm, new) = appbox::exec::exec(vm, old, &mut handler, &request)?;
+                loader = Arc::new(new);
+            }
+            exit => {
+                writeln!(trace.lock().unwrap(), "VM exited: {:?}", exit)?;
+                break;
+            }
+        }
+    }
+
+    // Exit like the guest did, so e.g. a guest parent's waitpid() sees its status.
+    if let Some(status) = handler.exit_status() {
+        drop(vm);
+        std::process::exit(status);
+    }
+    Ok(())
+}
+
+/// Runs a guest thread's vCPU, tracing its syscalls, until the thread or the guest is done.
+fn run_thread(
+    vm: &mut VmManager,
+    thread: &mut GuestThread,
+    loader: &Loader,
+    trace: &Trace,
+) -> Result<ExitKind> {
     loop {
         let exit = match vm.run()? {
             VmRunResult::Svc => {
@@ -295,24 +347,18 @@ fn main() -> Result<()> {
                     .map(|name| name.to_string())
                     .unwrap_or_else(|| format!("<unknown 0x{:x}>", ctx.num));
                 let args = format_syscall_args(&mut vm.vma(), ctx.num, &ctx.args);
-                write!(
-                    trace,
-                    "[{}] {}({}) = ",
-                    handler.current_thread(),
-                    name,
-                    args.join(", ")
-                );
-                trace.flush()?;
+                let call = format!("[{}] {}({})", thread.current_thread(), name, args.join(", "));
 
-                let result = handler.handle_syscall(&ctx, &mut vm, &loader)?;
+                let result = thread.handle_syscall(&ctx, vm, loader)?;
+                let mut trace = trace.lock().unwrap();
                 match result.exit {
                     ExitKind::Continue if result.thread_switch.is_some() => {
                         let switch = result.thread_switch.unwrap();
-                        writeln!(trace, "<switched to thread {}>", switch.to)?;
+                        writeln!(trace, "{call} = <switched to thread {}>", switch.to)?;
                         ExitKind::Continue
                     }
                     ExitKind::Continue => {
-                        writeln!(trace, "{}", format_syscall_result(&result))?;
+                        writeln!(trace, "{call} = {}", format_syscall_result(&result))?;
                         if result.write_back {
                             debug!(
                                 "Returning x0={:x} x1={:x} cflags={:x}",
@@ -329,20 +375,20 @@ fn main() -> Result<()> {
                         ExitKind::Continue
                     }
                     _ => {
-                        writeln!(trace, "{:?}", result.exit)?;
+                        writeln!(trace, "{call} = {:?}", result.exit)?;
                         result.exit
                     }
                 }
             }
             // Nothing here sets breakpoints, so this is the guest trapping (e.g. abort()).
             VmRunResult::Brk => {
-                print_stack(&mut trace, &vm, &loader)?;
+                print_stack(&mut **trace.lock().unwrap(), vm, loader)?;
                 ExitKind::Crash("guest trap (brk)".to_string())
             }
             VmRunResult::Timer => {
-                if let Some(switch) = handler.handle_timer(&mut vm)? {
+                if let Some(switch) = thread.handle_timer(vm)? {
                     writeln!(
-                        trace,
+                        trace.lock().unwrap(),
                         "[{}] <preempted, switched to thread {}>",
                         switch.from.unwrap_or_default(),
                         switch.to
@@ -350,6 +396,7 @@ fn main() -> Result<()> {
                 }
                 ExitKind::Continue
             }
+            VmRunResult::Stopped => ExitKind::ThreadExit,
             VmRunResult::HardwareBreakpoint | VmRunResult::Step | VmRunResult::Watchpoint { .. } => {
                 ExitKind::Crash("unexpected debug exception".to_string())
             }
@@ -364,11 +411,12 @@ fn main() -> Result<()> {
                             let esr = vm.vcpu.get_sys_reg(av::SysReg::ESR_EL1)?;
                             let far = vm.vcpu.get_sys_reg(av::SysReg::FAR_EL1)?;
                             let elr = vm.vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
+                            let mut trace = trace.lock().unwrap();
                             writeln!(
                                 trace,
                                 "guest exception: ESR_EL1={esr:#x} FAR_EL1={far:#x} ELR_EL1={elr:#x}"
                             )?;
-                            print_stack(&mut trace, &vm, &loader)?;
+                            print_stack(&mut **trace, vm, loader)?;
                             ExitKind::Crash(format!("guest exception (ESR_EL1 {esr:#x})"))
                         }
                         _ => Err(ExceptionError::UnimplementedException(
@@ -387,24 +435,8 @@ fn main() -> Result<()> {
                 }
             },
         };
-
-        match exit {
-            ExitKind::Continue => continue,
-            ExitKind::Exec(request) => {
-                writeln!(trace, "exec {:?} {:?}", request.path, request.argv)?;
-                (vm, loader) = appbox::exec::exec(vm, loader, &mut handler, &request)?;
-            }
-            _ => {
-                writeln!(trace, "VM exited: {:?}", exit)?;
-                break;
-            }
+        if exit != ExitKind::Continue {
+            return Ok(exit);
         }
     }
-
-    // Exit like the guest did, so e.g. a guest parent's waitpid() sees its status.
-    if let Some(status) = handler.exit_status() {
-        drop(vm);
-        std::process::exit(status);
-    }
-    Ok(())
 }

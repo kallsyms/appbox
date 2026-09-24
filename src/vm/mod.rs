@@ -7,6 +7,7 @@ use crate::hyperpom::memory::{PhysMemAllocator, VirtMemAllocator};
 use anyhow::Result;
 use mmap_fixed_fixed::MemoryMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -27,6 +28,8 @@ pub enum VmRunResult {
     Watchpoint {
         addr: u64,
     },
+    /// The VM is being shut down (see [`SharedVm::stop`]): stop running this vCPU.
+    Stopped,
     Other(av::VcpuExit),
 }
 
@@ -188,6 +191,9 @@ pub struct SharedVm {
     hooks: Mutex<Hooks>,
     /// Host memory mapped into the VM that the VM keeps alive.
     mappings: Mutex<Vec<Rc<MemoryMap>>>,
+    /// The vCPUs that exist, to kick them out of the guest when stopping.
+    vcpus: Mutex<Vec<av::VcpuInstance>>,
+    stopping: AtomicBool,
     _vm: av::VirtualMachine,
 }
 
@@ -209,6 +215,20 @@ impl SharedVm {
 
     pub fn hooks(&self) -> MutexGuard<'_, Hooks> {
         lock(&self.hooks)
+    }
+
+    /// Has every vCPU's [`VmManager::run`] return [`VmRunResult::Stopped`], now or once it's next
+    /// called.
+    pub fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        let vcpus = lock(&self.vcpus);
+        if !vcpus.is_empty() {
+            let _ = av::Vcpu::stop(&vcpus);
+        }
+    }
+
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 }
 
@@ -247,6 +267,8 @@ impl VmManager {
             vma: Mutex::new(vma),
             hooks: Mutex::new(Hooks::new()),
             mappings: Mutex::new(Vec::new()),
+            vcpus: Mutex::new(Vec::new()),
+            stopping: AtomicBool::new(false),
             _vm: vm,
         });
         Ok(Self::with_vcpu(vcpu, shared))
@@ -260,6 +282,7 @@ impl VmManager {
     }
 
     fn with_vcpu(vcpu: av::Vcpu, shared: Arc<SharedVm>) -> Self {
+        lock(&shared.vcpus).push(vcpu.get_instance());
         Self {
             vcpu,
             shared,
@@ -516,6 +539,9 @@ impl VmManager {
 
     fn run_to_exit(&mut self) -> Result<VmRunResult> {
         loop {
+            if self.shared.stopping() {
+                return Ok(VmRunResult::Stopped);
+            }
             if self.vma().take_caches_stale() {
                 Caches::invalidate(&mut self.vcpu)?;
             }
@@ -615,6 +641,8 @@ impl VmManager {
 impl Drop for VmManager {
     fn drop(&mut self) {
         let _ = self.shutdown();
+        let instance = self.vcpu.get_instance();
+        lock(&self.shared.vcpus).retain(|&vcpu| vcpu != instance);
     }
 }
 
