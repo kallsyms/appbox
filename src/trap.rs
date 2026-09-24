@@ -551,6 +551,9 @@ impl DefaultTrapHandler {
                 self.kevents_pending(vcpu, vma, source)?;
             }
             if let Some(switch) = self.threads.switch_to_next(vcpu, from)? {
+                if !self.deliver_kevents(vcpu, vma, switch.to)? {
+                    continue;
+                }
                 return Ok(SyscallResult::switched(switch));
             }
             // As with the kernel, the process ends with its last thread. Parked workqueue threads

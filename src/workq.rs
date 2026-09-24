@@ -17,7 +17,7 @@
 //! emulated here entirely; see filt_wl* in xnu's bsd/kern/kern_event.c. Owners and QoS overrides
 //! are ignored, since only one guest thread runs at a time anyway.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -370,8 +370,10 @@ pub(crate) struct Workqueue {
     stacks: Vec<(ThreadId, u64)>,
     /// Workqueue threads waiting for work, most recently parked last.
     idle: Vec<ThreadId>,
-    /// A stack region allocated for a thread that turned out not to be needed.
-    spare_stack: Option<u64>,
+    /// Threads bound to service a kqueue, whose events are dequeued when they get on the vCPU.
+    deliveries: BTreeMap<ThreadId, Delivery>,
+    /// Idle threads that were parked again before ever running.
+    unstarted: BTreeSet<ThreadId>,
     watcher: Option<Watcher>,
     queues: BTreeMap<EventSource, EventQueue>,
 }
@@ -409,11 +411,11 @@ enum Registered {
     Wait(u64),
 }
 
-/// What a workqueue thread is started to do.
-struct Work {
-    flags: u32,
-    /// The number of kevents dequeued onto the thread's stack, and the stack top below their data.
-    kevents: Option<(usize, u64)>,
+/// Events due to a thread bound to service `source`.
+struct Delivery {
+    source: EventSource,
+    /// Changes its last servicer handed back that failed.
+    errors: Vec<KeventQos>,
 }
 
 impl DefaultTrapHandler {
@@ -480,11 +482,7 @@ impl DefaultTrapHandler {
                     (Some(flags), 1..) => {
                         for _ in 0..count {
                             let (reused, stack) = self.workq_thread_stack(vma)?;
-                            let work = Work {
-                                flags,
-                                kevents: None,
-                            };
-                            self.start_workq_thread(vcpu, vma, reused, stack, work)?;
+                            self.start_workq_thread(vcpu, vma, reused, stack, flags)?;
                         }
                         Ok(0)
                     }
@@ -532,10 +530,10 @@ impl DefaultTrapHandler {
         };
         // Failed changes go back to the thread as events, like the kernel does.
         let mut errors = Vec::new();
-        for change in changes {
+        for mut change in changes {
             let result = match source {
                 EventSource::Workloop(id) if change.filter == EVFILT_WORKLOOP => {
-                    match self.register_workloop_change(id, change, vma)? {
+                    match self.register_workloop_change(id, &mut change, vma)? {
                         Registered::Done => None,
                         Registered::Error(errno) => Some(errno),
                         Registered::Wait(_) => Some(nix::libc::EINVAL),
@@ -582,21 +580,23 @@ impl DefaultTrapHandler {
         })
     }
 
-    /// Delivers `source`'s events (and `errors` from its last servicer's changes) to a workqueue
-    /// thread, if there are any and it isn't already being serviced.
+    /// Binds a workqueue thread to service `source`'s events (and `errors` from its last
+    /// servicer's changes), if there are any and it isn't already being serviced. Like the
+    /// kernel, the events are only dequeued when the thread gets to run (see
+    /// [`Self::deliver_kevents`]): by then, other threads may have dealt with some of them.
     fn service(
         &mut self,
         vcpu: &av::Vcpu,
         vma: &mut VirtMemAllocator,
         source: EventSource,
-        mut events: Vec<KeventQos>,
+        errors: Vec<KeventQos>,
     ) -> Result<()> {
         let Some(queue) = self.workq.queues.get_mut(&source) else {
             return Ok(());
         };
         let thread_request_active = queue.thread_request.as_ref().is_some_and(|tr| tr.active);
         if queue.servicer.is_some()
-            || (events.is_empty() && !thread_request_active && !queue.host_pending)
+            || (errors.is_empty() && !thread_request_active && !queue.host_pending)
         {
             if queue.is_unused() {
                 self.workq.queues.remove(&source);
@@ -605,8 +605,27 @@ impl DefaultTrapHandler {
         }
 
         let (reused, stack) = self.workq_thread_stack(vma)?;
-        let addrs = ThreadAddrs::new(stack);
-        let queue = self.workq.queues.get_mut(&source).unwrap();
+        let flags = WQ_FLAG_THREAD_NEWSPI | WQ_FLAG_THREAD_KEVENT;
+        let id = self.start_workq_thread(vcpu, vma, reused, stack, flags)?;
+        self.workq.queues.get_mut(&source).unwrap().servicer = Some(id);
+        self.workq.deliveries.insert(id, Delivery { source, errors });
+        debug!("{source:?}: bound thread {id}");
+        Ok(())
+    }
+
+    /// Dequeues the events due to thread `id`, which was just switched to, onto its stack.
+    /// Returns false if there were none any more, in which case the thread is parked again.
+    pub(crate) fn deliver_kevents(
+        &mut self,
+        vcpu: &av::Vcpu,
+        vma: &mut VirtMemAllocator,
+        id: ThreadId,
+    ) -> Result<bool> {
+        let Some(Delivery { source, errors: mut events }) = self.workq.deliveries.remove(&id) else {
+            return Ok(true);
+        };
+        let addrs = ThreadAddrs::new(self.workq.stack(id).expect("workqueue thread"));
+        let queue = self.workq.queues.get_mut(&source).expect("serviced queue");
         let mut data_available = WQ_KEVENT_DATA_SIZE as usize;
         let mut flags = WQ_FLAG_THREAD_NEWSPI | WQ_FLAG_THREAD_KEVENT;
         match source {
@@ -663,26 +682,33 @@ impl DefaultTrapHandler {
             self.watcher()?.watch(kq, source, false)?;
         }
 
+        let started_flags = vcpu.get_reg(av::Reg::X4)? as u32;
         if count == 0 {
-            if reused.is_none() {
-                self.workq.spare_stack = Some(stack);
+            debug!("{source:?}: nothing left for thread {id}");
+            let queue = self.workq.queues.get_mut(&source).unwrap();
+            queue.servicer = None;
+            if queue.is_unused() {
+                self.workq.queues.remove(&source);
             }
-            return Ok(());
+            self.park_workq_thread();
+            if started_flags & WQ_FLAG_THREAD_TSD_BASE_SET != 0 {
+                self.workq.unstarted.insert(id);
+            }
+            return Ok(false);
         }
+
         let data_start = addrs.kevent_data + data_available as u64;
         self.note_guest_write(
             data_start,
             addrs.kevent_list + count as u64 * KEVENT_QOS_SIZE - data_start,
         );
-        let stack_top = data_start & !15;
-        let work = Work {
-            flags,
-            kevents: Some((count, stack_top)),
-        };
-        let id = self.start_workq_thread(vcpu, vma, reused, stack, work)?;
-        self.workq.queues.get_mut(&source).unwrap().servicer = Some(id);
+        let first_use = started_flags & (WQ_FLAG_THREAD_REUSE | WQ_FLAG_THREAD_TSD_BASE_SET);
+        vcpu.set_reg(av::Reg::X3, addrs.kevent_list)?;
+        vcpu.set_reg(av::Reg::X4, (flags | first_use) as u64)?;
+        vcpu.set_reg(av::Reg::X5, count as u64)?;
+        vcpu.set_sys_reg(av::SysReg::SP_EL0, data_start & !15)?;
         debug!("{source:?}: delivered {count} kevents to thread {id}");
-        Ok(())
+        Ok(true)
     }
 
     /// The thread to start next: the most recently parked idle one (with its stack), or a new
@@ -691,42 +717,36 @@ impl DefaultTrapHandler {
         if let Some(&id) = self.workq.idle.last() {
             return Ok((Some(id), self.workq.stack(id).expect("workqueue thread")));
         }
-        if let Some(stack) = self.workq.spare_stack.take() {
-            return Ok((None, stack));
-        }
         let registration = self.pthread.context("workqueue before pthread registration")?;
         let size = stack_region_size(registration.pthread_size);
         Ok((None, self.allocate_guest_memory(vma, size)?))
     }
 
     /// Makes workqueue thread `reused` (the last idle one), or a new one on `stack`, runnable
-    /// on `work`.
+    /// with upcall `flags` (and no kevents, which [`Self::deliver_kevents`] adds).
     fn start_workq_thread(
         &mut self,
         vcpu: &av::Vcpu,
         vma: &mut VirtMemAllocator,
         reused: Option<ThreadId>,
         stack: u64,
-        work: Work,
+        flags: u32,
     ) -> Result<ThreadId> {
         let registration = self.pthread.context("workqueue before pthread registration")?;
         let addrs = ThreadAddrs::new(stack);
-        let (kevent_list, kevent_count, stack_top) = match work.kevents {
-            Some((count, stack_top)) => (addrs.kevent_list, count, stack_top),
-            None => (0, 0, addrs.pthread & !15),
-        };
-        let flags = work.flags
-            | if reused.is_some() {
-                WQ_FLAG_THREAD_REUSE
-            } else {
+        let first_use = reused.is_none_or(|id| self.workq.unstarted.remove(&id));
+        let flags = flags
+            | if first_use {
                 WQ_FLAG_THREAD_TSD_BASE_SET
+            } else {
+                WQ_FLAG_THREAD_REUSE
             };
         let template = Registers::save_at_syscall(vcpu)?;
         let tsd = addrs.pthread + registration.tsd_offset as u64;
         let regs = |port: u32| {
             let mut regs = Registers {
                 pc: registration.wq_thread,
-                sp: stack_top,
+                sp: addrs.pthread & !15,
                 // The EL0 mode the other threads run in, without condition flags.
                 cpsr: template.cpsr & !(0b1111 << 28),
                 fpcr: template.fpcr,
@@ -737,9 +757,9 @@ impl DefaultTrapHandler {
                 addrs.pthread,
                 port as u64,
                 addrs.stack_bottom,
-                kevent_list,
+                0,
                 flags as u64,
-                kevent_count as u64,
+                0,
             ]);
             regs
         };
@@ -803,9 +823,9 @@ impl DefaultTrapHandler {
         let mut wait = None;
         let changes = read_kevents(vma, changelist, nchanges)?;
         let last = changes.len().saturating_sub(1);
-        for (i, change) in changes.into_iter().enumerate() {
+        for (i, mut change) in changes.into_iter().enumerate() {
             let result = if change.filter == EVFILT_WORKLOOP {
-                match self.register_workloop_change(id, change, vma)? {
+                match self.register_workloop_change(id, &mut change, vma)? {
                     Registered::Done => None,
                     Registered::Error(errno) => Some(errno),
                     // Like the kernel, only supported as the last change, with room for errors.
@@ -909,7 +929,7 @@ impl DefaultTrapHandler {
     fn register_workloop_change(
         &mut self,
         id: u64,
-        mut kev: KeventQos,
+        kev: &mut KeventQos,
         vma: &VirtMemAllocator,
     ) -> Result<Registered> {
         let requested_flags = kev.flags;
@@ -987,7 +1007,7 @@ impl DefaultTrapHandler {
             if is_thread_request {
                 kev.flags |= EV_CLEAR;
                 queue.thread_request = Some(ThreadRequest {
-                    event: kev,
+                    event: *kev,
                     active: true,
                 });
                 return Ok(Registered::Done);
@@ -1068,7 +1088,7 @@ impl DefaultTrapHandler {
                 } else {
                     tr.event.qos
                 },
-                ..kev
+                ..*kev
             };
             tr.active = true;
             return Ok(Registered::Done);
