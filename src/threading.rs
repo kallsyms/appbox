@@ -1,17 +1,17 @@
 //! How a guest's threads map onto vCPUs; see [`ThreadingModel`].
 
-/// How a [`DefaultTrapHandler`](crate::trap::DefaultTrapHandler) runs a guest's threads.
+/// How a guest's threads run.
 ///
 /// Processes the guest spawns use the same model as the one that spawned them, whatever their
 /// embedder asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadingModel {
-    /// One vCPU, which guest threads take turns on (see [`crate::threads`]): one runs at a time
-    /// and appbox decides when threads switch, so a run can be recorded and replayed exactly.
+    /// One vCPU, which guest threads take turns on: one runs at a time and a
+    /// [`Scheduler`](crate::guest::Scheduler) decides when threads switch, so a run can be
+    /// recorded and replayed exactly.
     TimeShared,
-    /// A vCPU per guest thread, on a host thread of its own, all running at once (see
-    /// [`crate::runner`]). Guests then race as they would natively, so they can't be recorded and
-    /// replayed, nor checkpointed.
+    /// A vCPU per guest thread, on a host thread of its own, all running at once. Guests then
+    /// race as they would natively, so they can't be recorded and replayed, nor checkpointed.
     Parallel,
 }
 

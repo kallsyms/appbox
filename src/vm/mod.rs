@@ -1,4 +1,3 @@
-use self::hooks::Hooks;
 use crate::hyperpom::applevisor as av;
 use crate::hyperpom::caches::Caches;
 use crate::hyperpom::exceptions::ExceptionClass;
@@ -12,7 +11,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 mod exclusive;
-pub mod hooks;
 
 pub enum VmRunResult {
     Svc,
@@ -184,11 +182,9 @@ impl Watchpoint {
     }
 }
 
-/// What a VM's vCPUs share: guest memory and its page tables, software breakpoints (which are in
-/// guest memory), and the VM itself.
+/// What a VM's vCPUs share: guest memory and its page tables, and the VM itself.
 pub struct SharedVm {
     vma: Mutex<VirtMemAllocator>,
-    hooks: Mutex<Hooks>,
     /// Host memory mapped into the VM that the VM keeps alive.
     mappings: Mutex<Vec<Rc<MemoryMap>>>,
     /// The vCPUs that exist, to kick them out of the guest when stopping.
@@ -211,10 +207,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl SharedVm {
     pub fn vma(&self) -> MutexGuard<'_, VirtMemAllocator> {
         lock(&self.vma)
-    }
-
-    pub fn hooks(&self) -> MutexGuard<'_, Hooks> {
-        lock(&self.hooks)
     }
 
     /// Has every vCPU's [`VmManager::run`] return [`VmRunResult::Stopped`], now or once it's next
@@ -265,7 +257,6 @@ impl VmManager {
 
         let shared = Arc::new(SharedVm {
             vma: Mutex::new(vma),
-            hooks: Mutex::new(Hooks::new()),
             mappings: Mutex::new(Vec::new()),
             vcpus: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
@@ -303,33 +294,6 @@ impl VmManager {
     /// Guest memory, shared by all the VM's vCPUs.
     pub fn vma(&self) -> MutexGuard<'_, VirtMemAllocator> {
         self.shared.vma()
-    }
-
-    /// Software breakpoints, shared by all the VM's vCPUs.
-    pub fn hooks(&self) -> MutexGuard<'_, Hooks> {
-        self.shared.hooks()
-    }
-
-    /// See [`Hooks::add_breakpoint`].
-    pub fn add_breakpoint(&self, addr: u64) -> Result<()> {
-        self.hooks().add_breakpoint(addr, &mut self.vma())
-    }
-
-    /// See [`Hooks::remove_breakpoint`].
-    pub fn remove_breakpoint(&self, addr: u64) -> Result<()> {
-        self.hooks().remove_breakpoint(addr, &mut self.vma())
-    }
-
-    /// See [`Hooks::prepare_for_debugger`].
-    pub fn prepare_for_debugger(&mut self) -> Result<()> {
-        let shared = self.shared.clone();
-        let result = shared.hooks().prepare_for_debugger(&mut self.vcpu, &mut shared.vma());
-        result
-    }
-
-    /// See [`Hooks::compute_step_target`].
-    pub fn compute_step_target(&self) -> Result<u64> {
-        self.hooks().compute_step_target(&self.vcpu, &self.vma())
     }
 
     /// Keeps `mapping` (mapped into the VM) alive as long as the VM.
@@ -399,6 +363,7 @@ impl VmManager {
     /// Has [`Self::run`] return [`VmRunResult::HardwareBreakpoint`] whenever the guest is about
     /// to execute `addr` at EL0, or stops doing so. Uses breakpoint slot 0; see
     /// [`Self::set_hardware_breakpoint_slot`] for the others.
+    #[cfg(test)]
     pub fn set_hardware_breakpoint(&mut self, addr: Option<u64>) -> Result<()> {
         self.set_hardware_breakpoint_slot(0, addr)
     }
@@ -503,12 +468,6 @@ impl VmManager {
         Ok(self.vma().checkpoint_memory()?)
     }
 
-    /// Announces a write to guest memory that won't go through the VM; see
-    /// [`VirtMemAllocator::log_host_write`].
-    pub fn log_host_write(&mut self, addr: u64, size: usize) {
-        self.vma().log_host_write(addr, size)
-    }
-
     /// Puts guest memory back how it was at `checkpoint`, discarding later checkpoints.
     pub fn restore_memory(&mut self, checkpoint: MemoryCheckpoint) -> Result<()> {
         anyhow::ensure!(
@@ -528,6 +487,7 @@ impl VmManager {
     }
 
     /// The memory checkpoints' saved pages' total size.
+    #[cfg(test)]
     pub fn checkpointed_bytes(&self) -> usize {
         self.vma().checkpointed_bytes()
     }
@@ -971,7 +931,7 @@ mod tests {
         let second = vm.checkpoint_memory()?;
         store_per_page(&mut vm, code, 2, data_addr, 2)?;
         let last_page = data_addr + 3 * HOST_PAGE as u64;
-        vm.log_host_write(last_page, 8);
+        vm.vma().log_host_write(last_page, 8);
         unsafe { (last_page as *mut u64).write(3) };
         assert_eq!(first_words(&data, 4), [2, 2, 1, 3]);
 

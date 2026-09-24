@@ -22,7 +22,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CStr;
 use std::io;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 const KERN_SUCCESS: u64 = 0;
 const KERN_DENIED: u64 = 53;
@@ -291,15 +290,12 @@ pub struct DefaultTrapHandler {
     pub(crate) runtime: Option<crate::runner::Runtime>,
 }
 
-/// How long a guest thread runs before others get a turn, if it doesn't block first.
-pub const DEFAULT_QUANTUM: Duration = Duration::from_millis(1);
-
-/// Changes a [`DefaultTrapHandler`] made to guest memory itself while handling syscalls, which
-/// record/replay needs as well as whatever the syscalls' arguments point to.
+/// Changes appbox made to guest memory itself while handling syscalls, which record/replay needs
+/// as well as whatever the syscalls' arguments point to.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct GuestMemoryChanges {
-    /// Memory allocated (as address and size) with [`DefaultTrapHandler::allocate_guest_memory`],
-    /// in order, e.g. workqueue threads' stacks.
+    /// Memory allocated (as address and size), in order, e.g. workqueue threads' stacks (see
+    /// [`crate::guest::ThreadCx::allocate_guest_memory`]).
     pub allocations: Vec<(u64, u64)>,
     /// Memory written (as address and length) that the syscall's arguments don't necessarily
     /// point to, e.g. kevents delivered onto a workqueue thread's stack.
@@ -481,11 +477,6 @@ impl DefaultTrapHandler {
     /// The guest thread currently on the vCPU.
     pub fn current_thread(&self) -> ThreadId {
         self.threads.current()
-    }
-
-    /// The guest's action for signal `sig`.
-    pub fn sigaction(&self, sig: usize) -> Option<&GuestSigaction> {
-        self.signals.get(sig)
     }
 
     /// Resets state the guest image owns, for replacing it on exec (see [`crate::exec`]).
@@ -1925,7 +1916,7 @@ mod tests {
         )?;
         handler.emulate_sigaction(&mut vm.vma(), sig, nsa, 0).unwrap();
         assert_eq!(
-            handler.sigaction(sig as usize),
+            handler.signals.get(sig as usize),
             Some(&GuestSigaction {
                 handler: 0x1234_5678,
                 tramp: 0x8765_4321,

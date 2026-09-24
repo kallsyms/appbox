@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::{mem, ptr};
 
 use appbox::guest::{
-    Decision, Guest, GuestEnd, Hooks, Memory as VirtMemAllocator, Program, Returned, Syscall,
+    Decision, Guest, GuestEnd, Hooks, Memory, Program, Returned, Syscall,
     ThreadCx,
 };
 use nix::sys::signal::Signal;
@@ -43,7 +43,7 @@ struct BpfSyscallContext {
 }
 
 struct HelperState {
-    vma: *mut VirtMemAllocator,
+    memory: *const Memory<'static>,
     mem_base: *mut u8,
     mem_len: usize,
 }
@@ -52,22 +52,23 @@ thread_local! {
     static HELPER_STATE: RefCell<Option<HelperState>> = RefCell::new(None);
 }
 
-struct HelperGuard;
+/// Makes `memory` available to the helpers while it lives.
+struct HelperGuard<'a>(std::marker::PhantomData<&'a Memory<'a>>);
 
-impl HelperGuard {
-    fn new(vma: &mut VirtMemAllocator, mem: &mut [u8]) -> Self {
+impl<'a> HelperGuard<'a> {
+    fn new(memory: &'a Memory<'a>, mem: &mut [u8]) -> Self {
         HELPER_STATE.with(|state| {
             *state.borrow_mut() = Some(HelperState {
-                vma,
+                memory: memory as *const Memory as *const Memory<'static>,
                 mem_base: mem.as_mut_ptr(),
                 mem_len: mem.len(),
             });
         });
-        Self
+        Self(std::marker::PhantomData)
     }
 }
 
-impl Drop for HelperGuard {
+impl Drop for HelperGuard<'_> {
     fn drop(&mut self) {
         HELPER_STATE.with(|state| {
             *state.borrow_mut() = None;
@@ -95,9 +96,9 @@ fn bpf_read_mem(addr: u64, len: u64, dst: u64, _arg4: u64, _arg5: u64) -> u64 {
             return 1;
         }
 
-        let vma = unsafe { &mut *state.vma };
+        let memory = unsafe { &*state.memory };
         let mut buf = vec![0u8; len];
-        if vma.read(addr, &mut buf).is_err() {
+        if memory.read(addr, &mut buf).is_err() {
             return 1;
         }
         unsafe {
@@ -142,7 +143,8 @@ impl Hooks for Guard {
             );
         }
         let verdict = {
-            let _guard = HelperGuard::new(&mut t.memory(), &mut self.memory);
+            let memory = t.memory();
+            let _guard = HelperGuard::new(&memory, &mut self.memory);
             self.bpf
                 .execute_program(&mut self.memory)
                 .map_err(|e| anyhow!("rbpf exec: {e}"))?

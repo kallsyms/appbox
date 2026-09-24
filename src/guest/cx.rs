@@ -2,14 +2,14 @@ use std::sync::MutexGuard;
 
 use anyhow::Result;
 
-use super::{Registers, ThreadId, Watchpoint};
+use super::{
+    Checkpoint, GuestMemoryChanges, Memory, Registers, Symbolication, ThreadId, ThreadingModel,
+    Watchpoint,
+};
 use crate::applevisor as av;
-use crate::checkpoint::Checkpoint;
-use crate::hyperpom::memory::VirtMemAllocator;
 use crate::loader::Loader;
 use crate::runner::GuestThread;
-use crate::symbols::Symbolication;
-use crate::trap::{DefaultTrapHandler, GuestMemoryChanges};
+use crate::trap::DefaultTrapHandler;
 use crate::vm::VmManager;
 
 /// Hardware breakpoint slot finding [`super::Slice::At`] targets uses; hooks get the others.
@@ -48,17 +48,13 @@ impl ThreadCx<'_> {
     }
 
     /// Guest memory (the whole guest's).
-    pub fn memory(&self) -> MutexGuard<'_, VirtMemAllocator> {
-        self.vm.vma()
+    pub fn memory(&self) -> Memory<'_> {
+        Memory(self.vm.vma())
     }
 
     /// The vCPU it's on, for what this doesn't cover.
     pub fn vcpu(&self) -> &av::Vcpu {
         &self.vm.vcpu
-    }
-
-    pub fn loader(&self) -> &Loader {
-        self.loader
     }
 
     pub fn symbolicate(&self, addr: u64) -> Option<Symbolication> {
@@ -81,10 +77,20 @@ impl ThreadCx<'_> {
         self.handler().contended()
     }
 
-    /// The trap handler the guest's threads share, for what this doesn't cover (e.g. its exit
-    /// status so far).
-    pub fn handler(&self) -> MutexGuard<'_, DefaultTrapHandler> {
+    /// How the guest's threads run (which a guest spawned inherits, whatever its embedder asked
+    /// for).
+    pub fn threading(&self) -> ThreadingModel {
+        self.handler().threading()
+    }
+
+    fn handler(&self) -> MutexGuard<'_, DefaultTrapHandler> {
         self.thread.handler()
+    }
+
+    /// Allocates `size` bytes of guest memory on the guest's behalf, as appbox does for e.g.
+    /// thread stacks (see [`Self::take_guest_memory_changes`]).
+    pub fn allocate_guest_memory(&mut self, size: u64) -> Result<u64> {
+        self.handler().allocate_guest_memory(&mut self.vm.vma(), size)
     }
 
     /// Memory appbox allocated or wrote on the guest's behalf since last asked, beyond what
@@ -125,7 +131,7 @@ impl ThreadCx<'_> {
     }
 
     /// Records the guest's state, to [`Self::restore`] later. Only for a time-shared guest with a
-    /// single thread (see [`crate::checkpoint`]).
+    /// single thread.
     pub fn checkpoint(&mut self) -> Result<Checkpoint> {
         let thread = self.thread;
         thread.handler().checkpoint(self.vm)
@@ -141,7 +147,7 @@ impl ThreadCx<'_> {
         Ok(())
     }
 
-    /// Forgets `checkpoint` (see [`DefaultTrapHandler::discard_checkpoint`]).
+    /// Forgets `checkpoint`, which can't be restored any more (but those around it still can).
     pub fn discard_checkpoint(&mut self, checkpoint: &Checkpoint) -> Result<()> {
         let thread = self.thread;
         thread.handler().discard_checkpoint(self.vm, checkpoint)

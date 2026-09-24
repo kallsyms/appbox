@@ -81,6 +81,7 @@ impl SharedCache {
     }
 
     /// The shared cache at `cache_path`, which other processes may be executing.
+    #[cfg(test)]
     pub fn new(cache_path: &Path) -> Result<Self> {
         Self::open(cache_path, cache_path, true)
     }

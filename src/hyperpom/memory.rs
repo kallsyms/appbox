@@ -20,7 +20,7 @@ use crate::hyperpom::utils::*;
 // -----------------------------------------------------------------------------------------------
 
 /// Rounds up an address to the next multiple of [`applevisor::PAGE_SIZE`].
-#[macro_export]
+#[cfg(test)]
 macro_rules! round_phys_page {
     ( $addr: expr ) => {
         (($addr as u64) + (av::PAGE_SIZE as u64 - 1)) & !(av::PAGE_SIZE as u64 - 1)
@@ -28,7 +28,7 @@ macro_rules! round_phys_page {
 }
 
 /// Truncates an address to a multiple of [`applevisor::PAGE_SIZE`].
-#[macro_export]
+#[cfg(test)]
 macro_rules! align_phys_page {
     ( $addr: expr ) => {
         $addr & !(av::PAGE_SIZE as u64 - 1)
@@ -36,7 +36,7 @@ macro_rules! align_phys_page {
 }
 
 /// Rounds up an address to the next multiple of [`VIRT_PAGE_SIZE`].
-#[macro_export]
+#[cfg(test)]
 macro_rules! round_virt_page {
     ( $addr: expr ) => {
         (($addr as u64) + (VIRT_PAGE_SIZE as u64 - 1)) & !(VIRT_PAGE_SIZE as u64 - 1)
@@ -44,7 +44,6 @@ macro_rules! round_virt_page {
 }
 
 /// Truncates an address to a multiple of [`VIRT_PAGE_SIZE`].
-#[macro_export]
 macro_rules! align_virt_page {
     ( $addr: expr ) => {
         $addr & !(VIRT_PAGE_SIZE as u64 - 1)

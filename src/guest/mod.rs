@@ -15,6 +15,7 @@
 
 mod cx;
 mod drive;
+mod memory;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -23,15 +24,18 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use nix::sys::signal::Signal;
 
+pub use crate::checkpoint::Checkpoint;
 pub use crate::exec::ExecRequest;
-pub use crate::hyperpom::memory::VirtMemAllocator as Memory;
 use crate::hyperpom::crash::ExitKind;
+pub use crate::symbols::Symbolication;
 pub use crate::threading::ThreadingModel;
 pub use crate::threads::{Registers, ThreadId, ThreadSwitch};
+pub use crate::trap::{forward_syscall, GuestMemoryChanges};
 use crate::trap::DefaultTrapHandler;
 pub use crate::vm::{WatchKind, Watchpoint};
 use crate::vm::VmManager;
 pub use cx::ThreadCx;
+pub use memory::Memory;
 
 /// How long a thread runs before others get a turn, with the default [`RoundRobin`] scheduler.
 pub const DEFAULT_QUANTUM: Duration = Duration::from_millis(1);
@@ -58,6 +62,9 @@ impl Program {
 /// of note: it re-runs the program in a child whose memory layout leaves the guest room (only
 /// the child returns from this). Returns the program to run instead of the embedder's own, if
 /// this process was started for one a guest spawned.
+///
+/// The binary must be signed with the `com.apple.security.cs.debugger` and
+/// `com.apple.security.get-task-allow` entitlements.
 pub fn prepare() -> Result<Option<Program>> {
     crate::respawn::respawn()?;
     Ok(crate::respawn::spawned_guest()?.map(|request| Program {

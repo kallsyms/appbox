@@ -1,35 +1,36 @@
 // For passing SIMD registers to Hypervisor.framework; see threads::set_simd_fp_reg.
 #![feature(simd_ffi)]
 
-pub mod commpage;
-pub mod debug;
-pub mod dyld;
-pub mod dyld_cache_format;
-pub mod checkpoint;
-pub mod exec;
+mod commpage;
+mod debug;
+mod dyld;
+mod dyld_cache_format;
+mod checkpoint;
+mod exec;
 mod fds;
 pub mod gdb;
 pub mod guest;
-pub mod layout;
-pub mod loader;
+mod layout;
+mod loader;
 mod mach;
-pub mod respawn;
-pub mod runner;
-pub mod symbols;
+mod respawn;
+mod runner;
+mod symbols;
 pub mod syscalls;
-pub mod threading;
-pub mod threads;
-pub mod trap;
-pub mod vm;
+mod threading;
+mod threads;
+mod trap;
+mod vm;
 mod workq;
 
-pub mod hyperpom;
+// Adapted from the hyperpom fuzzer, whose API is broader than appbox needs.
+#[allow(dead_code)]
+mod hyperpom;
 pub mod applevisor {
     pub use applevisor::*;
 }
 
-pub use debug::{format_user_stack, format_vm_state, unwind_user_stack};
-pub use symbols::Symbolication;
+use debug::unwind_user_stack;
 
 #[cfg(test)]
 pub(crate) mod test_support {

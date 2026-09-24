@@ -10,14 +10,6 @@
 //!
 //! Pinning needs `task_for_pid` on the child, so the binary must be signed with the
 //! `com.apple.security.cs.debugger` and `com.apple.security.get-task-allow` entitlements.
-//!
-//! ```no_run
-//! fn main() -> anyhow::Result<()> {
-//!     appbox::respawn::respawn()?;
-//!     // ... create the VM, load and run the guest ...
-//!     Ok(())
-//! }
-//! ```
 
 use std::ffi::CString;
 

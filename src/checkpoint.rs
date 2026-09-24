@@ -29,7 +29,7 @@ use crate::trap::{
 };
 use crate::vm::{MemoryCheckpoint, VmManager};
 
-/// A state of the guest that [`DefaultTrapHandler::restore`] can go back to.
+/// A state of the guest that [`crate::guest::ThreadCx::restore`] can go back to.
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
     id: u64,
@@ -153,12 +153,6 @@ impl DefaultTrapHandler {
     /// Puts the guest back how it was at `checkpoint`, discarding later checkpoints.
     pub fn restore(&mut self, vm: &mut VmManager, checkpoint: &Checkpoint) -> Result<()> {
         let index = self.checkpoint_index(checkpoint)?;
-        // Breakpoints are in guest memory, but not part of the guest's state.
-        let breakpoints = vm.hooks().breakpoints();
-        for &addr in &breakpoints {
-            vm.hooks().remove_breakpoint(addr, &mut vm.vma())?;
-        }
-
         let mut intervals = self.checkpoints.split_off(index);
         for interval in intervals.iter_mut().rev() {
             for undo in std::mem::take(&mut interval.undo).into_iter().rev() {
@@ -170,10 +164,6 @@ impl DefaultTrapHandler {
         self.restore_handler_state(target.state.clone());
         self.checkpoints.push(target);
         checkpoint.registers.restore(&vm.vcpu)?;
-
-        for addr in breakpoints {
-            vm.hooks().add_breakpoint(addr, &mut vm.vma())?;
-        }
         debug!("restored checkpoint {}", checkpoint.id);
         Ok(())
     }

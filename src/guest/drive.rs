@@ -548,10 +548,6 @@ impl<'a> Driver<'a> {
                         signal: Signal::SIGABRT,
                         reason,
                     }),
-                    other => Outcome::Ended(GuestEnd::Crashed {
-                        signal: Signal::SIGKILL,
-                        reason: format!("{other:?}"),
-                    }),
                 }
             }
             Decision::Return(returned) => {

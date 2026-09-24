@@ -245,7 +245,7 @@ impl Strace {
 
 impl Hooks for Strace {
     fn start(&mut self, t: &mut ThreadCx) -> Result<Resume> {
-        let threading = t.handler().threading();
+        let threading = t.threading();
         self.line(format_args!("threading: {threading:?}"))?;
         Ok(Resume::Continue)
     }

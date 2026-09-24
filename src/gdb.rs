@@ -1036,10 +1036,7 @@ impl GdbServer {
                     Err(_) => GdbResponse::Error(1),
                 }
             }
-            GdbCommand::WriteMemory { addr, ref data } => match t.memory().write_code(addr, data) {
-                Ok(_) => GdbResponse::Ok,
-                Err(_) => GdbResponse::Error(1),
-            },
+            GdbCommand::WriteMemory { addr, ref data } => status(t.memory().write_code(addr, data)),
             GdbCommand::ReadRegisters => GdbResponse::RegisterData(get_all_registers(t.vcpu())),
             GdbCommand::WriteRegister { reg, val } => {
                 if let Some(gdb_reg) = GdbRegister::from_index(reg) {
