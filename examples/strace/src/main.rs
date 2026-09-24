@@ -257,11 +257,21 @@ fn main() -> Result<()> {
                     .map(|name| name.to_string())
                     .unwrap_or_else(|| format!("<unknown 0x{:x}>", ctx.num));
                 let args = format_syscall_args(&mut vm.vma, ctx.num, &ctx.args);
-                print!("{}({}) = ", name, args.join(", "));
+                print!(
+                    "[{}] {}({}) = ",
+                    handler.current_thread(),
+                    name,
+                    args.join(", ")
+                );
                 std::io::stdout().flush()?;
 
                 let result = handler.handle_syscall(&ctx, &mut vm.vcpu, &mut vm.vma, &loader)?;
                 match result.exit {
+                    ExitKind::Continue if result.thread_switch.is_some() => {
+                        let switch = result.thread_switch.unwrap();
+                        println!("<switched to thread {}>", switch.to);
+                        ExitKind::Continue
+                    }
                     ExitKind::Continue => {
                         println!("{}", format_syscall_result(&result));
                         if result.write_back {

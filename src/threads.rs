@@ -10,7 +10,8 @@
 //! blocks its proxy.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -133,14 +134,18 @@ struct Job {
 /// A host thread that runs one guest thread's forwarded syscalls.
 struct Proxy {
     jobs: Sender<Job>,
+    /// The proxy's thread port name, i.e. the guest thread's.
+    port: u32,
 }
 
 impl Proxy {
     fn spawn(id: ThreadId, completions: Sender<(ThreadId, SyscallReturn)>) -> Result<Self> {
         let (jobs, pending) = channel::<Job>();
+        let (port_tx, port_rx) = channel();
         std::thread::Builder::new()
             .name(format!("appbox-guest-{id}"))
             .spawn(move || {
+                let _ = port_tx.send(unsafe { nix::libc::mach_thread_self() });
                 for job in pending {
                     let ret = forward_syscall(job.num, &job.args);
                     if completions.send((id, ret)).is_err() {
@@ -149,20 +154,57 @@ impl Proxy {
                 }
             })
             .context("spawning syscall proxy thread")?;
-        Ok(Self { jobs })
+        let port = port_rx.recv().context("syscall proxy thread exited")?;
+        Ok(Self { jobs, port })
     }
+}
+
+enum State {
+    /// On the vCPU.
+    Running,
+    Runnable(Registers),
+    /// Waiting for a syscall on its proxy; the registers are as they'll be once it returns,
+    /// apart from the return value.
+    Blocked(Registers),
 }
 
 struct Thread {
     proxy: Proxy,
     tsd: u64,
+    state: State,
 }
+
+/// A change of which guest thread is on the vCPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadSwitch {
+    /// `None` if the previous thread exited.
+    pub from: Option<ThreadId>,
+    pub to: ThreadId,
+}
+
+/// The result of forwarding a syscall for the current thread.
+pub(crate) enum Forwarded {
+    Returned(SyscallReturn),
+    /// It's still running, so the thread blocked and another was switched in.
+    Blocked(ThreadSwitch),
+}
+
+// How long a syscall can take before its thread is treated as blocked and another thread (if
+// any) is run instead.
+const BLOCKING_THRESHOLD: Duration = Duration::from_millis(1);
 
 pub(crate) struct Threads {
     threads: BTreeMap<ThreadId, Thread>,
     current: ThreadId,
+    next_id: ThreadId,
     completions: Receiver<(ThreadId, SyscallReturn)>,
     completions_tx: Sender<(ThreadId, SyscallReturn)>,
+}
+
+fn apply_return(regs: &mut Registers, (ret0, ret1, flags): SyscallReturn) {
+    regs.x[0] = ret0;
+    regs.x[1] = ret1;
+    regs.cpsr = (regs.cpsr & !(0b1111 << 28)) | flags;
 }
 
 impl Threads {
@@ -171,10 +213,12 @@ impl Threads {
         let main = Thread {
             proxy: Proxy::spawn(MAIN_THREAD, completions_tx.clone())?,
             tsd: 0,
+            state: State::Running,
         };
         Ok(Self {
             threads: BTreeMap::from([(MAIN_THREAD, main)]),
             current: MAIN_THREAD,
+            next_id: MAIN_THREAD + 1,
             completions,
             completions_tx,
         })
@@ -198,20 +242,144 @@ impl Threads {
         self.current_thread().tsd = tsd;
     }
 
-    /// Runs a syscall on the current thread's proxy, waiting for it to finish.
-    pub(crate) fn forward(&mut self, num: u64, args: &[u64; 16]) -> Result<SyscallReturn> {
+    /// Adds a runnable thread, whose initial registers `regs` gets from its thread port.
+    pub(crate) fn spawn(&mut self, regs: impl FnOnce(u32) -> Registers) -> Result<ThreadId> {
+        let id = self.next_id;
+        let proxy = Proxy::spawn(id, self.completions_tx.clone())?;
+        let regs = regs(proxy.port);
+        self.threads.insert(
+            id,
+            Thread {
+                proxy,
+                tsd: regs.tpidrro,
+                state: State::Runnable(regs),
+            },
+        );
+        self.next_id += 1;
+        Ok(id)
+    }
+
+    /// A thread's port name.
+    pub(crate) fn port(&self, id: ThreadId) -> u32 {
+        self.threads[&id].proxy.port
+    }
+
+    /// Drops every thread but the current one, as exec does.
+    pub(crate) fn retain_only_current(&mut self) {
+        let current = self.current;
+        // A proxy stuck in a syscall stays so; its completion is ignored once it arrives.
+        self.threads.retain(|&id, _| id == current);
+    }
+
+    /// Runs a syscall on the current thread's proxy. If `may_block` and it doesn't return
+    /// promptly while another thread can run, the current thread is marked blocked and another
+    /// is switched in; its result is delivered into its saved registers once it returns.
+    pub(crate) fn forward(
+        &mut self,
+        vcpu: &av::Vcpu,
+        num: u64,
+        args: &[u64; 16],
+        may_block: bool,
+    ) -> Result<Forwarded> {
         let id = self.current;
         self.current_thread()
             .proxy
             .jobs
             .send(Job { num, args: *args })
             .context("syscall proxy thread exited")?;
-        let (completed, ret) = self
-            .completions
-            .recv()
-            .context("syscall proxy thread exited")?;
-        debug_assert_eq!(completed, id);
-        Ok(ret)
+
+        let mut waited_long = !may_block;
+        loop {
+            let completion = if waited_long {
+                Some(self.completions.recv().context("syscall proxies exited")?)
+            } else {
+                match self.completions.recv_timeout(BLOCKING_THRESHOLD) {
+                    Ok(completion) => Some(completion),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => anyhow::bail!("syscall proxies exited"),
+                }
+            };
+            match completion {
+                Some((completed, ret)) if completed == id => return Ok(Forwarded::Returned(ret)),
+                Some((completed, ret)) => self.complete(completed, ret),
+                None => waited_long = true,
+            }
+            if may_block && waited_long && self.next_runnable().is_some() {
+                let regs = Registers::save_at_syscall(vcpu)?;
+                self.current_thread().state = State::Blocked(regs);
+                let switch = self.switch_to_next(vcpu, Some(id))?;
+                return Ok(Forwarded::Blocked(switch));
+            }
+        }
+    }
+
+    /// Delivers a finished syscall's result to a blocked thread, making it runnable.
+    fn complete(&mut self, id: ThreadId, ret: SyscallReturn) {
+        let Some(thread) = self.threads.get_mut(&id) else {
+            return;
+        };
+        if let State::Blocked(regs) = &mut thread.state {
+            let mut regs = std::mem::take(regs);
+            apply_return(&mut regs, ret);
+            thread.state = State::Runnable(regs);
+        }
+    }
+
+    /// The next runnable thread after the current one, in id order (wrapping around).
+    fn next_runnable(&self) -> Option<ThreadId> {
+        let runnable = |(&id, thread): (&ThreadId, &Thread)| {
+            matches!(thread.state, State::Runnable(_)).then_some(id)
+        };
+        self.threads
+            .range(self.current + 1..)
+            .find_map(runnable)
+            .or_else(|| self.threads.range(..=self.current).find_map(runnable))
+    }
+
+    /// Puts the next runnable thread on the vCPU, waiting for a blocked one to become runnable
+    /// if necessary. The current thread must already have been saved or removed.
+    fn switch_to_next(&mut self, vcpu: &av::Vcpu, from: Option<ThreadId>) -> Result<ThreadSwitch> {
+        let to = loop {
+            if let Some(id) = self.next_runnable() {
+                break id;
+            }
+            let (completed, ret) = self.completions.recv().context("syscall proxies exited")?;
+            self.complete(completed, ret);
+        };
+        let thread = self.threads.get_mut(&to).expect("runnable thread exists");
+        let State::Runnable(regs) = std::mem::replace(&mut thread.state, State::Running) else {
+            unreachable!("next_runnable returned a runnable thread");
+        };
+        regs.restore(vcpu)?;
+        vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, thread.tsd)?;
+        self.current = to;
+        Ok(ThreadSwitch { from, to })
+    }
+
+    /// Lets another runnable thread run, if there is one. The current thread is at a syscall
+    /// that has returned `ret`.
+    pub(crate) fn yield_current(
+        &mut self,
+        vcpu: &av::Vcpu,
+        ret: SyscallReturn,
+    ) -> Result<Option<ThreadSwitch>> {
+        if self.next_runnable().is_none() {
+            return Ok(None);
+        }
+        let mut regs = Registers::save_at_syscall(vcpu)?;
+        apply_return(&mut regs, ret);
+        let id = self.current;
+        self.current_thread().state = State::Runnable(regs);
+        self.switch_to_next(vcpu, Some(id)).map(Some)
+    }
+
+    /// Removes the current thread and switches to another. `None` if it was the last one.
+    pub(crate) fn exit_current(&mut self, vcpu: &av::Vcpu) -> Result<Option<ThreadSwitch>> {
+        self.threads.remove(&self.current);
+        if self.threads.is_empty() {
+            return Ok(None);
+        }
+        self.switch_to_next(vcpu, None).map(Some)
     }
 }
 
@@ -254,16 +422,22 @@ mod tests {
 
     #[test]
     fn forwards_syscalls_on_a_proxy_thread() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let vm = VmManager::new()?;
         let mut threads = Threads::new()?;
         let args = [0u64; 16];
+        let mut forward = |num| match threads.forward(&vm.vcpu, num, &args, true)? {
+            Forwarded::Returned(ret) => Ok::<_, anyhow::Error>(ret),
+            Forwarded::Blocked(_) => panic!("blocked with no other threads"),
+        };
 
-        let (pid, _, flags) = threads.forward(crate::syscalls::SYS_getpid, &args)?;
+        let (pid, _, flags) = forward(crate::syscalls::SYS_getpid)?;
         assert_eq!(flags & (1 << 29), 0);
         assert_eq!(pid, std::process::id() as u64);
 
         // thread_selfid identifies the calling kernel thread, which must be the proxy.
-        let (proxy_tid, _, _) = threads.forward(crate::syscalls::SYS_thread_selfid, &args)?;
-        let (again, _, _) = threads.forward(crate::syscalls::SYS_thread_selfid, &args)?;
+        let (proxy_tid, _, _) = forward(crate::syscalls::SYS_thread_selfid)?;
+        let (again, _, _) = forward(crate::syscalls::SYS_thread_selfid)?;
         let mut own_tid = 0u64;
         unsafe { nix::libc::pthread_threadid_np(0, &mut own_tid) };
         assert_eq!(proxy_tid, again);

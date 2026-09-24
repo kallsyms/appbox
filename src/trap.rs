@@ -8,7 +8,7 @@ use crate::mach::{
     mach_vm_allocate, mach_vm_deallocate, mach_vm_map, mach_vm_read_overwrite, VM_FLAGS_OVERWRITE,
 };
 use crate::syscalls;
-use crate::threads::Threads;
+use crate::threads::{Forwarded, Registers, ThreadSwitch, Threads, MAIN_THREAD};
 use anyhow::{Context, Result};
 use log::{debug, error, trace, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -105,6 +105,9 @@ pub struct SyscallResult {
     pub cflags: u64,
     pub exit: ExitKind,
     pub write_back: bool,
+    /// Set if a different guest thread is now on the vCPU (whose registers are already in
+    /// place, so there's nothing to write back).
+    pub thread_switch: Option<ThreadSwitch>,
 }
 
 impl SyscallResult {
@@ -115,6 +118,7 @@ impl SyscallResult {
             cflags,
             exit: ExitKind::Continue,
             write_back: true,
+            thread_switch: None,
         }
     }
 
@@ -125,6 +129,18 @@ impl SyscallResult {
             cflags: 0,
             exit,
             write_back: false,
+            thread_switch: None,
+        }
+    }
+
+    pub fn switched(switch: ThreadSwitch) -> Self {
+        Self {
+            ret0: 0,
+            ret1: 0,
+            cflags: 0,
+            exit: ExitKind::Continue,
+            write_back: false,
+            thread_switch: Some(switch),
         }
     }
 }
@@ -230,6 +246,7 @@ pub struct DefaultTrapHandler {
     map_fixed_next: u64,
     mappings: Vec<(u64, usize)>,
     threads: Threads,
+    pthread: Option<PthreadRegistration>,
     signals: [GuestSigaction; NSIG],
     exit_status: Option<i32>,
 }
@@ -252,6 +269,47 @@ pub struct GuestSigaction {
     pub validate_sigreturn: bool,
 }
 
+/// What libpthread registered with `__bsdthread_register`.
+#[derive(Clone, Copy, Default, Debug)]
+struct PthreadRegistration {
+    thread_start: u64,
+    wq_thread: u64,
+    pthread_size: u32,
+    dispatch_queue_offset: u64,
+    tsd_offset: u32,
+    mach_thread_self_offset: u32,
+}
+
+const PTHREAD_REGISTRATION_DATA_SIZE: usize = 56;
+
+// See libpthread's kern/kern_internal.h and src/pthread.c. Everything the kernel supports but
+// workloops and the cooperative workqueue.
+const PTHREAD_FEATURES: u64 = 0x01 // DISPATCHFUNC
+    | 0x02 // FINEPRIO
+    | 0x04 // BSDTHREADCTL
+    | 0x08 // SETSELF
+    | 0x10 // QOS_MAINTENANCE
+    | 0x40 // KEVENT
+    | 0x4000_0000; // QOS_DEFAULT
+const PTHREAD_START_CUSTOM: u64 = 0x0100_0000;
+const PTHREAD_START_TSD_BASE_SET: u64 = 0x1000_0000;
+const PTHREAD_START_SUSPENDED: u64 = 0x2000_0000;
+
+fn host_mutex_default_policy() -> u32 {
+    let mut value = 0u32;
+    let mut len = std::mem::size_of::<u32>();
+    unsafe {
+        nix::libc::sysctlbyname(
+            c"kern.pthread_mutex_default_policy".as_ptr(),
+            &mut value as *mut u32 as _,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    value
+}
+
 // See bsd/sys/signal.h in xnu.
 const SA_USERSPACE_MASK: i32 = 0x7f;
 const SA_VALIDATE_SIGRETURN_FROM_SIGTRAMP: i32 = 0x400;
@@ -269,6 +327,7 @@ impl DefaultTrapHandler {
             map_fixed_next,
             mappings: Vec::new(),
             threads: Threads::new()?,
+            pthread: None,
             signals: [GuestSigaction::default(); NSIG],
             exit_status: None,
         })
@@ -304,6 +363,11 @@ impl DefaultTrapHandler {
             .collect();
     }
 
+    /// The guest thread currently on the vCPU.
+    pub fn current_thread(&self) -> crate::threads::ThreadId {
+        self.threads.current()
+    }
+
     /// The guest's action for signal `sig`.
     pub fn sigaction(&self, sig: usize) -> Option<&GuestSigaction> {
         self.signals.get(sig)
@@ -312,6 +376,8 @@ impl DefaultTrapHandler {
     /// Resets state the guest image owns, for replacing it on exec (see [`crate::exec`]).
     pub fn prepare_for_exec(&mut self) {
         self.release_guest_memory();
+        self.threads.retain_only_current();
+        self.pthread = None;
         // Like the kernel: caught signals revert to their default action, ignored ones stay so.
         for action in &mut self.signals {
             if action.handler != SIG_IGN {
@@ -400,6 +466,147 @@ impl DefaultTrapHandler {
         let addr = self.map_fixed_next;
         self.map_fixed_next += size;
         addr
+    }
+
+    fn forward_to_completion(
+        &mut self,
+        vcpu: &av::Vcpu,
+        num: u64,
+        args: &[u64; 16],
+    ) -> Result<(u64, u64, u64)> {
+        match self.threads.forward(vcpu, num, args, false)? {
+            Forwarded::Returned(ret) => Ok(ret),
+            Forwarded::Blocked(_) => unreachable!("forwarding without blocking"),
+        }
+    }
+
+    /// `__bsdthread_register(threadstart, wqthread, pthsize, data, data_size, dq_offset)`:
+    /// records libpthread's entry points and offsets. Returns the supported features.
+    fn bsdthread_register(
+        &mut self,
+        vma: &mut VirtMemAllocator,
+        args: &[u64; 16],
+    ) -> std::result::Result<u64, i32> {
+        if self.pthread.is_some() {
+            return Err(nix::libc::EINVAL);
+        }
+        let (data, data_size) = (args[3], args[4] as usize);
+        let mut registration = PthreadRegistration {
+            thread_start: args[0],
+            wq_thread: args[1],
+            pthread_size: args[2] as u32,
+            dispatch_queue_offset: args[5],
+            ..Default::default()
+        };
+        if data != 0 {
+            // struct _pthread_registration_data (packed); see libpthread's kern_internal.h.
+            let mut raw = [0u8; PTHREAD_REGISTRATION_DATA_SIZE];
+            let size = data_size.min(raw.len());
+            read_guest(vma, data, &mut raw[..size]).ok_or(nix::libc::EFAULT)?;
+            let u64_at = |at: usize| u64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
+            let u32_at = |at: usize| u32::from_le_bytes(raw[at..at + 4].try_into().unwrap());
+            if u64_at(0) as usize != data_size {
+                return Err(nix::libc::EINVAL);
+            }
+            registration.dispatch_queue_offset = u64_at(8);
+            registration.tsd_offset = u32_at(24);
+            registration.mach_thread_self_offset = u32_at(32);
+
+            let mut out = raw;
+            out[0..8].copy_from_slice(&(PTHREAD_REGISTRATION_DATA_SIZE as u64).to_le_bytes());
+            // main_qos: unspecified, stack_addr_hint: none.
+            out[16..24].copy_from_slice(&0u64.to_le_bytes());
+            out[36..44].copy_from_slice(&0u64.to_le_bytes());
+            out[44..48].copy_from_slice(&host_mutex_default_policy().to_le_bytes());
+            vma.write(data, &out[..size])
+                .map_err(|_| nix::libc::EFAULT)?;
+        }
+        self.pthread = Some(registration);
+        Ok(PTHREAD_FEATURES)
+    }
+
+    /// `__bsdthread_create(func, arg, stack, pthread, flags)`: adds a guest thread starting at
+    /// libpthread's `thread_start`, as the kernel would.
+    fn bsdthread_create(
+        &mut self,
+        vcpu: &av::Vcpu,
+        vma: &mut VirtMemAllocator,
+        args: &[u64; 16],
+    ) -> Result<std::result::Result<u64, i32>> {
+        let Some(registration) = self.pthread else {
+            return Ok(Err(nix::libc::EINVAL));
+        };
+        let (func, arg, stack, pthread, flags) = (args[0], args[1], args[2], args[3], args[4]);
+        if flags & PTHREAD_START_CUSTOM == 0 {
+            return Ok(Err(nix::libc::EINVAL));
+        }
+        if flags & PTHREAD_START_SUSPENDED != 0 {
+            return Ok(Err(nix::libc::ENOTSUP));
+        }
+        let tsd = pthread + registration.tsd_offset as u64;
+        let creator = Registers::save_at_syscall(vcpu)?;
+        let id = self.threads.spawn(|port| {
+            let mut regs = Registers {
+                pc: registration.thread_start,
+                sp: stack,
+                // The creator's EL0 mode, without its condition flags.
+                cpsr: creator.cpsr & !(0b1111 << 28),
+                fpcr: creator.fpcr,
+                tpidrro: tsd,
+                ..Default::default()
+            };
+            regs.x[..6].copy_from_slice(&[
+                pthread,
+                port as u64,
+                func,
+                arg,
+                stack,
+                flags | PTHREAD_START_TSD_BASE_SET,
+            ]);
+            regs
+        })?;
+        if registration.mach_thread_self_offset != 0 {
+            let port = self.threads.port(id);
+            vma.write_qword(
+                tsd + registration.mach_thread_self_offset as u64,
+                port as u64,
+            )?;
+        }
+        debug!("created guest thread {} at {:#x}", id, func);
+        Ok(Ok(pthread))
+    }
+
+    /// `__bsdthread_terminate(stack, size, kport, sem)`: frees the thread's stack, wakes its
+    /// joiner and removes it, switching to another thread.
+    fn bsdthread_terminate(
+        &mut self,
+        vcpu: &av::Vcpu,
+        vma: &mut VirtMemAllocator,
+        loader: &Loader,
+        args: &[u64; 16],
+    ) -> Result<SyscallResult> {
+        let (stack, size, kport, sem) = (args[0], args[1], args[2] as u32, args[3] as u32);
+        // The kernel keeps the main thread's stack around (as reusable memory).
+        if stack != 0 && size != 0 && self.threads.current() != MAIN_THREAD {
+            unsafe { mach_vm_deallocate(nix::libc::mach_task_self(), stack, size) };
+            self.unmap_from_vm(vma, loader, stack, size)?;
+        }
+        if sem != 0 {
+            let mut signal_args = [0u64; 16];
+            signal_args[0] = sem as u64;
+            self.forward_to_completion(vcpu, syscalls::TRAP_semaphore_signal, &signal_args)?;
+        }
+        if kport != 0 {
+            unsafe { crate::mach::mach_port_deallocate(nix::libc::mach_task_self(), kport) };
+        }
+        match self.threads.exit_current(vcpu)? {
+            Some(switch) => Ok(SyscallResult::switched(switch)),
+            // As with the kernel, the process ends with its last thread.
+            None => {
+                self.exit_status = Some(0);
+                Ok(SyscallResult::exit(ExitKind::Exit))
+            }
+        }
     }
 
     /// `__sigaction(sig, nsa, osa)`: records the guest's action, applying only `SIG_DFL` or
@@ -590,6 +797,36 @@ impl TrapHandler for DefaultTrapHandler {
                     }
                 }
             }
+            syscalls::SYS_bsdthread_register => {
+                match self.bsdthread_register(vma, &args) {
+                    Ok(features) => ret0 = features,
+                    Err(errno) => {
+                        ret0 = errno as u64;
+                        cflags = 1 << 29;
+                    }
+                }
+                handled = true;
+            }
+            syscalls::SYS_bsdthread_create => {
+                match self.bsdthread_create(vcpu, vma, &args)? {
+                    Ok(pthread) => ret0 = pthread,
+                    Err(errno) => {
+                        ret0 = errno as u64;
+                        cflags = 1 << 29;
+                    }
+                }
+                handled = true;
+            }
+            // Forwarding these would have the host kernel start real host threads running the
+            // host's libdispatch.
+            syscalls::SYS_workq_open | syscalls::SYS_workq_kernreturn => {
+                ret0 = nix::libc::ENOTSUP as u64;
+                cflags = 1 << 29;
+                handled = true;
+            }
+            syscalls::SYS_bsdthread_terminate => {
+                return self.bsdthread_terminate(vcpu, vma, loader, &args);
+            }
             syscalls::SYS_sigaction => {
                 match self.emulate_sigaction(vma, args[0], args[1], args[2]) {
                     Ok(()) => ret0 = 0,
@@ -636,7 +873,7 @@ impl TrapHandler for DefaultTrapHandler {
                     trace!("Fixing mach_vm_allocate address to {:x}", chosen);
                     self.release_fixed_map_range(chosen, args[2])?;
                     self.write_out_address(args[1], chosen);
-                    (ret0, ret1, cflags) = self.threads.forward(num, &args)?;
+                    (ret0, ret1, cflags) = self.forward_to_completion(vcpu, num, &args)?;
                     if ret0 != KERN_SUCCESS {
                         self.restore_fixed_map_range(chosen, args[2])?;
                     }
@@ -657,7 +894,7 @@ impl TrapHandler for DefaultTrapHandler {
                     trace!("Fixing mach_vm_map address to {:x}", chosen);
                     self.release_fixed_map_range(chosen, args[2])?;
                     self.write_out_address(args[1], chosen);
-                    (ret0, ret1, cflags) = self.threads.forward(num, &args)?;
+                    (ret0, ret1, cflags) = self.forward_to_completion(vcpu, num, &args)?;
                     if ret0 != KERN_SUCCESS {
                         self.restore_fixed_map_range(chosen, args[2])?;
                     }
@@ -867,7 +1104,27 @@ impl TrapHandler for DefaultTrapHandler {
         }
 
         if !handled {
-            (ret0, ret1, cflags) = self.threads.forward(num, &args)?;
+            // The VM side of (un)mapping below has to follow its host side immediately.
+            let may_block = !matches!(
+                num,
+                syscalls::SYS_mmap
+                    | syscalls::SYS_munmap
+                    | syscalls::TRAP_mach_vm_allocate
+                    | syscalls::TRAP_mach_vm_map
+                    | syscalls::TRAP_mach_vm_deallocate
+            );
+            match self.threads.forward(vcpu, num, &args, may_block)? {
+                Forwarded::Returned(ret) => (ret0, ret1, cflags) = ret,
+                Forwarded::Blocked(switch) => return Ok(SyscallResult::switched(switch)),
+            }
+            if matches!(
+                num,
+                syscalls::TRAP_swtch_pri | syscalls::TRAP_swtch | syscalls::TRAP_thread_switch
+            ) {
+                if let Some(switch) = self.threads.yield_current(vcpu, (ret0, ret1, cflags))? {
+                    return Ok(SyscallResult::switched(switch));
+                }
+            }
             if let Some((addr, size)) = released_fixed_map_range {
                 if cflags & (1 << 29) != 0 {
                     self.restore_fixed_map_range(addr, size)?;
