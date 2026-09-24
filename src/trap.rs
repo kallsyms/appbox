@@ -418,11 +418,20 @@ impl TrapHandler for DefaultTrapHandler {
         // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/arm64/sleh.c#L1686
         // for dispatch code.
         match num {
-            syscalls::SYS_execve | syscalls::SYS___mac_execve => {
-                let request = read_exec_args(vma, args[0], args[1], args[2])
-                    .map_or(Err(nix::libc::EFAULT), |(path, argv, envp)| {
-                        ExecRequest::resolve(path, argv, envp)
-                    });
+            syscalls::SYS_execve
+            | syscalls::SYS___mac_execve
+            | syscalls::SYS_posix_spawn
+            | syscalls::SYS_fork
+            | syscalls::SYS_vfork => {
+                let request = match num {
+                    syscalls::SYS_posix_spawn => posix_spawn_exec(vma, &args),
+                    // A child would run on the host, outside the VM.
+                    syscalls::SYS_fork | syscalls::SYS_vfork => Err(nix::libc::ENOTSUP),
+                    _ => read_exec_args(vma, args[0], args[1], args[2])
+                        .map_or(Err(nix::libc::EFAULT), |(path, argv, envp)| {
+                            ExecRequest::resolve(path, argv, envp)
+                        }),
+                };
                 match request {
                     Ok(request) => return Ok(SyscallResult::exit(ExitKind::Exec(request))),
                     Err(errno) => {
@@ -911,6 +920,69 @@ fn read_guest_cstring_array(vma: &VirtMemAllocator, addr: u64) -> Option<Vec<Str
     None
 }
 
+// See bsd/sys/spawn.h, bsd/sys/spawn_internal.h and osfmk/mach/machine.h in xnu.
+const POSIX_SPAWN_SETEXEC: i16 = 0x0040;
+const CPU_TYPE_ARM64: i32 = 0x0100_000c;
+const CPU_TYPE_ANY: i32 = -1;
+const EBADARCH: i32 = 86;
+
+/// Reads a `posix_spawn()` that replaces the calling process (`POSIX_SPAWN_SETEXEC`) as an exec.
+/// Spawning a new process isn't supported, since it would run on the host outside the VM, and
+/// neither are file or port actions.
+fn posix_spawn_exec(vma: &VirtMemAllocator, args: &[u64; 16]) -> Result<ExecRequest, i32> {
+    let (path, argv, envp) =
+        read_exec_args(vma, args[1], args[3], args[4]).ok_or(nix::libc::EFAULT)?;
+    let read_u64 = |addr: u64| {
+        let mut bytes = [0u8; 8];
+        read_guest(vma, addr, &mut bytes).map(|_| u64::from_le_bytes(bytes))
+    };
+    let read_i32 = |addr: u64| {
+        let mut bytes = [0u8; 4];
+        read_guest(vma, addr, &mut bytes).map(|_| i32::from_le_bytes(bytes))
+    };
+
+    // struct _posix_spawn_args_desc: (size, pointer) pairs, starting with attributes, file
+    // actions and port actions.
+    let desc = args[2];
+    let mut flags = 0i16;
+    let mut binprefs = [0i32; 4];
+    if desc != 0 {
+        let attrs = read_u64(desc + 8).ok_or(nix::libc::EFAULT)?;
+        for actions in [desc + 24, desc + 40] {
+            let actions = read_u64(actions).ok_or(nix::libc::EFAULT)?;
+            // Both action structs start with (alloc, count).
+            if actions != 0 && read_i32(actions + 4).ok_or(nix::libc::EFAULT)? != 0 {
+                return Err(nix::libc::ENOTSUP);
+            }
+        }
+        if attrs != 0 {
+            // struct _posix_spawnattr: psa_flags at 0, psa_binprefs[4] at 16.
+            flags = read_i32(attrs).ok_or(nix::libc::EFAULT)? as i16;
+            for (i, binpref) in binprefs.iter_mut().enumerate() {
+                *binpref = read_i32(attrs + 16 + 4 * i as u64).ok_or(nix::libc::EFAULT)?;
+            }
+        }
+    }
+    if flags & POSIX_SPAWN_SETEXEC == 0 {
+        return Err(nix::libc::ENOTSUP);
+    }
+    let binprefs: Vec<i32> = binprefs.into_iter().take_while(|&p| p != 0).collect();
+    if !binprefs.is_empty()
+        && !binprefs
+            .iter()
+            .any(|&p| p == CPU_TYPE_ARM64 || p == CPU_TYPE_ANY)
+    {
+        return Err(EBADARCH);
+    }
+    if flags & !POSIX_SPAWN_SETEXEC != 0 {
+        debug!(
+            "ignoring posix_spawn flags {:#x}",
+            flags & !POSIX_SPAWN_SETEXEC
+        );
+    }
+    ExecRequest::resolve(path, argv, envp)
+}
+
 fn read_exec_args(
     vma: &VirtMemAllocator,
     path: u64,
@@ -980,6 +1052,71 @@ mod tests {
         let pages = explore_pointers(&vm.vma, &[page1]);
 
         assert_eq!(pages, HashSet::from([page1, page2, page3]));
+        Ok(())
+    }
+
+    #[test]
+    fn posix_spawn_is_only_supported_as_exec() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let region = mmap_fixed_fixed::MemoryMap::new(
+            PAGE_ALIGN as usize,
+            &[
+                mmap_fixed_fixed::MapOption::MapReadable,
+                mmap_fixed_fixed::MapOption::MapWritable,
+            ],
+        )?;
+        let mut vm = VmManager::new()?;
+        let base = region.data() as u64;
+        vm.vma.map_1to1(base, region.len(), av::MemPerms::RWX)?;
+
+        let (path, arg0, arg1, argv, attrs, file_actions, desc) = (
+            base,
+            base + 0x100,
+            base + 0x108,
+            base + 0x200,
+            base + 0x300,
+            base + 0x400,
+            base + 0x500,
+        );
+        vm.vma.write(path, b"/bin/echo\0")?;
+        vm.vma.write(arg0, b"echo\0")?;
+        vm.vma.write(arg1, b"hi\0")?;
+        for (i, ptr) in [arg0, arg1, 0].into_iter().enumerate() {
+            vm.vma.write_qword(argv + 8 * i as u64, ptr)?;
+        }
+        for (i, value) in [0x100, attrs, 0x100, file_actions, 0, 0]
+            .into_iter()
+            .enumerate()
+        {
+            vm.vma.write_qword(desc + 8 * i as u64, value)?;
+        }
+        let args = {
+            let mut args = [0u64; 16];
+            args[1..5].copy_from_slice(&[path, desc, argv, 0]);
+            args
+        };
+        let set_attrs = |vm: &mut VmManager, flags: u32, binpref: u32| -> Result<()> {
+            vm.vma.write_dword(attrs, flags)?;
+            vm.vma.write_dword(attrs + 16, binpref)?;
+            Ok(())
+        };
+        const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+
+        set_attrs(&mut vm, POSIX_SPAWN_SETEXEC as u32, CPU_TYPE_ARM64 as u32)?;
+        let request = posix_spawn_exec(&vm.vma, &args).unwrap();
+        assert_eq!(request.path, std::path::PathBuf::from("/bin/echo"));
+        assert_eq!(request.argv, vec!["echo".to_string(), "hi".to_string()]);
+
+        set_attrs(&mut vm, 0, 0)?;
+        assert_eq!(posix_spawn_exec(&vm.vma, &args), Err(nix::libc::ENOTSUP));
+
+        set_attrs(&mut vm, POSIX_SPAWN_SETEXEC as u32, CPU_TYPE_X86_64)?;
+        assert_eq!(posix_spawn_exec(&vm.vma, &args), Err(EBADARCH));
+
+        set_attrs(&mut vm, POSIX_SPAWN_SETEXEC as u32, 0)?;
+        vm.vma.write_dword(file_actions + 4, 1)?;
+        assert_eq!(posix_spawn_exec(&vm.vma, &args), Err(nix::libc::ENOTSUP));
         Ok(())
     }
 
