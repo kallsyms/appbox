@@ -11,6 +11,7 @@ use crate::mach::{
 };
 use crate::syscalls;
 use crate::threads::{Forwarded, Registers, ThreadId, ThreadSwitch, Threads, MAIN_THREAD};
+use crate::vm::VmManager;
 use crate::workq::{WorkqReturn, Workqueue, KEVENT_FLAG_WORKQ};
 use anyhow::{Context, Result};
 use log::{debug, error, trace, warn};
@@ -153,8 +154,7 @@ pub trait TrapHandler {
     fn handle_syscall(
         &mut self,
         ctx: &SyscallContext,
-        vcpu: &mut av::Vcpu,
-        vma: &mut VirtMemAllocator,
+        vm: &mut VmManager,
         loader: &Loader,
     ) -> Result<SyscallResult>;
 }
@@ -447,7 +447,13 @@ impl DefaultTrapHandler {
     /// Handles the current thread's time slice ending
     /// ([`VmRunResult::Timer`](crate::vm::VmRunResult::Timer)): switches to another thread if one
     /// is ready, returning the switch.
-    pub fn handle_timer(
+    pub fn handle_timer(&mut self, vm: &mut VmManager) -> Result<Option<ThreadSwitch>> {
+        let shared = vm.shared().clone();
+        let switch = self.timer(&vm.vcpu, &mut shared.vma());
+        switch
+    }
+
+    fn timer(
         &mut self,
         vcpu: &av::Vcpu,
         vma: &mut VirtMemAllocator,
@@ -888,6 +894,19 @@ impl DefaultTrapHandler {
 
 impl TrapHandler for DefaultTrapHandler {
     fn handle_syscall(
+        &mut self,
+        ctx: &SyscallContext,
+        vm: &mut VmManager,
+        loader: &Loader,
+    ) -> Result<SyscallResult> {
+        let shared = vm.shared().clone();
+        let result = self.syscall(ctx, &mut vm.vcpu, &mut shared.vma(), loader);
+        result
+    }
+}
+
+impl DefaultTrapHandler {
+    fn syscall(
         &mut self,
         ctx: &SyscallContext,
         vcpu: &mut av::Vcpu,
@@ -1736,14 +1755,14 @@ mod tests {
         let page3 = 0x1000_2000;
 
         for page in [page1, page2, page3] {
-            vm.vma.map(page, 0x1000, av::MemPerms::RWX)?;
+            vm.vma().map(page, 0x1000, av::MemPerms::RWX)?;
         }
 
-        vm.vma.write_qword(page1, page2 + 0x20)?;
-        vm.vma.write_qword(page1 + 8, 0xdead_beef)?;
-        vm.vma.write_qword(page2 + 0x20, page3 + 0x40)?;
+        vm.vma().write_qword(page1, page2 + 0x20)?;
+        vm.vma().write_qword(page1 + 8, 0xdead_beef)?;
+        vm.vma().write_qword(page2 + 0x20, page3 + 0x40)?;
 
-        let pages = explore_pointers(&vm.vma, &[page1]);
+        let pages = explore_pointers(&vm.vma(), &[page1]);
 
         assert_eq!(pages, HashSet::from([page1, page2, page3]));
         Ok(())
@@ -1762,7 +1781,7 @@ mod tests {
         )?;
         let mut vm = VmManager::new()?;
         let base = region.data() as u64;
-        vm.vma.map_1to1(base, region.len(), av::MemPerms::RWX)?;
+        vm.vma().map_1to1(base, region.len(), av::MemPerms::RWX)?;
 
         let (path, arg0, arg1, argv, attrs, file_actions, desc) = (
             base,
@@ -1773,17 +1792,17 @@ mod tests {
             base + 0x400,
             base + 0x500,
         );
-        vm.vma.write(path, b"/bin/echo\0")?;
-        vm.vma.write(arg0, b"echo\0")?;
-        vm.vma.write(arg1, b"hi\0")?;
+        vm.vma().write(path, b"/bin/echo\0")?;
+        vm.vma().write(arg0, b"echo\0")?;
+        vm.vma().write(arg1, b"hi\0")?;
         for (i, ptr) in [arg0, arg1, 0].into_iter().enumerate() {
-            vm.vma.write_qword(argv + 8 * i as u64, ptr)?;
+            vm.vma().write_qword(argv + 8 * i as u64, ptr)?;
         }
         for (i, value) in [0x100, attrs, 0x100, file_actions, 0, 0]
             .into_iter()
             .enumerate()
         {
-            vm.vma.write_qword(desc + 8 * i as u64, value)?;
+            vm.vma().write_qword(desc + 8 * i as u64, value)?;
         }
         let args = {
             let mut args = [0u64; 16];
@@ -1791,14 +1810,14 @@ mod tests {
             args
         };
         let set_attrs = |vm: &mut VmManager, flags: u32, binpref: u32| -> Result<()> {
-            vm.vma.write_dword(attrs, flags)?;
-            vm.vma.write_dword(attrs + 16, binpref)?;
+            vm.vma().write_dword(attrs, flags)?;
+            vm.vma().write_dword(attrs + 16, binpref)?;
             Ok(())
         };
         const CPU_TYPE_X86_64: u32 = 0x0100_0007;
 
         set_attrs(&mut vm, POSIX_SPAWN_SETEXEC as u32, CPU_TYPE_ARM64 as u32)?;
-        let spawn = read_posix_spawn(&vm.vma, &args).unwrap();
+        let spawn = read_posix_spawn(&vm.vma(), &args).unwrap();
         assert_eq!(spawn.flags, POSIX_SPAWN_SETEXEC);
         assert_eq!(spawn.request.path, std::path::PathBuf::from("/bin/echo"));
         assert_eq!(
@@ -1808,15 +1827,15 @@ mod tests {
         assert_eq!(spawn.file_actions, None);
 
         set_attrs(&mut vm, 0, 0)?;
-        assert_eq!(read_posix_spawn(&vm.vma, &args).unwrap().flags, 0);
+        assert_eq!(read_posix_spawn(&vm.vma(), &args).unwrap().flags, 0);
 
         set_attrs(&mut vm, POSIX_SPAWN_SETEXEC as u32, CPU_TYPE_X86_64)?;
-        assert_eq!(read_posix_spawn(&vm.vma, &args).err(), Some(EBADARCH));
+        assert_eq!(read_posix_spawn(&vm.vma(), &args).err(), Some(EBADARCH));
 
         set_attrs(&mut vm, 0, 0)?;
-        vm.vma.write_dword(file_actions + 4, 1)?;
+        vm.vma().write_dword(file_actions + 4, 1)?;
         assert_eq!(
-            read_posix_spawn(&vm.vma, &args).unwrap().file_actions,
+            read_posix_spawn(&vm.vma(), &args).unwrap().file_actions,
             Some(file_actions)
         );
         Ok(())
@@ -1835,19 +1854,19 @@ mod tests {
         )?;
         let mut vm = VmManager::new()?;
         let (nsa, osa) = (region.data() as u64, region.data() as u64 + 0x100);
-        vm.vma.map_1to1(nsa, region.len(), av::MemPerms::RWX)?;
+        vm.vma().map_1to1(nsa, region.len(), av::MemPerms::RWX)?;
         let mut handler = DefaultTrapHandler::new()?;
         let sig = nix::libc::SIGUSR1 as u64;
 
         // struct __sigaction: handler, tramp, mask, flags.
-        vm.vma.write_qword(nsa, 0x1234_5678)?;
-        vm.vma.write_qword(nsa + 8, 0x8765_4321)?;
-        vm.vma.write_dword(nsa + 16, 0x4)?;
-        vm.vma.write_dword(
+        vm.vma().write_qword(nsa, 0x1234_5678)?;
+        vm.vma().write_qword(nsa + 8, 0x8765_4321)?;
+        vm.vma().write_dword(nsa + 16, 0x4)?;
+        vm.vma().write_dword(
             nsa + 20,
             (nix::libc::SA_RESTART | SA_VALIDATE_SIGRETURN_FROM_SIGTRAMP) as u32,
         )?;
-        handler.emulate_sigaction(&mut vm.vma, sig, nsa, 0).unwrap();
+        handler.emulate_sigaction(&mut vm.vma(), sig, nsa, 0).unwrap();
         assert_eq!(
             handler.sigaction(sig as usize),
             Some(&GuestSigaction {
@@ -1863,12 +1882,12 @@ mod tests {
         unsafe { nix::libc::sigaction(sig as i32, std::ptr::null(), &mut host_action) };
         assert_eq!(host_action.sa_sigaction, SIG_DFL as usize);
 
-        handler.emulate_sigaction(&mut vm.vma, sig, 0, osa).unwrap();
-        assert_eq!(vm.vma.read_qword(osa)?, 0x1234_5678);
-        assert_eq!(vm.vma.read_dword(osa + 8)?, 0x4);
+        handler.emulate_sigaction(&mut vm.vma(), sig, 0, osa).unwrap();
+        assert_eq!(vm.vma().read_qword(osa)?, 0x1234_5678);
+        assert_eq!(vm.vma().read_dword(osa + 8)?, 0x4);
 
         assert_eq!(
-            handler.emulate_sigaction(&mut vm.vma, nix::libc::SIGKILL as u64, nsa, 0),
+            handler.emulate_sigaction(&mut vm.vma(), nix::libc::SIGKILL as u64, nsa, 0),
             Err(nix::libc::EINVAL)
         );
         Ok(())
@@ -1880,15 +1899,15 @@ mod tests {
 
         let mut vm = VmManager::new()?;
         let page = 0x1000_0000;
-        vm.vma.map(page, 0x1000, av::MemPerms::RWX)?;
+        vm.vma().map(page, 0x1000, av::MemPerms::RWX)?;
 
         // Like a guest guard range: mapped into the guest, but PROT_NONE on the host.
         let guard = mmap_fixed_fixed::MemoryMap::new(PAGE_ALIGN as usize, &[])?;
-        vm.vma
+        vm.vma()
             .map_1to1_lazy(guard.data() as u64, guard.len(), av::MemPerms::RWX)?;
-        vm.vma.write_qword(page, guard.data() as u64)?;
+        vm.vma().write_qword(page, guard.data() as u64)?;
 
-        assert_eq!(explore_pointers(&vm.vma, &[page]), HashSet::from([page]));
+        assert_eq!(explore_pointers(&vm.vma(), &[page]), HashSet::from([page]));
         Ok(())
     }
 
@@ -1897,7 +1916,7 @@ mod tests {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let vm = VmManager::new()?;
-        assert!(explore_pointers(&vm.vma, &[u64::MAX, u64::MAX - 0x800]).is_empty());
+        assert!(explore_pointers(&vm.vma(), &[u64::MAX, u64::MAX - 0x800]).is_empty());
         Ok(())
     }
 }

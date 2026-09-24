@@ -228,10 +228,11 @@ mod tests {
         assert_eq!(vm.vcpu.get_reg(av::Reg::PC)?, loader.entry_point);
         let sp = vm.vcpu.get_sys_reg(av::SysReg::SP_EL0)?;
         assert_eq!(sp, loader.stack_pointer);
-        assert_eq!(vm.vma.read_qword(sp + 8)?, 2);
-        assert_eq!(vm.vma.read_cstring(vm.vma.read_qword(sp + 16)?)?, "echo");
-        assert_eq!(vm.vma.read_cstring(vm.vma.read_qword(sp + 24)?)?, "hi");
-        assert_eq!(vm.vma.read_cstring(vm.vma.read_qword(sp + 40)?)?, "K=V");
+        let vma = vm.vma();
+        assert_eq!(vma.read_qword(sp + 8)?, 2);
+        assert_eq!(vma.read_cstring(vma.read_qword(sp + 16)?)?, "echo");
+        assert_eq!(vma.read_cstring(vma.read_qword(sp + 24)?)?, "hi");
+        assert_eq!(vma.read_cstring(vma.read_qword(sp + 40)?)?, "K=V");
         Ok(())
     }
 

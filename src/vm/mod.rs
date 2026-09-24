@@ -7,6 +7,7 @@ use crate::hyperpom::memory::{PhysMemAllocator, VirtMemAllocator};
 use anyhow::Result;
 use mmap_fixed_fixed::MemoryMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 mod exclusive;
@@ -180,11 +181,43 @@ impl Watchpoint {
     }
 }
 
+/// What a VM's vCPUs share: guest memory and its page tables, software breakpoints (which are in
+/// guest memory), and the VM itself.
+pub struct SharedVm {
+    vma: Mutex<VirtMemAllocator>,
+    hooks: Mutex<Hooks>,
+    /// Host memory mapped into the VM that the VM keeps alive.
+    mappings: Mutex<Vec<Rc<MemoryMap>>>,
+    _vm: av::VirtualMachine,
+}
+
+// SAFETY: what isn't thread-safe in here is only ever reached through its mutex: the Rcs in the
+// VirtMemAllocator's slab allocator and the kept MemoryMaps aren't handed out, and the VM handle
+// is only destroyed, once, by whichever thread drops the last reference.
+unsafe impl Send for SharedVm {}
+unsafe impl Sync for SharedVm {}
+
+/// Locks `mutex`, carrying on if another thread panicked holding it.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl SharedVm {
+    pub fn vma(&self) -> MutexGuard<'_, VirtMemAllocator> {
+        lock(&self.vma)
+    }
+
+    pub fn hooks(&self) -> MutexGuard<'_, Hooks> {
+        lock(&self.hooks)
+    }
+}
+
+/// A vCPU of a VM, which only the thread that created it can use, and access to what it shares
+/// with the VM's other vCPUs (see [`SharedVm`]).
 pub struct VmManager {
+    // Dropped (destroyed) before `shared`, whose VM can't be torn down with a vCPU alive.
     pub vcpu: av::Vcpu,
-    pub vma: VirtMemAllocator,
-    pub hooks: Hooks,
-    pub(crate) mappings: Vec<Rc<MemoryMap>>,
+    shared: Arc<SharedVm>,
     stopped: bool,
     /// See [`Self::count_instructions`]: the host instructions each run costs on top of the
     /// guest's, once calibrated.
@@ -195,35 +228,90 @@ pub struct VmManager {
     /// By slot.
     breakpoints: Vec<Option<u64>>,
     watchpoints: Vec<Option<Watchpoint>>,
-    // Drop vCPU before VM; VM teardown fails if vCPU is still alive.
-    _vm: av::VirtualMachine,
 }
 
 impl VmManager {
+    /// Creates the process's VM (there can only be one at a time), with a first vCPU on the
+    /// calling thread.
     pub fn new() -> Result<Self> {
         let vm = av::VirtualMachine::new()?;
         let mut vcpu = av::Vcpu::new()?;
         let pma = PhysMemAllocator::new(0x1000_0000)?;
         let mut vma = VirtMemAllocator::new(pma)?;
-        let hooks = Hooks::new();
 
         vma.init(&mut vcpu, true)?;
         Caches::init(&mut vma)?;
         vcpu.set_reg(av::Reg::LR, 0xdeadf000)?;
 
-        Ok(Self {
+        let shared = Arc::new(SharedVm {
+            vma: Mutex::new(vma),
+            hooks: Mutex::new(Hooks::new()),
+            mappings: Mutex::new(Vec::new()),
+            _vm: vm,
+        });
+        Ok(Self::with_vcpu(vcpu, shared))
+    }
+
+    /// Adds a vCPU to `shared`'s VM, on (and only usable by) the calling thread.
+    pub fn attach(shared: &Arc<SharedVm>) -> Result<Self> {
+        let mut vcpu = av::Vcpu::new()?;
+        shared.vma().init(&mut vcpu, false)?;
+        Ok(Self::with_vcpu(vcpu, shared.clone()))
+    }
+
+    fn with_vcpu(vcpu: av::Vcpu, shared: Arc<SharedVm>) -> Self {
+        Self {
             vcpu,
-            vma,
-            hooks,
-            mappings: Vec::new(),
+            shared,
             stopped: false,
             run_overhead: None,
             guest_instructions: 0,
             stepping: false,
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
-            _vm: vm,
-        })
+        }
+    }
+
+    /// What this vCPU shares with the VM's others, for [`Self::attach`]ing more.
+    pub fn shared(&self) -> &Arc<SharedVm> {
+        &self.shared
+    }
+
+    /// Guest memory, shared by all the VM's vCPUs.
+    pub fn vma(&self) -> MutexGuard<'_, VirtMemAllocator> {
+        self.shared.vma()
+    }
+
+    /// Software breakpoints, shared by all the VM's vCPUs.
+    pub fn hooks(&self) -> MutexGuard<'_, Hooks> {
+        self.shared.hooks()
+    }
+
+    /// See [`Hooks::add_breakpoint`].
+    pub fn add_breakpoint(&self, addr: u64) -> Result<()> {
+        self.hooks().add_breakpoint(addr, &mut self.vma())
+    }
+
+    /// See [`Hooks::remove_breakpoint`].
+    pub fn remove_breakpoint(&self, addr: u64) -> Result<()> {
+        self.hooks().remove_breakpoint(addr, &mut self.vma())
+    }
+
+    /// See [`Hooks::prepare_for_debugger`].
+    pub fn prepare_for_debugger(&mut self) -> Result<()> {
+        let shared = self.shared.clone();
+        let result = shared.hooks().prepare_for_debugger(&mut self.vcpu, &mut shared.vma());
+        result
+    }
+
+    /// See [`Hooks::compute_step_target`].
+    pub fn compute_step_target(&self) -> Result<u64> {
+        self.hooks().compute_step_target(&self.vcpu, &self.vma())
+    }
+
+    /// Keeps `mapping` (mapped into the VM) alive as long as the VM.
+    pub(crate) fn keep_mapping(&self, mapping: Rc<MemoryMap>) {
+        lock(&self.shared.mappings).push(mapping);
     }
 
     fn run_once(&mut self) -> Result<()> {
@@ -384,19 +472,19 @@ impl VmManager {
     /// Records the current state of guest memory, to [`Self::restore_memory`] later; see
     /// [`VirtMemAllocator::checkpoint_memory`].
     pub fn checkpoint_memory(&mut self) -> Result<MemoryCheckpoint> {
-        Ok(self.vma.checkpoint_memory()?)
+        Ok(self.vma().checkpoint_memory()?)
     }
 
     /// Announces a write to guest memory that won't go through the VM; see
     /// [`VirtMemAllocator::log_host_write`].
     pub fn log_host_write(&mut self, addr: u64, size: usize) {
-        self.vma.log_host_write(addr, size)
+        self.vma().log_host_write(addr, size)
     }
 
     /// Puts guest memory back how it was at `checkpoint`, discarding later checkpoints.
     pub fn restore_memory(&mut self, checkpoint: MemoryCheckpoint) -> Result<()> {
         anyhow::ensure!(
-            self.vma.restore_memory(checkpoint)?,
+            self.vma().restore_memory(checkpoint)?,
             "no memory checkpoint {checkpoint:?}"
         );
         Ok(())
@@ -405,7 +493,7 @@ impl VmManager {
     /// Forgets `checkpoint`, which can't be restored any more (but those around it still can).
     pub fn discard_memory_checkpoint(&mut self, checkpoint: MemoryCheckpoint) -> Result<()> {
         anyhow::ensure!(
-            self.vma.discard_memory_checkpoint(checkpoint)?,
+            self.vma().discard_memory_checkpoint(checkpoint)?,
             "no memory checkpoint {checkpoint:?}"
         );
         Ok(())
@@ -413,7 +501,7 @@ impl VmManager {
 
     /// The memory checkpoints' saved pages' total size.
     pub fn checkpointed_bytes(&self) -> usize {
-        self.vma.checkpointed_bytes()
+        self.vma().checkpointed_bytes()
     }
 
     pub fn run(&mut self) -> Result<VmRunResult> {
@@ -428,7 +516,7 @@ impl VmManager {
 
     fn run_to_exit(&mut self) -> Result<VmRunResult> {
         loop {
-            if self.vma.take_caches_stale() {
+            if self.vma().take_caches_stale() {
                 Caches::invalidate(&mut self.vcpu)?;
             }
             // A step can't run a whole exclusive sequence, so steps through one may fail.
@@ -444,7 +532,7 @@ impl VmManager {
             if exit_info.reason == av::ExitReason::EXCEPTION {
                 match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
                     ExceptionClass::DataAbortLowerEl
-                        if self.vma.handle_checkpoint_write_fault(
+                        if self.vma().handle_checkpoint_write_fault(
                             exit_info.exception.physical_address,
                         )? =>
                     {
@@ -459,9 +547,7 @@ impl VmManager {
                         continue;
                     }
                     ExceptionClass::DataAbortLowerEl | ExceptionClass::InsAbortLowerEl
-                        if self
-                            .vma
-                            .fault_in_lazy_1to1(exit_info.exception.physical_address)? =>
+                        if self.vma().fault_in_lazy_1to1(exit_info.exception.physical_address)? =>
                     {
                         continue;
                     }
@@ -510,7 +596,7 @@ impl VmManager {
     fn resume_address(&self, pc: u64) -> u64 {
         let read = |addr| {
             let mut insn = [0; 4];
-            self.vma.read(addr, &mut insn).ok()?;
+            self.vma().read(addr, &mut insn).ok()?;
             Some(u32::from_le_bytes(insn))
         };
         exclusive::rewind_target(read, pc).unwrap_or(pc)
@@ -571,22 +657,22 @@ mod tests {
             unsafe { (page(i) as *mut u64).write(i as u64) };
         }
         let mut vm = VmManager::new()?;
-        vm.vma.map_1to1(page(0), data.len(), av::MemPerms::RWX)?;
+        vm.vma().map_1to1(page(0), data.len(), av::MemPerms::RWX)?;
 
-        vm.vma.unmap_1to1(page(1), 2 * HOST_PAGE)?;
-        assert_eq!(vm.vma.read_qword(page(0))?, 0);
-        assert_eq!(vm.vma.read_qword(page(3))?, 3);
-        assert!(vm.vma.read_qword(page(1)).is_err());
-        assert!(vm.vma.read_qword(page(2) + HOST_PAGE as u64 - 8).is_err());
+        vm.vma().unmap_1to1(page(1), 2 * HOST_PAGE)?;
+        assert_eq!(vm.vma().read_qword(page(0))?, 0);
+        assert_eq!(vm.vma().read_qword(page(3))?, 3);
+        assert!(vm.vma().read_qword(page(1)).is_err());
+        assert!(vm.vma().read_qword(page(2) + HOST_PAGE as u64 - 8).is_err());
         assert_eq!(
-            vm.vma.one_to_one_host_pages(page(0), data.len()),
+            vm.vma().one_to_one_host_pages(page(0), data.len()),
             [page(0), page(3)]
         );
 
         // And the hole can be mapped again.
-        vm.vma.map_1to1(page(1), 2 * HOST_PAGE, av::MemPerms::RWX)?;
-        assert_eq!(vm.vma.read_qword(page(2))?, 2);
-        assert_eq!(vm.vma.one_to_one_host_pages(page(0), data.len()).len(), 4);
+        vm.vma().map_1to1(page(1), 2 * HOST_PAGE, av::MemPerms::RWX)?;
+        assert_eq!(vm.vma().read_qword(page(2))?, 2);
+        assert_eq!(vm.vma().one_to_one_host_pages(page(0), data.len()).len(), 4);
         Ok(())
     }
 
@@ -605,9 +691,9 @@ mod tests {
         unsafe { (data_addr as *mut u64).write(1) };
 
         let mut vm = VmManager::new()?;
-        vm.vma
+        vm.vma()
             .map_1to1(code as u64, code_region.len(), av::MemPerms::RWX)?;
-        vm.vma
+        vm.vma()
             .map_1to1(data_addr as u64, HOST_PAGE, av::MemPerms::RWX)?;
         let cpsr = vm.vcpu.get_reg(av::Reg::CPSR)?;
         let mut run_load = |vm: &mut VmManager| -> Result<VmRunResult> {
@@ -620,13 +706,13 @@ mod tests {
         assert!(matches!(run_load(&mut vm)?, VmRunResult::Brk));
         assert_eq!(vm.vcpu.get_reg(av::Reg::X1)?, 1);
 
-        vm.vma.unmap_1to1(data_addr as u64, HOST_PAGE)?;
+        vm.vma().unmap_1to1(data_addr as u64, HOST_PAGE)?;
         drop(data_region);
         assert!(matches!(run_load(&mut vm)?, VmRunResult::Other(_)));
 
         let new_data_region = host_map(Some(data_addr), HOST_PAGE)?;
         unsafe { (new_data_region.data() as *mut u64).write(2) };
-        vm.vma
+        vm.vma()
             .map_1to1(data_addr as u64, HOST_PAGE, av::MemPerms::RWX)?;
         assert!(matches!(run_load(&mut vm)?, VmRunResult::Brk));
         assert_eq!(vm.vcpu.get_reg(av::Reg::X1)?, 2);
@@ -649,11 +735,11 @@ mod tests {
         }
 
         let mut vm = VmManager::new()?;
-        vm.vma
+        vm.vma()
             .map_1to1_lazy(region.data() as _, region.len(), av::MemPerms::RWX)?;
         for (start, end) in [(HOST_PAGE, 2 * HOST_PAGE), (3 * HOST_PAGE, region.len())] {
             let addr = unsafe { region.data().add(start) };
-            vm.vma.unmap_1to1(addr as u64, end - start)?;
+            vm.vma().unmap_1to1(addr as u64, end - start)?;
             assert_eq!(unsafe { nix::libc::munmap(addr as _, end - start) }, 0);
         }
         vm.vcpu.set_reg(av::Reg::PC, code as u64)?;
@@ -679,7 +765,7 @@ mod tests {
         }
 
         let mut vm = VmManager::new()?;
-        vm.vma
+        vm.vma()
             .map_1to1_lazy(region.data() as _, region.len(), av::MemPerms::RWX)?;
         vm.vcpu.set_reg(av::Reg::PC, code as u64)?;
         vm.vcpu.set_reg(av::Reg::X2, data as u64)?;
@@ -697,7 +783,7 @@ mod tests {
             unsafe { (region.data() as *mut u32).add(i).write(*insn) };
         }
         let mut vm = VmManager::new()?;
-        vm.vma
+        vm.vma()
             .map_1to1(region.data() as u64, HOST_PAGE, av::MemPerms::RWX)?;
         vm.vcpu.set_reg(av::Reg::PC, region.data() as u64)?;
         Ok((vm, region))
@@ -758,7 +844,7 @@ mod tests {
     /// faults.
     fn write_protected_page(vm: &mut VmManager) -> Result<MemoryMap> {
         let data = host_map(None, HOST_PAGE)?;
-        vm.vma
+        vm.vma()
             .map_1to1(data.data() as u64, data.len(), av::MemPerms::RWX)?;
         vm.checkpoint_memory()?;
         Ok(data)
@@ -776,6 +862,16 @@ mod tests {
         assert!(matches!(vm.run()?, VmRunResult::Step));
         assert_eq!(vm.vcpu.get_reg(av::Reg::PC)?, code.data() as u64 + 4);
         assert_eq!(unsafe { (data.data() as *const u64).read() }, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn a_timer_due_while_invalidating_caches_still_goes_off() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut vm, code) = vm_running(&[B_SELF])?;
+        vm.vma().write_code(code.data() as u64, &B_SELF.to_le_bytes())?;
+        vm.arm_timer(Duration::ZERO)?;
+        assert!(matches!(vm.run()?, VmRunResult::Timer));
         Ok(())
     }
 
@@ -832,7 +928,7 @@ mod tests {
         let code = code.data() as u64;
         let data = host_map(None, 4 * HOST_PAGE)?;
         unsafe { std::ptr::write_bytes(data.data(), 0xaa, data.len()) };
-        vm.vma
+        vm.vma()
             .map_1to1(data.data() as u64, data.len(), av::MemPerms::RWX)?;
         let data_addr = data.data() as u64;
         let original = u64::from_ne_bytes([0xaa; 8]);
@@ -863,7 +959,7 @@ mod tests {
         let (mut vm, code) = vm_running(&STORE_PER_PAGE)?;
         let code = code.data() as u64;
         let data = host_map(None, 2 * HOST_PAGE)?;
-        vm.vma
+        vm.vma()
             .map_1to1(data.data() as u64, data.len(), av::MemPerms::RWX)?;
         let data_addr = data.data() as u64;
 
@@ -893,7 +989,7 @@ mod tests {
         let (mut vm, code) = vm_running(&STORE_PER_PAGE)?;
         let code = code.data() as u64;
         let data = host_map(None, 2 * HOST_PAGE)?;
-        vm.vma
+        vm.vma()
             .map_1to1_lazy(data.data() as u64, data.len(), av::MemPerms::RWX)?;
         let data_addr = data.data() as u64;
 
@@ -913,7 +1009,7 @@ mod tests {
         let code = code.data() as u64;
         // Three 1MB lazy chunks, each faulted in (so mapped into the VM) separately.
         let data = host_map(None, 0x30_0000)?;
-        vm.vma
+        vm.vma()
             .map_1to1_lazy(data.data() as u64, data.len(), av::MemPerms::RWX)?;
         let pages = data.len() / HOST_PAGE;
         let data_addr = data.data() as u64;
@@ -933,7 +1029,7 @@ mod tests {
         let (mut vm, code) = vm_running(&STORE_PER_PAGE)?;
         let code = code.data() as u64;
         let data = host_map(None, 4 * HOST_PAGE)?;
-        vm.vma
+        vm.vma()
             .map_1to1(data.data() as u64, data.len(), av::MemPerms::RWX)?;
         let data_addr = data.data() as u64;
         assert!(vm.watchpoint_slots()? >= 2);

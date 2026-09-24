@@ -150,9 +150,9 @@ impl DefaultTrapHandler {
     pub fn restore(&mut self, vm: &mut VmManager, checkpoint: &Checkpoint) -> Result<()> {
         let index = self.checkpoint_index(checkpoint)?;
         // Breakpoints are in guest memory, but not part of the guest's state.
-        let breakpoints = vm.hooks.breakpoints();
+        let breakpoints = vm.hooks().breakpoints();
         for &addr in &breakpoints {
-            vm.hooks.remove_breakpoint(addr, &mut vm.vma)?;
+            vm.hooks().remove_breakpoint(addr, &mut vm.vma())?;
         }
 
         let mut intervals = self.checkpoints.split_off(index);
@@ -168,7 +168,7 @@ impl DefaultTrapHandler {
         checkpoint.registers.restore(&vm.vcpu)?;
 
         for addr in breakpoints {
-            vm.hooks.add_breakpoint(addr, &mut vm.vma)?;
+            vm.hooks().add_breakpoint(addr, &mut vm.vma())?;
         }
         debug!("restored checkpoint {}", checkpoint.id);
         Ok(())
@@ -223,7 +223,7 @@ impl DefaultTrapHandler {
         let task = unsafe { nix::libc::mach_task_self() };
         match undo {
             Undo::Created { addr, size } => {
-                vm.vma.unmap_1to1(addr, size as usize)?;
+                vm.vma().unmap_1to1(addr, size as usize)?;
                 unsafe { mach_vm_deallocate(task, addr, size) };
                 if addr >= FIXED_MAP_BASE && addr + size <= FIXED_MAP_BASE + FIXED_MAP_SIZE {
                     self.restore_fixed_map_range(addr, size)?;
@@ -252,7 +252,7 @@ impl DefaultTrapHandler {
                         contents.len(),
                     )
                 };
-                vm.vma.map_1to1(addr, size as usize, av::MemPerms::RWX)?;
+                vm.vma().map_1to1(addr, size as usize, av::MemPerms::RWX)?;
             }
             Undo::FdOpened(fd) => {
                 unsafe { nix::libc::close(fd) };
@@ -391,7 +391,7 @@ mod tests {
                 );
             };
             let ctx = read_syscall_context(&mut vm.vcpu)?;
-            let result = handler.handle_syscall(&ctx, &mut vm.vcpu, &mut vm.vma, loader)?;
+            let result = handler.handle_syscall(&ctx, vm, loader)?;
             // On arm64, traps -3 and -4 are mach_absolute_time and mach_continuous_time.
             let is_clock = ctx.num == (-3i64) as u64 || ctx.num == (-4i64) as u64;
             let ret0 = if is_clock { 0 } else { result.ret0 };
@@ -413,7 +413,7 @@ mod tests {
     }
 
     fn memory_dump(vm: &VmManager) -> std::collections::BTreeMap<u64, Vec<u8>> {
-        vm.vma
+        vm.vma()
             .lower_table
             .mapped_one_to_one_host_pages()
             .into_iter()
@@ -501,7 +501,7 @@ mod tests {
             .filter(|&&(addr, size)| !was_mapped(addr, size))
         {
             assert!(
-                vm.vma.one_to_one_host_pages(addr, size).is_empty(),
+                vm.vma().one_to_one_host_pages(addr, size).is_empty(),
                 "{addr:#x}+{size:#x}, mapped since, is still mapped"
             );
         }

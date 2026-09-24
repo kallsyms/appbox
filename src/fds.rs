@@ -243,7 +243,7 @@ mod tests {
     fn exec_closes_only_the_guests_close_on_exec_fds() {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let vm = VmManager::new().unwrap();
-        let vma = &vm.vma;
+        let vma = &vm.vma();
         let mut fds = empty();
         let embedders = std::fs::File::open("/dev/null").unwrap();
         let open = |cloexec: bool| {
@@ -273,7 +273,7 @@ mod tests {
     fn tracks_closes_and_dups() {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let vm = VmManager::new().unwrap();
-        let vma = &vm.vma;
+        let vma = &vm.vma();
         let mut fds = empty();
         let mut args = [0u64; 16];
         args[1] = nix::libc::F_DUPFD_CLOEXEC as u64;

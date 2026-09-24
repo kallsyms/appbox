@@ -350,10 +350,10 @@ impl SharedCache {
                 .iter()
                 .any(|executable| Rc::ptr_eq(executable, mapping))
             {
-                vm.vma
+                vm.vma()
                     .map_1to1_lazy(mapping.data() as _, mapping.len(), av::MemPerms::RWX)?;
             } else {
-                vm.vma
+                vm.vma()
                     .map_1to1(mapping.data() as _, mapping.len(), av::MemPerms::RWX)?;
             }
         }
@@ -1130,7 +1130,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(mapping.data(), host.as_mut_ptr(), host.len());
         }
         let mut guest = [0u8; 16];
-        vm.vma.read(addr, &mut guest)?;
+        vm.vma().read(addr, &mut guest)?;
         assert_eq!(guest, host);
 
         Ok(())

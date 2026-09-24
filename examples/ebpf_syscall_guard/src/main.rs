@@ -171,13 +171,13 @@ fn main() -> Result<()> {
                     );
                 }
 
-                let _guard = HelperGuard::new(&mut vm.vma, &mut bpf_mem);
+                let _guard = HelperGuard::new(&mut vm.vma(), &mut bpf_mem);
                 let decision = bpf_vm
                     .execute_program(&mut bpf_mem)
                     .map_err(|e| anyhow!("rbpf exec: {e}"))?;
 
                 let result = match decision {
-                    0 => handler.handle_syscall(&ctx, &mut vm.vcpu, &mut vm.vma, &loader)?,
+                    0 => handler.handle_syscall(&ctx, &mut vm, &loader)?,
                     1 => SyscallResult::cont(nix::libc::EPERM as u64, 0, 1 << 29),
                     2 => {
                         info!("Killed by eBPF policy");
@@ -207,7 +207,7 @@ fn main() -> Result<()> {
                 }
             }
             VmRunResult::Timer => {
-                handler.handle_timer(&vm.vcpu, &mut vm.vma)?;
+                handler.handle_timer(&mut vm)?;
                 ExitKind::Continue
             }
             VmRunResult::HardwareBreakpoint | VmRunResult::Step | VmRunResult::Watchpoint { .. } => {

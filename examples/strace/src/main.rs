@@ -294,7 +294,7 @@ fn main() -> Result<()> {
                 let name = appbox::syscalls::syscall_name(ctx.num)
                     .map(|name| name.to_string())
                     .unwrap_or_else(|| format!("<unknown 0x{:x}>", ctx.num));
-                let args = format_syscall_args(&mut vm.vma, ctx.num, &ctx.args);
+                let args = format_syscall_args(&mut vm.vma(), ctx.num, &ctx.args);
                 write!(
                     trace,
                     "[{}] {}({}) = ",
@@ -304,7 +304,7 @@ fn main() -> Result<()> {
                 );
                 trace.flush()?;
 
-                let result = handler.handle_syscall(&ctx, &mut vm.vcpu, &mut vm.vma, &loader)?;
+                let result = handler.handle_syscall(&ctx, &mut vm, &loader)?;
                 match result.exit {
                     ExitKind::Continue if result.thread_switch.is_some() => {
                         let switch = result.thread_switch.unwrap();
@@ -340,7 +340,7 @@ fn main() -> Result<()> {
                 ExitKind::Crash("guest trap (brk)".to_string())
             }
             VmRunResult::Timer => {
-                if let Some(switch) = handler.handle_timer(&vm.vcpu, &mut vm.vma)? {
+                if let Some(switch) = handler.handle_timer(&mut vm)? {
                     writeln!(
                         trace,
                         "[{}] <preempted, switched to thread {}>",

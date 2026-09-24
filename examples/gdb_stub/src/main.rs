@@ -96,21 +96,21 @@ fn main() -> Result<(), anyhow::Error> {
                 appbox::gdb::GdbCommand::Continue => {
                     // Remove single step breakpoint if it exists
                     if let Some(addr) = single_step_breakpoint.take() {
-                        let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+                        let _ = vm.hooks().remove_breakpoint(addr, &mut vm.vma());
                     }
                     break;
                 }
                 appbox::gdb::GdbCommand::Step => {
                     // Remove previous single step breakpoint if it exists
                     if let Some(addr) = single_step_breakpoint.take() {
-                        let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+                        let _ = vm.hooks().remove_breakpoint(addr, &mut vm.vma());
                     }
 
                     // Compute correct next PC using emulator
-                    let next_pc = vm.hooks.compute_step_target(&vm.vcpu, &vm.vma)?;
+                    let next_pc = vm.hooks().compute_step_target(&vm.vcpu, &vm.vma())?;
 
                     // Set new single step breakpoint
-                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma)?;
+                    vm.hooks().add_breakpoint(next_pc, &mut vm.vma())?;
                     single_step_breakpoint = Some(next_pc);
                     break;
                 }
@@ -125,7 +125,7 @@ fn main() -> Result<(), anyhow::Error> {
         let exit = match run_result {
             VmRunResult::Svc => {
                 let ctx = read_syscall_context(&mut vm.vcpu)?;
-                let result = handler.handle_syscall(&ctx, &mut vm.vcpu, &mut vm.vma, &loader)?;
+                let result = handler.handle_syscall(&ctx, &mut vm, &loader)?;
                 match result.exit {
                     ExitKind::Continue => {
                         if result.write_back {
@@ -143,7 +143,7 @@ fn main() -> Result<(), anyhow::Error> {
                 }
             }
             VmRunResult::Timer => {
-                handler.handle_timer(&vm.vcpu, &mut vm.vma)?;
+                handler.handle_timer(&mut vm)?;
                 ExitKind::Continue
             }
             VmRunResult::HardwareBreakpoint | VmRunResult::Step | VmRunResult::Watchpoint { .. } => {
@@ -156,14 +156,14 @@ fn main() -> Result<(), anyhow::Error> {
                 if Some(pc) == single_step_breakpoint {
                     println!("Single step completed at {:#x}", pc);
                     // Remove the single step breakpoint
-                    vm.hooks.remove_breakpoint(pc, &mut vm.vma)?;
+                    vm.hooks().remove_breakpoint(pc, &mut vm.vma())?;
                     single_step_breakpoint = None;
                     // Don't handle as normal breakpoint since we removed it
                     ExitKind::Continue
                 } else {
                     println!("Breakpoint hit at {:#x}", pc);
                     // Restore original instruction at PC for debugger visibility
-                    vm.hooks.prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)?;
+                    vm.prepare_for_debugger()?;
                     ExitKind::Continue
                 }
             }

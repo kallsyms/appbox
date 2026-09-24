@@ -2352,6 +2352,8 @@ impl VirtMemAllocator {
         if map_exceptions {
             // Maps and sets VBAR_EL1
             Exceptions::init(vcpu, self)?;
+        } else {
+            vcpu.set_sys_reg(av::SysReg::VBAR_EL1, EVTABLE_ADDR)?;
         }
         // Enables debug features for the hypervisor
         vcpu.set_trap_debug_exceptions(true)?;

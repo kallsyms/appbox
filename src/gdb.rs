@@ -967,11 +967,11 @@ pub fn handle_command(
     trace!("Handling GDB command: {:?}", cmd);
     match cmd {
         GdbCommand::AddBreakpoint { addr, .. } => {
-            vm.hooks.add_breakpoint(addr, &mut vm.vma).unwrap();
+            vm.hooks().add_breakpoint(addr, &mut vm.vma()).unwrap();
             response_sender.send(GdbResponse::Ok).unwrap();
         }
         GdbCommand::RemoveBreakpoint { addr, .. } => {
-            vm.hooks.remove_breakpoint(addr, &mut vm.vma).unwrap();
+            vm.hooks().remove_breakpoint(addr, &mut vm.vma()).unwrap();
             response_sender.send(GdbResponse::Ok).unwrap();
         }
         GdbCommand::AddWatchpoint { addr, len, kind } => {
@@ -1005,12 +1005,12 @@ pub fn handle_command(
         }
         GdbCommand::ReadMemory { addr, len } => {
             let mut data = vec![0; len];
-            match vm.vma.read(addr, &mut data) {
+            match vm.vma().read(addr, &mut data) {
                 Ok(_) => response_sender.send(GdbResponse::MemoryData(data)).unwrap(),
                 Err(_) => response_sender.send(GdbResponse::Error(1)).unwrap(),
             }
         }
-        GdbCommand::WriteMemory { addr, data } => match vm.vma.write_code(addr, &data) {
+        GdbCommand::WriteMemory { addr, data } => match vm.vma().write_code(addr, &data) {
             Ok(_) => response_sender.send(GdbResponse::Ok).unwrap(),
             Err(_) => response_sender.send(GdbResponse::Error(1)).unwrap(),
         },

@@ -138,7 +138,7 @@ pub fn unwind_user_stack(vm: &VmManager, max_frames: usize) -> Vec<u64> {
         }
 
         let mut buf = [0u8; 16];
-        if vm.vma.read(fp, &mut buf).is_err() {
+        if vm.vma().read(fp, &mut buf).is_err() {
             break;
         }
 

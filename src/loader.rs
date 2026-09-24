@@ -181,8 +181,8 @@ impl Loader {
         let mapping = Rc::new(MemoryMap::new(size, &options)?);
         self.map_fixed_next += mapping.len();
         self.mappings.push(mapping.clone());
-        vm.mappings.push(mapping.clone());
-        vm.vma
+        vm.keep_mapping(mapping.clone());
+        vm.vma()
             .map_1to1(mapping.data() as _, mapping.len(), av::MemPerms::RWX)?;
         Ok(mapping)
     }
@@ -461,61 +461,61 @@ impl Loader {
     fn setup_commpage(&mut self, vm: &mut VmManager) -> Result<()> {
         debug!("setting up commpage");
 
-        vm.vma.map(
+        vm.vma().map(
             crate::commpage::_COMM_PAGE64_BASE_ADDRESS as _,
             0x1000,
             av::MemPerms::RW,
         )?;
-        vm.vma.map(
+        vm.vma().map(
             crate::commpage::_COMM_PAGE64_RO_ADDRESS as _,
             0x1000,
             av::MemPerms::R,
         )?;
 
-        vm.vma.write(
+        vm.vma().write(
             crate::commpage::_COMM_PAGE64_BASE_ADDRESS,
             b"commpage 64-bit",
         )?;
-        vm.vma.write_word(
+        vm.vma().write_word(
             crate::commpage::_COMM_PAGE_VERSION,
             crate::commpage::_COMM_PAGE_THIS_VERSION as _,
         )?;
 
         // N.B. These are in the RO page
-        vm.vma.write_byte(
+        vm.vma().write_byte(
             crate::commpage::_COMM_PAGE_USER_PAGE_SHIFT_64,
             14, // PAGE_SIZE = 0x4000
         )?;
-        vm.vma
+        vm.vma()
             .write_byte(crate::commpage::_COMM_PAGE_KERNEL_PAGE_SHIFT, 14)?;
 
         let configured_cpus = 1u32;
         let cpu_capabilities =
             crate::commpage::kUP | (configured_cpus << crate::commpage::kNumCPUsShift);
-        vm.vma.write_dword(
+        vm.vma().write_dword(
             crate::commpage::_COMM_PAGE_CPU_CAPABILITIES,
             cpu_capabilities,
         )?;
-        vm.vma.write_qword(
+        vm.vma().write_qword(
             crate::commpage::_COMM_PAGE_CPU_CAPABILITIES64,
             cpu_capabilities as _,
         )?;
 
-        vm.vma.write_qword(
+        vm.vma().write_qword(
             crate::commpage::_COMM_PAGE_MEMORY_SIZE,
             1 * 1024 * 1024 * 1024, // TODO: no idea if correct
         )?;
 
-        vm.vma.write_byte(crate::commpage::_COMM_PAGE_NCPUS, configured_cpus as u8)?;
-        vm.vma
+        vm.vma().write_byte(crate::commpage::_COMM_PAGE_NCPUS, configured_cpus as u8)?;
+        vm.vma()
             .write_byte(crate::commpage::_COMM_PAGE_ACTIVE_CPUS, configured_cpus as u8)?;
-        vm.vma
+        vm.vma()
             .write_byte(crate::commpage::_COMM_PAGE_PHYSICAL_CPUS, configured_cpus as u8)?;
-        vm.vma
+        vm.vma()
             .write_byte(crate::commpage::_COMM_PAGE_LOGICAL_CPUS, configured_cpus as u8)?;
         // libmalloc sizes its per-cluster structures from this; zero overflows them.
         // _COMM_PAGE_CPU_TO_CLUSTER is left zeroed, mapping every CPU to cluster 0.
-        vm.vma.write_byte(crate::commpage::_COMM_PAGE_CPU_CLUSTERS, 1)?;
+        vm.vma().write_byte(crate::commpage::_COMM_PAGE_CPU_CLUSTERS, 1)?;
 
         Ok(())
     }
@@ -573,33 +573,33 @@ mod tests {
         let (vm, loader) = load_test_binary(arguments.clone(), environment.clone())?;
         let sp = loader.stack_pointer;
 
-        assert_eq!(vm.vma.read_qword(sp)?, loader.mh);
-        assert_eq!(vm.vma.read_qword(sp + 8)?, arguments.len() as u64);
+        assert_eq!(vm.vma().read_qword(sp)?, loader.mh);
+        assert_eq!(vm.vma().read_qword(sp + 8)?, arguments.len() as u64);
 
         let mut cursor = sp + 16;
         for argument in &arguments {
-            let ptr = vm.vma.read_qword(cursor)?;
-            assert_eq!(vm.vma.read_cstring(ptr)?, *argument);
+            let ptr = vm.vma().read_qword(cursor)?;
+            assert_eq!(vm.vma().read_cstring(ptr)?, *argument);
             cursor += 8;
         }
-        assert_eq!(vm.vma.read_qword(cursor)?, 0);
+        assert_eq!(vm.vma().read_qword(cursor)?, 0);
         cursor += 8;
 
         for env in &environment {
-            let ptr = vm.vma.read_qword(cursor)?;
-            assert_eq!(vm.vma.read_cstring(ptr)?, *env);
+            let ptr = vm.vma().read_qword(cursor)?;
+            assert_eq!(vm.vma().read_cstring(ptr)?, *env);
             cursor += 8;
         }
-        assert_eq!(vm.vma.read_qword(cursor)?, 0);
+        assert_eq!(vm.vma().read_qword(cursor)?, 0);
         cursor += 8;
 
         let mut apple = Vec::new();
         loop {
-            let ptr = vm.vma.read_qword(cursor)?;
+            let ptr = vm.vma().read_qword(cursor)?;
             if ptr == 0 {
                 break;
             }
-            apple.push(vm.vma.read_cstring(ptr)?);
+            apple.push(vm.vma().read_cstring(ptr)?);
             cursor += 8;
         }
 
@@ -619,35 +619,35 @@ mod tests {
         let expected_cpu_capabilities = commpage::kUP | (1 << commpage::kNumCPUsShift);
 
         let mut label = [0u8; b"commpage 64-bit".len()];
-        vm.vma
+        vm.vma()
             .read(commpage::_COMM_PAGE64_BASE_ADDRESS, &mut label)?;
         assert_eq!(&label, b"commpage 64-bit");
         assert_eq!(
-            vm.vma.read_word(commpage::_COMM_PAGE_VERSION)?,
+            vm.vma().read_word(commpage::_COMM_PAGE_VERSION)?,
             commpage::_COMM_PAGE_THIS_VERSION as u16
         );
-        assert_eq!(vm.vma.read_byte(commpage::_COMM_PAGE_NCPUS)?, 1);
-        assert_eq!(vm.vma.read_byte(commpage::_COMM_PAGE_ACTIVE_CPUS)?, 1);
-        assert_eq!(vm.vma.read_byte(commpage::_COMM_PAGE_PHYSICAL_CPUS)?, 1);
-        assert_eq!(vm.vma.read_byte(commpage::_COMM_PAGE_LOGICAL_CPUS)?, 1);
+        assert_eq!(vm.vma().read_byte(commpage::_COMM_PAGE_NCPUS)?, 1);
+        assert_eq!(vm.vma().read_byte(commpage::_COMM_PAGE_ACTIVE_CPUS)?, 1);
+        assert_eq!(vm.vma().read_byte(commpage::_COMM_PAGE_PHYSICAL_CPUS)?, 1);
+        assert_eq!(vm.vma().read_byte(commpage::_COMM_PAGE_LOGICAL_CPUS)?, 1);
         assert_eq!(
-            vm.vma.read_byte(commpage::_COMM_PAGE_USER_PAGE_SHIFT_64)?,
+            vm.vma().read_byte(commpage::_COMM_PAGE_USER_PAGE_SHIFT_64)?,
             14
         );
         assert_eq!(
-            vm.vma.read_byte(commpage::_COMM_PAGE_KERNEL_PAGE_SHIFT)?,
+            vm.vma().read_byte(commpage::_COMM_PAGE_KERNEL_PAGE_SHIFT)?,
             14
         );
         assert_eq!(
-            vm.vma.read_dword(commpage::_COMM_PAGE_CPU_CAPABILITIES)?,
+            vm.vma().read_dword(commpage::_COMM_PAGE_CPU_CAPABILITIES)?,
             expected_cpu_capabilities
         );
         assert_eq!(
-            vm.vma.read_qword(commpage::_COMM_PAGE_CPU_CAPABILITIES64)?,
+            vm.vma().read_qword(commpage::_COMM_PAGE_CPU_CAPABILITIES64)?,
             expected_cpu_capabilities as u64
         );
         assert_eq!(
-            vm.vma.read_qword(commpage::_COMM_PAGE_MEMORY_SIZE)?,
+            vm.vma().read_qword(commpage::_COMM_PAGE_MEMORY_SIZE)?,
             1024 * 1024 * 1024
         );
 
