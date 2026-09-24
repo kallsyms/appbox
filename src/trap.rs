@@ -849,6 +849,17 @@ impl TrapHandler for DefaultTrapHandler {
             }
             syscalls::SYS_mmap => {
                 args[2] &= !PROT_EXEC;
+                // Shared file mappings can't be copied into the VM page by page like private
+                // ones (see below), and hv_vm_map can refuse (or panic on) their pages. A
+                // read-only one is mapped privately instead: the only difference the guest could
+                // see is that other processes' later writes to the file don't show up.
+                let flags = args[3] as i32;
+                if flags & nix::libc::MAP_ANON == 0
+                    && flags & nix::libc::MAP_SHARED != 0
+                    && args[2] & nix::libc::PROT_WRITE as u64 == 0
+                {
+                    args[3] = ((flags & !nix::libc::MAP_SHARED) | nix::libc::MAP_PRIVATE) as u64;
+                }
                 // page align size
                 args[1] = Self::align_size(args[1]);
                 // fake fixed address
@@ -1155,7 +1166,7 @@ impl TrapHandler for DefaultTrapHandler {
                     // types the page XNU_USER_EXEC, and handing it to hv_vm_map panics the kernel.
                     // For private mappings, map lazily so pages get copied before reaching the VM.
                     // Shared file mappings can't be copied without breaking sharing, so an
-                    // executable file mapped MAP_SHARED by the guest can still panic.
+                    // executable file mapped MAP_SHARED and writable by the guest can still panic.
                     if flags & nix::libc::MAP_ANON == 0 && flags & nix::libc::MAP_PRIVATE != 0 {
                         // Lazy fault-in writes each page to force the copy.
                         let ret = unsafe {
