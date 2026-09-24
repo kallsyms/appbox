@@ -6,8 +6,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use anyhow::{bail, Result};
-use log::{debug, trace, warn};
+use anyhow::{bail, Context, Result};
+use log::{debug, info, trace, warn};
 use mmap_fixed_fixed::{MapOption, MemoryMap};
 
 use crate::hyperpom::applevisor as av;
@@ -24,11 +24,13 @@ pub struct SharedCache {
     pub reservation: Rc<MemoryMap>,
     pub slide: usize,
     pub mappings: Vec<Rc<MemoryMap>>,
-    // Subset of `mappings`. Until written, their file-backed pages are the same physical pages
-    // the host's own shared region executes, which SPTM types XNU_USER_EXEC; handing those to
-    // hv_vm_map panics the kernel (VIOLATION_ILLEGAL_MAPPING_TYPE). They're mapped into the VM
-    // lazily so only pages the guest touches get copied.
+    // Subset of `mappings`, when mapped from the system's cache files. Until written, their
+    // file-backed pages are the same physical pages the host's own shared region executes, which
+    // SPTM types XNU_USER_EXEC; handing those to hv_vm_map panics the kernel
+    // (VIOLATION_ILLEGAL_MAPPING_TYPE). They're mapped into the VM lazily so only pages the guest
+    // touches get copied. A private copy of the files (see `private_copy`) has no such pages.
     executable_mappings: Vec<Rc<MemoryMap>>,
+    executable_pages_shared: bool,
     symbol_map: Option<SymbolMap>,
 }
 
@@ -62,11 +64,25 @@ fn read_vec_at<T: Clone>(file: &File, offset: u64, count: usize) -> Result<Vec<T
 }
 
 impl SharedCache {
+    /// The system's shared cache, mapped from a private copy of its files if one can be made.
     pub fn new_system_cache() -> Result<Self> {
-        Self::new(Path::new(SYSTEM_CACHE_PATH))
+        let system_path = Path::new(SYSTEM_CACHE_PATH);
+        match private_copy(system_path) {
+            Ok(copy) => Self::open(&copy, system_path, false),
+            Err(err) => {
+                warn!("mapping the system's shared cache files, lazily: no private copy: {err:#}");
+                Self::open(system_path, system_path, true)
+            }
+        }
     }
 
+    /// The shared cache at `cache_path`, which other processes may be executing.
     pub fn new(cache_path: &Path) -> Result<Self> {
+        Self::open(cache_path, cache_path, true)
+    }
+
+    /// Maps the cache in the files at `cache_path`, which the guest is told are `system_path`.
+    fn open(cache_path: &Path, system_path: &Path, executable_pages_shared: bool) -> Result<Self> {
         debug!("loading shared cache {}", cache_path.display());
 
         let cache_file = File::open(cache_path)?;
@@ -94,6 +110,7 @@ impl SharedCache {
             slide,
             mappings: vec![],
             executable_mappings: vec![],
+            executable_pages_shared,
             symbol_map: None,
         };
         cache.map_single_cache(cache_path)?;
@@ -119,7 +136,7 @@ impl SharedCache {
         )?;
 
         let dyndata: *mut dyld_cache_dynamic_data_header = dyndata_mapping.data() as _;
-        let stat = std::fs::metadata(cache_path)?;
+        let stat = std::fs::metadata(system_path)?;
         unsafe {
             (*dyndata).magic = std::mem::transmute(*DYLD_SHARED_CACHE_DYNAMIC_DATA_MAGIC);
             (*dyndata).fsId = stat.st_dev();
@@ -127,7 +144,7 @@ impl SharedCache {
         }
 
         // TODO: cryptex path?
-        let path_bytes = cache_path.as_os_str().as_encoded_bytes();
+        let path_bytes = system_path.as_os_str().as_encoded_bytes();
         unsafe {
             (*dyndata).cachePathOffset =
                 std::mem::size_of::<dyld_cache_dynamic_data_header>() as u32;
@@ -294,7 +311,7 @@ impl SharedCache {
             }
 
             let mapping = Rc::new(mapping);
-            if mapping_info.maxProt & VM_PROT_EXECUTE != 0 {
+            if self.executable_pages_shared && mapping_info.maxProt & VM_PROT_EXECUTE != 0 {
                 self.executable_mappings.push(mapping.clone());
             }
             self.mappings.push(mapping);
@@ -328,6 +345,68 @@ impl SharedCache {
         }
         Ok(())
     }
+}
+
+/// Where private copies of the system shared cache are kept, one directory per cache UUID.
+fn private_copies_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("APPBOX_SHARED_CACHE_DIR") {
+        return Ok(dir.into());
+    }
+    let home = std::env::var_os("HOME").context("HOME isn't set")?;
+    Ok(PathBuf::from(home).join("Library/Caches/appbox/dyld"))
+}
+
+/// A copy of the shared cache files at `system_path` (the main one; its subcaches are beside it),
+/// made unless there already is one of this cache (by UUID). Nothing ever maps the copy
+/// executable, so unlike the system's files, its pages can be mapped into the VM as they are, and
+/// the kernel can page them in and out and share them between processes like any file's.
+///
+/// The system cache is on another volume (in the OS cryptex), so it can't be cloned.
+fn private_copy(system_path: &Path) -> Result<PathBuf> {
+    let system = File::open(system_path)?;
+    let header: dyld_cache_header = read_at(&system, 0)?;
+    let uuid: String = header.uuid.iter().map(|b| format!("{b:02x}")).collect();
+    let file_name = system_path.file_name().context("no cache file name")?;
+    let copies = private_copies_dir()?;
+    let dir = copies.join(&uuid);
+    let copy = dir.join(file_name);
+    if copy.exists() {
+        return Ok(copy);
+    }
+
+    let mut files = vec![system_path.to_path_buf()];
+    files.extend(subcache_paths(system_path, &system, &header)?);
+    info!(
+        "copying the shared cache {} to {}",
+        system_path.display(),
+        dir.display()
+    );
+    std::fs::create_dir_all(&copies)?;
+    // Copied aside and then moved into place, so no process sees a partial copy.
+    let partial = copies.join(format!("{uuid}.{}.partial", std::process::id()));
+    std::fs::create_dir_all(&partial)?;
+    let copied = files.iter().try_for_each(|file| {
+        let name = file.file_name().context("no cache file name")?;
+        std::fs::copy(file, partial.join(name))
+            .with_context(|| format!("copying {}", file.display()))?;
+        Ok::<_, anyhow::Error>(())
+    });
+    if let Err(err) = copied.and_then(|()| Ok(std::fs::rename(&partial, &dir)?)) {
+        let _ = std::fs::remove_dir_all(&partial);
+        // Another process may have just made the same copy.
+        if !copy.exists() {
+            return Err(err);
+        }
+    }
+
+    // Copies of caches the system no longer has. Processes using one keep their mappings.
+    for entry in std::fs::read_dir(&copies)?.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(&uuid) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    Ok(copy)
 }
 
 const DYLD_SHARED_CACHE_DEVELOPMENT_EXT: &str = ".development";

@@ -22,10 +22,11 @@ too. So:
 
 - Host mappings made for the guest never have `PROT_EXEC`. The host never executes guest code,
   and the VM maps everything RWX regardless of host protections.
-- Executable shared cache regions and guest private file mappings are mapped into the VM
-  lazily (`map_1to1_lazy`). On a stage-2 fault, appbox writes to each page of the faulting 1 MiB
-  chunk, which forces a private copy, and only then `hv_vm_map`s the chunk. That also avoids
-  copying gigabytes of shared cache up front.
+- Guest private file mappings are mapped into the VM lazily (`map_1to1_lazy`). On a stage-2
+  fault, appbox writes to each page of the faulting 1 MiB chunk, which forces a private copy, and
+  only then `hv_vm_map`s the chunk.
+- The shared cache is mapped from appbox's own copy of its files instead (see below). Nothing
+  ever maps that copy executable, so its pages go into the VM as they are.
 - Read-only *shared* file mappings are mapped privately instead, because `hv_vm_map` refuses
   some of them (e.g. ICU's data file, which broke `sw_vers`).
 
@@ -35,6 +36,18 @@ The kernel's shared region can't be mapped into a VM, so `dyld.rs` maps the cach
 itself: it reserves the region, maps each subcache's mappings, and applies the slide info.
 `shared_region_check_np` then returns our copy's address. See Apple's `dsc_extractor.cpp`
 when a new cache or slide format shows up.
+
+It maps a private copy of the files, not the system's own in the OS cryptex, so the text pages
+are clean file pages rather than the host's executable ones:
+- The kernel can page them in and out.
+- Concurrent appbox processes share them.
+- No per-page copying is needed to dodge the SPTM panic above.
+
+The copy lives in `~/Library/Caches/appbox/dyld/<cache UUID>/` (or `$APPBOX_SHARED_CACHE_DIR`).
+It's about 2.3 GB, and a full copy, since APFS can't clone across volumes and the cryptex is on
+the Preboot volume. It's made on first use, and again whenever the system cache's UUID changes.
+If it can't be made, appbox falls back to mapping the system's files lazily, with the copying
+described above.
 
 ### Pinning the host's malloc so the guest's xzone heap fits
 
