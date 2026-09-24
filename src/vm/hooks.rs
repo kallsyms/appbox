@@ -56,6 +56,11 @@ impl Hooks {
         }
     }
 
+    /// The addresses breakpoints are set at, in no particular order.
+    pub fn breakpoints(&self) -> Vec<u64> {
+        self.hooks.keys().copied().collect()
+    }
+
     pub fn add_breakpoint(&mut self, addr: u64, vma: &mut VirtMemAllocator) -> Result<()> {
         if let Entry::Vacant(e) = self.hooks.entry(addr) {
             trace!("Adding breakpoint at {:#x}", addr);
