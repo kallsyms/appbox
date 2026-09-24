@@ -411,7 +411,20 @@ mod tests {
             .into_iter()
             .map(|page| {
                 let mut contents = vec![0u8; 0x4000];
-                let _ = read_guest(&vm.vma, page, &mut contents);
+                // Pages not yet (lazily) mapped into the VM are read from the host directly.
+                let mut read = 0u64;
+                let kr = unsafe {
+                    crate::mach::mach_vm_read_overwrite(
+                        nix::libc::mach_task_self(),
+                        page,
+                        contents.len() as u64,
+                        contents.as_mut_ptr() as u64,
+                        &mut read,
+                    )
+                };
+                if kr != KERN_SUCCESS {
+                    contents.clear();
+                }
                 (page, contents)
             })
             .collect()

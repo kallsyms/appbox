@@ -1346,6 +1346,8 @@ pub struct PageTableManager {
     pub(crate) pgd: PageGlobalDirectory,
     pub(crate) allocs: BTreeMap<u64, Rc<RefCell<Page>>>,
     one_to_one_last: u64,
+    /// Guest physical ranges below `one_to_one_last` free for reuse, as start -> size.
+    free_one_to_one: BTreeMap<u64, u64>,
     /// 1:1 ranges, keyed by guest physical start address. Lazy ones' stage-2 mappings are
     /// deferred until first access.
     one_to_one: BTreeMap<u64, OneToOne>,
@@ -1421,6 +1423,7 @@ impl PageTableManager {
             pgd,
             allocs: BTreeMap::new(),
             one_to_one_last: 0x1_0000_0000,
+            free_one_to_one: BTreeMap::new(),
             one_to_one: BTreeMap::new(),
             write_protected: BTreeSet::new(),
             write_protecting: false,
@@ -1521,8 +1524,8 @@ impl PageTableManager {
         perms: av::MemPerms,
         privileged: bool,
     ) -> Result<()> {
-        let guest_paddr = self.one_to_one_last;
-        self.map_1to1_tables(addr, size, perms, privileged)?;
+        self.retire_1to1(addr, size as u64)?;
+        let guest_paddr = self.map_1to1_tables(addr, size, perms, privileged)?;
         hv_map_1to1(addr, guest_paddr, size)?;
         let pages = (size as u64).div_ceil(HOST_PAGE_SIZE) as usize;
         self.one_to_one.insert(
@@ -1548,8 +1551,8 @@ impl PageTableManager {
         if size as u64 % HOST_PAGE_SIZE != 0 {
             return Err(MemoryError::UnalignedSize(size))?;
         }
-        let guest_paddr = self.one_to_one_last;
-        self.map_1to1_tables(addr, size, perms, privileged)?;
+        self.retire_1to1(addr, size as u64)?;
+        let guest_paddr = self.map_1to1_tables(addr, size, perms, privileged)?;
         self.one_to_one.insert(
             guest_paddr,
             OneToOne {
@@ -1558,6 +1561,84 @@ impl PageTableManager {
             },
         );
         Ok(())
+    }
+
+    /// Takes the 1:1 pages backing host memory `addr..addr + size` out of the VM, before it's
+    /// mapped again (e.g. the guest mapping over it), which points the page tables elsewhere.
+    fn retire_1to1(&mut self, addr: u64, size: u64) -> Result<()> {
+        let end = addr.saturating_add(size);
+        let mut retired = BTreeSet::new();
+        for (&range_paddr, range) in self.one_to_one.iter_mut() {
+            let range_end = range.host_addr + range.pages.len() as u64 * HOST_PAGE_SIZE;
+            if range.host_addr >= end || range_end <= addr {
+                continue;
+            }
+            retired.insert(range_paddr);
+            let first = (addr.max(range.host_addr) - range.host_addr) / HOST_PAGE_SIZE;
+            let last = (end.min(range_end) - range.host_addr).div_ceil(HOST_PAGE_SIZE);
+            for page in first..last {
+                let state = std::mem::replace(&mut range.pages[page as usize], LazyPage::Unmapped);
+                let paddr = range_paddr + page * HOST_PAGE_SIZE;
+                self.write_protected.remove(&paddr);
+                if state == LazyPage::Mapped {
+                    let ret =
+                        unsafe { applevisor_sys::hv_vm_unmap(paddr, HOST_PAGE_SIZE as usize) };
+                    if ret != applevisor_sys::hv_error_t::HV_SUCCESS as i32 {
+                        Err(av::HypervisorError::from(ret))?;
+                    }
+                }
+            }
+        }
+        self.free_unmapped_1to1(retired);
+        Ok(())
+    }
+
+    /// Guest physical space for a 1:1 range of `size` bytes, reusing that of ranges since
+    /// unmapped. The VM's physical address space is small next to what a guest can map and unmap
+    /// over time.
+    fn allocate_one_to_one_paddr(&mut self, size: u64) -> u64 {
+        let size = size.div_ceil(HOST_PAGE_SIZE) * HOST_PAGE_SIZE;
+        let fit = self
+            .free_one_to_one
+            .iter()
+            .find(|(_, &free)| free >= size)
+            .map(|(&start, &free)| (start, free));
+        let Some((start, free)) = fit else {
+            let paddr = self.one_to_one_last;
+            self.one_to_one_last += size;
+            return paddr;
+        };
+        self.free_one_to_one.remove(&start);
+        if free > size {
+            self.free_one_to_one.insert(start + size, free - size);
+        }
+        start
+    }
+
+    /// Drops those of the 1:1 ranges starting at guest physical addresses `ranges` that are now
+    /// entirely unmapped, freeing their guest physical space.
+    fn free_unmapped_1to1(&mut self, ranges: BTreeSet<u64>) {
+        for mut start in ranges {
+            let Some(range) = self.one_to_one.get(&start) else {
+                continue;
+            };
+            if range.pages.iter().any(|&page| page != LazyPage::Unmapped) {
+                continue;
+            }
+            let mut size = range.pages.len() as u64 * HOST_PAGE_SIZE;
+            self.one_to_one.remove(&start);
+            if let Some((&before, &before_size)) = self.free_one_to_one.range(..start).next_back() {
+                if before + before_size == start {
+                    self.free_one_to_one.remove(&before);
+                    start = before;
+                    size += before_size;
+                }
+            }
+            if let Some(after_size) = self.free_one_to_one.remove(&(start + size)) {
+                size += after_size;
+            }
+            self.free_one_to_one.insert(start, size);
+        }
     }
 
     /// Maps the chunk of a lazy 1:1 range containing guest physical address `paddr` into the VM.
@@ -1672,7 +1753,7 @@ impl PageTableManager {
         Ok(Some(range.host_addr + (page_paddr - range_paddr)))
     }
 
-    /// The host pages of every 1:1 mapping currently mapped into the VM.
+    /// The host pages of every 1:1 mapping, whether or not (lazily) mapped into the VM yet.
     #[cfg(test)]
     pub(crate) fn mapped_one_to_one_host_pages(&self) -> Vec<u64> {
         self.one_to_one
@@ -1682,7 +1763,7 @@ impl PageTableManager {
                     .pages
                     .iter()
                     .enumerate()
-                    .filter(|(_, state)| **state == LazyPage::Mapped)
+                    .filter(|(_, state)| **state != LazyPage::Unmapped)
                     .map(|(page, _)| range.host_addr + page as u64 * HOST_PAGE_SIZE)
             })
             .collect()
@@ -1737,9 +1818,11 @@ impl PageTableManager {
             }
         }
 
+        let mut ranges = BTreeSet::new();
         for paddr in host_page_paddrs {
             let was_mapped = match self.lazy_page(paddr) {
-                Some((_, range, page)) => {
+                Some((range_paddr, range, page)) => {
+                    ranges.insert(range_paddr);
                     let state = std::mem::replace(&mut range.pages[page], LazyPage::Unmapped);
                     state == LazyPage::Mapped
                 }
@@ -1753,18 +1836,19 @@ impl PageTableManager {
                 }
             }
         }
+        self.free_unmapped_1to1(ranges);
         Ok(())
     }
 
     /// Assigns guest physical addresses to a 1:1 range and adds it to the page tables, without
-    /// creating the stage-2 mapping.
+    /// creating the stage-2 mapping. Returns the range's guest physical address.
     fn map_1to1_tables(
         &mut self,
         addr: u64,
         size: usize,
         perms: av::MemPerms,
         privileged: bool,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         // Makes sure the range's start address is page-aligned.
         if addr & (VIRT_PAGE_SIZE as u64 - 1) != 0 {
             return Err(MemoryError::UnalignedAddress(addr))?;
@@ -1779,8 +1863,7 @@ impl PageTableManager {
             .checked_add(size as u64)
             .ok_or(MemoryError::Overflow(addr, size))?);
 
-        let guest_paddr = self.one_to_one_last;
-        self.one_to_one_last += size as u64;
+        let guest_paddr = self.allocate_one_to_one_paddr(size as u64);
 
         // Iterates over the address of each page boundary and adds them to the page table.
         for addr in (range_start..range_end).step_by(VIRT_PAGE_SIZE) {
@@ -1836,7 +1919,7 @@ impl PageTableManager {
             pt_objects.insert(page_idx, page_ref.clone());
             self.allocs.insert(addr, page_ref);
         }
-        Ok(())
+        Ok(guest_paddr)
     }
 
     /// Unmaps the virtual address range of size `size` and starting at address `addr`.
