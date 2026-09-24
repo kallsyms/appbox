@@ -669,7 +669,12 @@ impl DefaultTrapHandler {
             }
             return Ok(());
         }
-        let stack_top = (addrs.kevent_data + data_available as u64) & !15;
+        let data_start = addrs.kevent_data + data_available as u64;
+        self.note_guest_write(
+            data_start,
+            addrs.kevent_list + count as u64 * KEVENT_QOS_SIZE - data_start,
+        );
+        let stack_top = data_start & !15;
         let work = Work {
             flags,
             kevents: Some((count, stack_top)),
@@ -751,7 +756,9 @@ impl DefaultTrapHandler {
                 let id = self.threads.spawn(regs)?;
                 if registration.mach_thread_self_offset != 0 {
                     let port = self.threads.port(id) as u64;
-                    vma.write_qword(tsd + registration.mach_thread_self_offset as u64, port)?;
+                    let addr = tsd + registration.mach_thread_self_offset as u64;
+                    vma.write_qword(addr, port)?;
+                    self.note_guest_write(addr, 8);
                 }
                 self.workq.stacks.push((id, stack));
                 debug!("created workqueue thread {id} (flags {flags:#x})");
@@ -816,7 +823,9 @@ impl DefaultTrapHandler {
                     return Ok(WorkqReturn::Done(Err(errno)));
                 }
                 let event = change.error(errno);
-                write_kevent(vma, eventlist + errors as u64 * KEVENT_QOS_SIZE, &event)?;
+                let addr = eventlist + errors as u64 * KEVENT_QOS_SIZE;
+                write_kevent(vma, addr, &event)?;
+                self.note_guest_write(addr, KEVENT_QOS_SIZE);
                 errors += 1;
             }
         }
@@ -852,6 +861,11 @@ impl DefaultTrapHandler {
         flags: u32,
         vma: &mut VirtMemAllocator,
     ) -> Result<u64> {
+        let data_size = if data_out != 0 && data_available != 0 {
+            vma.read_qword(data_available)?
+        } else {
+            0
+        };
         let queue = self.workq.queues.get_mut(&source).unwrap();
         let mut count = 0;
         if let Some(tr) = queue.thread_request.as_mut().filter(|tr| tr.active) {
@@ -876,6 +890,11 @@ impl DefaultTrapHandler {
                 return Err(last_os_error()).context("polling workloop kevents");
             }
             count += dequeued as u64;
+        }
+        self.note_guest_write(eventlist, count * KEVENT_QOS_SIZE);
+        self.note_guest_write(data_out, data_size);
+        if data_size != 0 {
+            self.note_guest_write(data_available, 8);
         }
         Ok(count)
     }

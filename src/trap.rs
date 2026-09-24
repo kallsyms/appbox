@@ -252,6 +252,20 @@ pub struct DefaultTrapHandler {
     pub(crate) workq: Workqueue,
     signals: [GuestSigaction; NSIG],
     exit_status: Option<i32>,
+    /// See [`Self::take_guest_memory_changes`].
+    guest_memory_changes: GuestMemoryChanges,
+}
+
+/// Changes a [`DefaultTrapHandler`] made to guest memory itself while handling syscalls, which
+/// record/replay needs as well as whatever the syscalls' arguments point to.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct GuestMemoryChanges {
+    /// Memory allocated (as address and size) with [`DefaultTrapHandler::allocate_guest_memory`],
+    /// in order, e.g. workqueue threads' stacks.
+    pub allocations: Vec<(u64, u64)>,
+    /// Memory written (as address and length) that the syscall's arguments don't necessarily
+    /// point to, e.g. kevents delivered onto a workqueue thread's stack.
+    pub writes: Vec<(u64, u64)>,
 }
 
 const NSIG: usize = 32;
@@ -335,6 +349,7 @@ impl DefaultTrapHandler {
             workq: Workqueue::default(),
             signals: [GuestSigaction::default(); NSIG],
             exit_status: None,
+            guest_memory_changes: GuestMemoryChanges::default(),
         })
     }
 
@@ -366,6 +381,17 @@ impl DefaultTrapHandler {
                 remaining
             })
             .collect();
+    }
+
+    /// The changes this handler has made to guest memory itself since last asked.
+    pub fn take_guest_memory_changes(&mut self) -> GuestMemoryChanges {
+        std::mem::take(&mut self.guest_memory_changes)
+    }
+
+    pub(crate) fn note_guest_write(&mut self, addr: u64, len: u64) {
+        if len != 0 {
+            self.guest_memory_changes.writes.push((addr, len));
+        }
     }
 
     /// The guest thread currently on the vCPU.
@@ -486,9 +512,10 @@ impl DefaultTrapHandler {
         }
     }
 
-    /// Allocates `size` bytes of guest memory (on the host, mapped into the VM) for appbox's own
-    /// use on the guest's behalf, like thread stacks the kernel would allocate.
-    pub(crate) fn allocate_guest_memory(
+    /// Allocates `size` bytes of guest memory (on the host, mapped into the VM) on the guest's
+    /// behalf, like thread stacks the kernel would allocate. Addresses come from the same pool as
+    /// the guest's own mappings, so replaying a guest means repeating these in the same order.
+    pub fn allocate_guest_memory(
         &mut self,
         vma: &mut VirtMemAllocator,
         size: u64,
@@ -506,6 +533,7 @@ impl DefaultTrapHandler {
         }
         vma.map_1to1(addr, size as usize, av::MemPerms::RWX)?;
         self.record_mapping(addr, size as usize);
+        self.guest_memory_changes.allocations.push((addr, size));
         Ok(addr)
     }
 
@@ -622,10 +650,9 @@ impl DefaultTrapHandler {
         })?;
         if registration.mach_thread_self_offset != 0 {
             let port = self.threads.port(id);
-            vma.write_qword(
-                tsd + registration.mach_thread_self_offset as u64,
-                port as u64,
-            )?;
+            let addr = tsd + registration.mach_thread_self_offset as u64;
+            vma.write_qword(addr, port as u64)?;
+            self.note_guest_write(addr, 8);
         }
         debug!("created guest thread {} at {:#x}", id, func);
         Ok(Ok(pthread))

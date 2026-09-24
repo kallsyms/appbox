@@ -81,6 +81,14 @@ impl Registers {
         Ok(regs)
     }
 
+    /// Saves the state of the thread about to run on `vcpu` (e.g. just switched to).
+    pub fn save(vcpu: &av::Vcpu) -> Result<Self> {
+        let mut regs = Self::save_at_syscall(vcpu)?;
+        regs.pc = vcpu.get_reg(av::Reg::PC)?;
+        regs.cpsr = vcpu.get_reg(av::Reg::CPSR)?;
+        Ok(regs)
+    }
+
     /// Puts this state on `vcpu`, so that running it resumes the thread in EL0.
     pub fn restore(&self, vcpu: &av::Vcpu) -> Result<()> {
         for (value, reg) in self.x.iter().zip(X_REGS) {
@@ -486,6 +494,7 @@ mod tests {
             *q = ((i as u128 + 1) << 64) | (0xabcd_0000 + i as u128);
         }
         regs.restore(vcpu)?;
+        assert_eq!(Registers::save(vcpu)?, regs);
 
         // What save_at_syscall reads for the resume point, as it'd be after an svc.
         vcpu.set_sys_reg(av::SysReg::ELR_EL1, regs.pc)?;
