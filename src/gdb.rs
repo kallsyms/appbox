@@ -1,6 +1,5 @@
 use anyhow::Result;
 use log::{debug, info, trace, warn};
-use mio::{Events, Interest, Poll, Token};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender};
@@ -8,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::vm::VmManager;
+use crate::vm::{VmManager, WatchKind, Watchpoint};
 use applevisor as av;
 
 #[derive(Debug, Clone)]
@@ -460,81 +459,55 @@ fn handle_all_registers(
     }
 }
 
-fn handle_breakpoint(
+/// `Z<type>,<addr>,<kind>` (insert) and `z<type>,<addr>,<kind>` (remove): breakpoints (types 0
+/// and 1, both done however the target sees fit) and watchpoints (2 write, 3 read, 4 access,
+/// with `kind` their length).
+fn handle_breakpoint_packet(
     writer: &mut mio::net::TcpStream,
     command: &str,
     command_sender: &Sender<GdbCommand>,
     response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
 ) {
-    let parts: Vec<&str> = command[3..].split(',').collect();
-    if parts.len() != 2 {
-        trace!("Malformed Z0 command");
+    let insert = command.starts_with('Z');
+    let parts: Vec<&str> = command[1..].split(',').collect();
+    let parsed = match parts.as_slice() {
+        [kind, addr, len] => (
+            kind.parse::<u8>(),
+            u64::from_str_radix(addr, 16),
+            u64::from_str_radix(len, 16),
+        ),
+        _ => {
+            trace!("Malformed breakpoint packet {command}");
+            send_packet(writer, GDB_ERROR);
+            return;
+        }
+    };
+    let (Ok(kind), Ok(addr), Ok(len)) = parsed else {
         send_packet(writer, GDB_ERROR);
         return;
-    }
-
-    let (addr_result, kind_result) = (
-        u64::from_str_radix(parts[0], 16),
-        u64::from_str_radix(parts[1], 16),
-    );
-
-    if let (Ok(addr), Ok(kind)) = (addr_result, kind_result) {
-        command_sender
-            .send(GdbCommand::AddBreakpoint { addr, kind })
-            .unwrap();
-        match response_receiver.lock().unwrap().recv().unwrap() {
-            GdbResponse::Ok => {
-                trace!("Sending OK");
-                send_packet(writer, GDB_OK);
-            }
-            GdbResponse::Error(e) => {
-                let response = format!("E{:02x}", e);
-                send_packet(writer, &response);
-            }
-            _ => {}
+    };
+    let watch_kind = match kind {
+        2 => Some(WatchKind::Write),
+        3 => Some(WatchKind::Read),
+        4 => Some(WatchKind::Access),
+        _ => None,
+    };
+    let command = match (kind, watch_kind, insert) {
+        (0 | 1, _, true) => GdbCommand::AddBreakpoint { addr, kind: len },
+        (0 | 1, _, false) => GdbCommand::RemoveBreakpoint { addr, kind: len },
+        (_, Some(kind), true) => GdbCommand::AddWatchpoint { addr, len, kind },
+        (_, Some(kind), false) => GdbCommand::RemoveWatchpoint { addr, len, kind },
+        _ => {
+            // Not supported: an empty reply says so.
+            send_packet(writer, "");
+            return;
         }
-    } else {
-        trace!("Malformed Z0 command");
-        send_packet(writer, GDB_ERROR);
-    }
-}
-
-fn handle_remove_breakpoint(
-    writer: &mut mio::net::TcpStream,
-    command: &str,
-    command_sender: &Sender<GdbCommand>,
-    response_receiver: &Arc<Mutex<Receiver<GdbResponse>>>,
-) {
-    let parts: Vec<&str> = command[3..].split(',').collect();
-    if parts.len() != 2 {
-        trace!("Malformed z0 command");
-        send_packet(writer, GDB_ERROR);
-        return;
-    }
-
-    let (addr_result, kind_result) = (
-        u64::from_str_radix(parts[0], 16),
-        u64::from_str_radix(parts[1], 16),
-    );
-
-    if let (Ok(addr), Ok(kind)) = (addr_result, kind_result) {
-        command_sender
-            .send(GdbCommand::RemoveBreakpoint { addr, kind })
-            .unwrap();
-        match response_receiver.lock().unwrap().recv().unwrap() {
-            GdbResponse::Ok => {
-                trace!("Sending OK");
-                send_packet(writer, GDB_OK);
-            }
-            GdbResponse::Error(e) => {
-                let response = format!("E{:02x}", e);
-                send_packet(writer, &response);
-            }
-            _ => {}
-        }
-    } else {
-        trace!("Malformed z0 command");
-        send_packet(writer, GDB_ERROR);
+    };
+    command_sender.send(command).unwrap();
+    match response_receiver.lock().unwrap().recv().unwrap() {
+        GdbResponse::Ok => send_packet(writer, GDB_OK),
+        GdbResponse::Error(e) => send_packet(writer, &format!("E{:02x}", e)),
+        _ => {}
     }
 }
 
@@ -542,6 +515,8 @@ fn handle_remove_breakpoint(
 pub enum GdbCommand {
     AddBreakpoint { addr: u64, kind: u64 },
     RemoveBreakpoint { addr: u64, kind: u64 },
+    AddWatchpoint { addr: u64, len: u64, kind: WatchKind },
+    RemoveWatchpoint { addr: u64, len: u64, kind: WatchKind },
     Continue,
     Step,
     Kill,
@@ -566,6 +541,30 @@ pub enum GdbResponse {
 #[derive(Debug)]
 pub enum GdbNotification {
     Stop(u8), // Signal number (5 for SIGTRAP, 11 for SIGSEGV, etc.)
+    /// Stopped (with SIGTRAP) after an access to `addr`, watched with a `kind` watchpoint.
+    Watchpoint { kind: WatchKind, addr: u64 },
+    /// Going backwards, the beginning of the recording was reached.
+    ReplayLogBegin,
+    /// Going forwards, the end of the recording was reached.
+    ReplayLogEnd,
+    /// The guest exited with this status.
+    Exited(u8),
+}
+
+/// Descriptors from here up are out of the way of a guest's, which share the host's table and
+/// whose numbers must stay as they were recorded.
+const HOST_FD_MIN: i32 = 1000;
+
+/// Moves `socket`'s descriptor up out of the guest's way (see [`HOST_FD_MIN`]).
+fn move_fd_high<T: std::os::fd::IntoRawFd + std::os::fd::FromRawFd>(socket: T) -> std::io::Result<T> {
+    let fd = socket.into_raw_fd();
+    let high = unsafe { nix::libc::fcntl(fd, nix::libc::F_DUPFD_CLOEXEC, HOST_FD_MIN) };
+    let error = std::io::Error::last_os_error();
+    unsafe { nix::libc::close(fd) };
+    if high < 0 {
+        return Err(error);
+    }
+    Ok(unsafe { T::from_raw_fd(high) })
 }
 
 pub fn start_gdb_server(
@@ -575,7 +574,7 @@ pub fn start_gdb_server(
     wait_sender: Option<Sender<()>>,
     features: GdbFeatures,
 ) -> Result<Sender<GdbNotification>> {
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let listener = move_fd_high(TcpListener::bind(("127.0.0.1", port))?)?;
     info!("GDB server listening on port {}", port);
     let response_receiver = Arc::new(Mutex::new(response_receiver));
 
@@ -589,6 +588,13 @@ pub fn start_gdb_server(
             }
             match stream {
                 Ok(stream) => {
+                    let stream = match move_fd_high(stream) {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            warn!("GDB connection failed: {}", e);
+                            continue;
+                        }
+                    };
                     let command_sender = command_sender.clone();
                     let response_receiver = response_receiver.clone();
                     let notification_receiver = notification_receiver.clone();
@@ -732,10 +738,8 @@ fn process_gdb_command(
         || core_command == "QEnableErrorStrings"
     {
         handle_thread_suffix_commands(writer);
-    } else if core_command.starts_with("Z0,") {
-        handle_breakpoint(writer, core_command, command_sender, response_receiver);
-    } else if core_command.starts_with("z0,") {
-        handle_remove_breakpoint(writer, core_command, command_sender, response_receiver);
+    } else if core_command.starts_with('Z') || core_command.starts_with('z') {
+        handle_breakpoint_packet(writer, core_command, command_sender, response_receiver);
     } else {
         trace!("Unhandled GDB command: {}", core_command);
         handle_unknown_command(writer);
@@ -834,7 +838,6 @@ fn read_and_buffer_data(
     }
 }
 
-const SOCKET_TOKEN: Token = Token(0);
 
 fn handle_connection(
     stream: TcpStream,
@@ -845,16 +848,14 @@ fn handle_connection(
 ) {
     debug!("New GDB client connected: {}", stream.peer_addr().unwrap());
 
+    // Non-blocking, and polled rather than waited on with a kqueue: that would be a descriptor
+    // where a guest's might be (see HOST_FD_MIN).
+    if let Err(e) = stream.set_nonblocking(true) {
+        warn!("GDB connection failed: {}", e);
+        return;
+    }
     let mut mio_stream = mio::net::TcpStream::from_std(stream);
-
-    // Create poll instance
-    let mut poll = Poll::new().unwrap();
-    let mut events = Events::with_capacity(128);
-
-    // Register the socket for read events
-    poll.registry()
-        .register(&mut mio_stream, SOCKET_TOKEN, Interest::READABLE)
-        .unwrap();
+    const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     let mut no_ack_mode = false;
 
@@ -868,8 +869,7 @@ fn handle_connection(
             }
             Ok(_) => break, // Got some data, continue
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // Wait for data to arrive
-                poll.poll(&mut events, None).unwrap();
+                std::thread::sleep(POLL_INTERVAL);
                 continue;
             }
             Err(_) => {
@@ -888,44 +888,16 @@ fn handle_connection(
     let mut buffer = Vec::new();
 
     loop {
-        // Poll for events with a short timeout to check notifications
-        match poll.poll(&mut events, Some(Duration::from_millis(1))) {
-            Ok(_) => {
-                // Check for socket events
-                for event in events.iter() {
-                    match event.token() {
-                        SOCKET_TOKEN => {
-                            if event.is_readable() {
-                                match read_and_buffer_data(&mut mio_stream, &mut buffer) {
-                                    Ok(false) => {
-                                        // Connection closed
-                                        info!(
-                                            "GDB client disconnected: {}",
-                                            mio_stream.peer_addr().unwrap()
-                                        );
-                                        return;
-                                    }
-                                    Ok(true) => {
-                                        // Data read successfully, process packets below
-                                    }
-                                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                                        // No more data available right now
-                                    }
-                                    Err(_) => {
-                                        // Read error, close connection
-                                        info!("GDB connection error, closing");
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
+        match read_and_buffer_data(&mut mio_stream, &mut buffer) {
+            Ok(false) => {
+                info!("GDB client disconnected");
+                return;
             }
-            Err(e) => {
-                warn!("Poll error: {}", e);
-                break;
+            Ok(true) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(POLL_INTERVAL),
+            Err(_) => {
+                info!("GDB connection error, closing");
+                return;
             }
         }
 
@@ -935,6 +907,23 @@ fn handle_connection(
                 GdbNotification::Stop(signal) => {
                     let signal_packet = format!("S{:02x}", signal);
                     send_packet(&mut mio_stream, &signal_packet);
+                }
+                GdbNotification::Watchpoint { kind, addr } => {
+                    let reason = match kind {
+                        WatchKind::Write => "watch",
+                        WatchKind::Read => "rwatch",
+                        WatchKind::Access => "awatch",
+                    };
+                    send_packet(&mut mio_stream, &format!("T05{reason}:{addr:x};"));
+                }
+                GdbNotification::ReplayLogBegin => {
+                    send_packet(&mut mio_stream, "T05replaylog:begin;");
+                }
+                GdbNotification::ReplayLogEnd => {
+                    send_packet(&mut mio_stream, "T05replaylog:end;");
+                }
+                GdbNotification::Exited(status) => {
+                    send_packet(&mut mio_stream, &format!("W{status:02x}"));
                 }
             }
         }
@@ -984,6 +973,35 @@ pub fn handle_command(
         GdbCommand::RemoveBreakpoint { addr, .. } => {
             vm.hooks.remove_breakpoint(addr, &mut vm.vma).unwrap();
             response_sender.send(GdbResponse::Ok).unwrap();
+        }
+        GdbCommand::AddWatchpoint { addr, len, kind } => {
+            let watchpoint = Watchpoint { addr, len, kind };
+            let result = (|| {
+                let slot = (0..vm.watchpoint_slots()?)
+                    .find(|&slot| vm.hardware_watchpoints().get(slot).is_none_or(Option::is_none))
+                    .ok_or_else(|| anyhow::anyhow!("no free hardware watchpoints"))?;
+                vm.set_hardware_watchpoint(slot, Some(watchpoint))
+            })();
+            response_sender
+                .send(match result {
+                    Ok(()) => GdbResponse::Ok,
+                    Err(_) => GdbResponse::Error(1),
+                })
+                .unwrap();
+        }
+        GdbCommand::RemoveWatchpoint { addr, len, kind } => {
+            let watchpoint = Some(Watchpoint { addr, len, kind });
+            let slot = vm
+                .hardware_watchpoints()
+                .iter()
+                .position(|set| *set == watchpoint);
+            let result = slot.map(|slot| vm.set_hardware_watchpoint(slot, None));
+            response_sender
+                .send(match result {
+                    Some(Ok(())) => GdbResponse::Ok,
+                    _ => GdbResponse::Error(1),
+                })
+                .unwrap();
         }
         GdbCommand::ReadMemory { addr, len } => {
             let mut data = vec![0; len];

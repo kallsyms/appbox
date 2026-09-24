@@ -79,6 +79,24 @@ const DBGBCR_EL0_ALL_BYTES: u64 = 1 | (0b10 << 1) | (0xf << 5);
 const DBGWCR_EL0: u64 = 1 | (0b10 << 1);
 const PSTATE_SS: u64 = 1 << 21;
 
+/// PSTATE.M's exception level and stack pointer selection; 0 at EL0.
+const PSTATE_MODE: u64 = 0xf;
+const DBGBVR: [av::SysReg; 16] = {
+    use av::SysReg::*;
+    [
+        DBGBVR0_EL1, DBGBVR1_EL1, DBGBVR2_EL1, DBGBVR3_EL1, DBGBVR4_EL1, DBGBVR5_EL1,
+        DBGBVR6_EL1, DBGBVR7_EL1, DBGBVR8_EL1, DBGBVR9_EL1, DBGBVR10_EL1, DBGBVR11_EL1,
+        DBGBVR12_EL1, DBGBVR13_EL1, DBGBVR14_EL1, DBGBVR15_EL1,
+    ]
+};
+const DBGBCR: [av::SysReg; 16] = {
+    use av::SysReg::*;
+    [
+        DBGBCR0_EL1, DBGBCR1_EL1, DBGBCR2_EL1, DBGBCR3_EL1, DBGBCR4_EL1, DBGBCR5_EL1,
+        DBGBCR6_EL1, DBGBCR7_EL1, DBGBCR8_EL1, DBGBCR9_EL1, DBGBCR10_EL1, DBGBCR11_EL1,
+        DBGBCR12_EL1, DBGBCR13_EL1, DBGBCR14_EL1, DBGBCR15_EL1,
+    ]
+};
 const DBGWVR: [av::SysReg; 16] = {
     use av::SysReg::*;
     [
@@ -172,7 +190,10 @@ pub struct VmManager {
     /// guest's, once calibrated.
     run_overhead: Option<u64>,
     guest_instructions: u64,
-    hardware_breakpoint: Option<u64>,
+    /// Where a pending single step (see [`Self::single_step`]) started.
+    stepping: Option<u64>,
+    /// By slot.
+    breakpoints: Vec<Option<u64>>,
     watchpoints: Vec<Option<Watchpoint>>,
     // Drop vCPU before VM; VM teardown fails if vCPU is still alive.
     _vm: av::VirtualMachine,
@@ -198,7 +219,8 @@ impl VmManager {
             stopped: false,
             run_overhead: None,
             guest_instructions: 0,
-            hardware_breakpoint: None,
+            stepping: None,
+            breakpoints: Vec::new(),
             watchpoints: Vec::new(),
             _vm: vm,
         })
@@ -259,10 +281,31 @@ impl VmManager {
     }
 
     /// Has [`Self::run`] return [`VmRunResult::HardwareBreakpoint`] whenever the guest is about
-    /// to execute `addr` at EL0, or stops doing so.
+    /// to execute `addr` at EL0, or stops doing so. Uses breakpoint slot 0; see
+    /// [`Self::set_hardware_breakpoint_slot`] for the others.
     pub fn set_hardware_breakpoint(&mut self, addr: Option<u64>) -> Result<()> {
-        self.hardware_breakpoint = addr;
+        self.set_hardware_breakpoint_slot(0, addr)
+    }
+
+    /// How many hardware breakpoints there are.
+    pub fn breakpoint_slots(&self) -> Result<usize> {
+        let dfr0 = self.vcpu.get_sys_reg(av::SysReg::ID_AA64DFR0_EL1)?;
+        Ok(((dfr0 >> 12 & 0xf) as usize + 1).min(DBGBVR.len()))
+    }
+
+    /// Like [`Self::set_hardware_breakpoint`], with breakpoint `slot`.
+    pub fn set_hardware_breakpoint_slot(&mut self, slot: usize, addr: Option<u64>) -> Result<()> {
+        anyhow::ensure!(slot < self.breakpoint_slots()?, "no breakpoint {slot}");
+        if self.breakpoints.len() <= slot {
+            self.breakpoints.resize(slot + 1, None);
+        }
+        self.breakpoints[slot] = addr;
         self.arm_debug_registers()
+    }
+
+    /// The breakpoints set with [`Self::set_hardware_breakpoint_slot`], by slot.
+    pub fn hardware_breakpoints(&self) -> &[Option<u64>] {
+        &self.breakpoints
     }
 
     /// How many hardware watchpoints there are.
@@ -298,13 +341,14 @@ impl VmManager {
     }
 
     fn arm_debug_registers(&mut self) -> Result<()> {
-        match self.hardware_breakpoint {
-            Some(addr) => {
-                self.vcpu.set_sys_reg(av::SysReg::DBGBVR0_EL1, addr)?;
-                self.vcpu
-                    .set_sys_reg(av::SysReg::DBGBCR0_EL1, DBGBCR_EL0_ALL_BYTES)?;
+        for (slot, addr) in self.breakpoints.iter().enumerate() {
+            match addr {
+                Some(addr) => {
+                    self.vcpu.set_sys_reg(DBGBVR[slot], *addr)?;
+                    self.vcpu.set_sys_reg(DBGBCR[slot], DBGBCR_EL0_ALL_BYTES)?;
+                }
+                None => self.vcpu.set_sys_reg(DBGBCR[slot], 0)?,
             }
-            None => self.vcpu.set_sys_reg(av::SysReg::DBGBCR0_EL1, 0)?,
         }
         for (slot, watchpoint) in self.watchpoints.iter().enumerate() {
             let (wvr, wcr) = watchpoint
@@ -313,8 +357,8 @@ impl VmManager {
             self.vcpu.set_sys_reg(DBGWVR[slot], wvr)?;
             self.vcpu.set_sys_reg(DBGWCR[slot], wcr)?;
         }
-        let enabled =
-            self.hardware_breakpoint.is_some() || self.watchpoints.iter().any(Option::is_some);
+        let enabled = self.breakpoints.iter().any(Option::is_some)
+            || self.watchpoints.iter().any(Option::is_some);
         self.vcpu
             .set_sys_reg(av::SysReg::MDSCR_EL1, if enabled { MDSCR_MDE } else { 0 })?;
         Ok(())
@@ -323,12 +367,15 @@ impl VmManager {
     /// Has the next [`Self::run`] execute one guest (EL0) instruction and return
     /// [`VmRunResult::Step`], ignoring hardware breakpoints and watchpoints on it.
     pub fn single_step(&mut self) -> Result<()> {
-        self.vcpu.set_sys_reg(av::SysReg::DBGBCR0_EL1, 0)?;
+        for slot in 0..self.breakpoints.len() {
+            self.vcpu.set_sys_reg(DBGBCR[slot], 0)?;
+        }
         for slot in 0..self.watchpoints.len() {
             self.vcpu.set_sys_reg(DBGWCR[slot], 0)?;
         }
         self.vcpu
             .set_sys_reg(av::SysReg::MDSCR_EL1, MDSCR_MDE | MDSCR_SS)?;
+        self.stepping = Some(self.vcpu.get_reg(av::Reg::PC)?);
         let cpsr = self.vcpu.get_reg(av::Reg::CPSR)?;
         self.vcpu.set_reg(av::Reg::CPSR, cpsr | PSTATE_SS)?;
         Ok(())
@@ -370,6 +417,17 @@ impl VmManager {
     }
 
     pub fn run(&mut self) -> Result<VmRunResult> {
+        let result = self.run_to_exit();
+        // A single step ends with whatever stops the guest next (e.g. the instruction was a
+        // syscall), not just a step exception.
+        if self.stepping.take().is_some() {
+            self.arm_debug_registers()?;
+        }
+        result
+    }
+
+    fn run_to_exit(&mut self) -> Result<VmRunResult> {
+        let mut stepped_through_handler = false;
         loop {
             self.run_once()?;
             let exit_info = self.vcpu.get_exit_info();
@@ -418,7 +476,17 @@ impl VmManager {
                         return Ok(VmRunResult::HardwareBreakpoint)
                     }
                     ExceptionClass::SoftwareStepLowerEL => {
-                        self.arm_debug_registers()?;
+                        // The stepped instruction faulted into appbox's own handling at EL1
+                        // (e.g. for dirty tracking): step on through it, then (once it's back
+                        // at the instruction to retry it) through the instruction again.
+                        let cpsr = self.vcpu.get_reg(av::Reg::CPSR)?;
+                        let pc = self.vcpu.get_reg(av::Reg::PC)?;
+                        let retrying = stepped_through_handler && Some(pc) == self.stepping;
+                        if cpsr & PSTATE_MODE != 0 || retrying {
+                            stepped_through_handler = !retrying;
+                            self.vcpu.set_reg(av::Reg::CPSR, cpsr | PSTATE_SS)?;
+                            continue;
+                        }
                         return Ok(VmRunResult::Step);
                     }
                     ExceptionClass::WatchpointLowerEL => {
@@ -656,6 +724,30 @@ mod tests {
             }
         }
         assert_eq!(hits, 10);
+        Ok(())
+    }
+
+    /// A 1:1 data page the guest hasn't written yet, so its first write takes a dirty-tracking
+    /// fault.
+    fn clean_data_page(vm: &mut VmManager) -> Result<MemoryMap> {
+        let data = host_map(None, HOST_PAGE)?;
+        vm.vma
+            .map_1to1(data.data() as u64, data.len(), av::MemPerms::RWX)?;
+        Ok(data)
+    }
+
+    #[test]
+    fn steps_over_stores_that_fault() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const STR_X0_X1: u32 = 0xf9000020;
+        let (mut vm, code) = vm_running(&[STR_X0_X1, BRK_0])?;
+        let data = clean_data_page(&mut vm)?;
+        vm.vcpu.set_reg(av::Reg::X0, 7)?;
+        vm.vcpu.set_reg(av::Reg::X1, data.data() as u64)?;
+        vm.single_step()?;
+        assert!(matches!(vm.run()?, VmRunResult::Step));
+        assert_eq!(vm.vcpu.get_reg(av::Reg::PC)?, code.data() as u64 + 4);
+        assert_eq!(unsafe { (data.data() as *const u64).read() }, 7);
         Ok(())
     }
 
