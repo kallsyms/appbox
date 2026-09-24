@@ -124,7 +124,7 @@ pub fn exec(
     request: &ExecRequest,
 ) -> Result<(VmManager, Loader)> {
     debug!("exec {:?}", request);
-    handler.release_guest_memory();
+    handler.prepare_for_exec();
     drop(loader);
     // Only one VM can exist per process, so the old one must be gone before creating another.
     drop(vm);

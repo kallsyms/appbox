@@ -230,8 +230,31 @@ pub struct DefaultTrapHandler {
     map_fixed_next: u64,
     mappings: Vec<(u64, usize)>,
     threads: Threads,
+    signals: [GuestSigaction; NSIG],
     exit_status: Option<i32>,
 }
+
+const NSIG: usize = 32;
+const SIG_DFL: u64 = 0;
+const SIG_IGN: u64 = 1;
+
+/// A guest's action for a signal (`struct __sigaction`). Only its `SIG_DFL`/`SIG_IGN` are applied
+/// on the host: a handler would be guest code, which the host must never run.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct GuestSigaction {
+    pub handler: u64,
+    /// libsystem's trampoline that calls `handler` when the kernel delivers the signal.
+    pub tramp: u64,
+    pub mask: u32,
+    /// Only the flags in `SA_USERSPACE_MASK`, as the kernel keeps them.
+    pub flags: i32,
+    /// `SA_VALIDATE_SIGRETURN_FROM_SIGTRAMP`: sigreturn must come from `tramp`.
+    pub validate_sigreturn: bool,
+}
+
+// See bsd/sys/signal.h in xnu.
+const SA_USERSPACE_MASK: i32 = 0x7f;
+const SA_VALIDATE_SIGRETURN_FROM_SIGTRAMP: i32 = 0x400;
 
 impl DefaultTrapHandler {
     pub fn new() -> Result<Self> {
@@ -246,6 +269,7 @@ impl DefaultTrapHandler {
             map_fixed_next,
             mappings: Vec::new(),
             threads: Threads::new()?,
+            signals: [GuestSigaction::default(); NSIG],
             exit_status: None,
         })
     }
@@ -280,9 +304,24 @@ impl DefaultTrapHandler {
             .collect();
     }
 
-    /// Releases the host memory backing everything the guest has mapped through this handler,
-    /// e.g. when replacing it on exec.
-    pub fn release_guest_memory(&mut self) {
+    /// The guest's action for signal `sig`.
+    pub fn sigaction(&self, sig: usize) -> Option<&GuestSigaction> {
+        self.signals.get(sig)
+    }
+
+    /// Resets state the guest image owns, for replacing it on exec (see [`crate::exec`]).
+    pub fn prepare_for_exec(&mut self) {
+        self.release_guest_memory();
+        // Like the kernel: caught signals revert to their default action, ignored ones stay so.
+        for action in &mut self.signals {
+            if action.handler != SIG_IGN {
+                *action = GuestSigaction::default();
+            }
+        }
+    }
+
+    /// Releases the host memory backing everything the guest has mapped through this handler.
+    fn release_guest_memory(&mut self) {
         for (addr, size) in self.mappings.drain(..) {
             unsafe { mach_vm_deallocate(nix::libc::mach_task_self(), addr, size as u64) };
         }
@@ -361,6 +400,71 @@ impl DefaultTrapHandler {
         let addr = self.map_fixed_next;
         self.map_fixed_next += size;
         addr
+    }
+
+    /// `__sigaction(sig, nsa, osa)`: records the guest's action, applying only `SIG_DFL` or
+    /// `SIG_IGN` to the host (a guest handler reverts the host to the default action).
+    fn emulate_sigaction(
+        &mut self,
+        vma: &mut VirtMemAllocator,
+        sig: u64,
+        nsa: u64,
+        osa: u64,
+    ) -> std::result::Result<(), i32> {
+        let sig = sig as usize;
+        if sig == 0 || sig >= NSIG {
+            return Err(nix::libc::EINVAL);
+        }
+        let old = self.signals[sig];
+        if nsa != 0 {
+            let mut raw = [0u8; 24];
+            read_guest(vma, nsa, &mut raw).ok_or(nix::libc::EFAULT)?;
+            let new = GuestSigaction {
+                handler: u64::from_le_bytes(raw[0..8].try_into().unwrap()),
+                tramp: u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+                mask: u32::from_le_bytes(raw[16..20].try_into().unwrap()),
+                flags: 0,
+                validate_sigreturn: false,
+            };
+            let raw_flags = i32::from_le_bytes(raw[20..24].try_into().unwrap());
+            let new = GuestSigaction {
+                flags: raw_flags & SA_USERSPACE_MASK,
+                validate_sigreturn: raw_flags & SA_VALIDATE_SIGRETURN_FROM_SIGTRAMP != 0,
+                ..new
+            };
+            let uncatchable =
+                sig == nix::libc::SIGKILL as usize || sig == nix::libc::SIGSTOP as usize;
+            if uncatchable && new.handler != SIG_DFL {
+                return Err(nix::libc::EINVAL);
+            }
+
+            let host_handler = if new.handler == SIG_IGN {
+                SIG_IGN
+            } else {
+                SIG_DFL
+            };
+            let host_action = nix::libc::sigaction {
+                sa_sigaction: host_handler as usize,
+                sa_mask: new.mask,
+                sa_flags: new.flags & !nix::libc::SA_SIGINFO,
+            };
+            if unsafe { nix::libc::sigaction(sig as i32, &host_action, std::ptr::null_mut()) } != 0
+            {
+                return Err(io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(nix::libc::EINVAL));
+            }
+            self.signals[sig] = new;
+        }
+        if osa != 0 {
+            // struct sigaction: handler, mask, flags.
+            let mut raw = [0u8; 16];
+            raw[0..8].copy_from_slice(&old.handler.to_le_bytes());
+            raw[8..12].copy_from_slice(&old.mask.to_le_bytes());
+            raw[12..16].copy_from_slice(&old.flags.to_le_bytes());
+            vma.write(osa, &raw).map_err(|_| nix::libc::EFAULT)?;
+        }
+        Ok(())
     }
 
     fn unmap_from_vm(
@@ -485,6 +589,16 @@ impl TrapHandler for DefaultTrapHandler {
                         handled = true;
                     }
                 }
+            }
+            syscalls::SYS_sigaction => {
+                match self.emulate_sigaction(vma, args[0], args[1], args[2]) {
+                    Ok(()) => ret0 = 0,
+                    Err(errno) => {
+                        ret0 = errno as u64;
+                        cflags = 1 << 29;
+                    }
+                }
+                handled = true;
             }
             syscalls::SYS_exit => {
                 self.exit_status = Some(args[0] as i32);
@@ -1186,6 +1300,58 @@ mod tests {
         assert_eq!(
             read_posix_spawn(&vm.vma, &args).unwrap().file_actions,
             Some(file_actions)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sigaction_records_guest_handlers_without_installing_them() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let region = mmap_fixed_fixed::MemoryMap::new(
+            PAGE_ALIGN as usize,
+            &[
+                mmap_fixed_fixed::MapOption::MapReadable,
+                mmap_fixed_fixed::MapOption::MapWritable,
+            ],
+        )?;
+        let mut vm = VmManager::new()?;
+        let (nsa, osa) = (region.data() as u64, region.data() as u64 + 0x100);
+        vm.vma.map_1to1(nsa, region.len(), av::MemPerms::RWX)?;
+        let mut handler = DefaultTrapHandler::new()?;
+        let sig = nix::libc::SIGUSR1 as u64;
+
+        // struct __sigaction: handler, tramp, mask, flags.
+        vm.vma.write_qword(nsa, 0x1234_5678)?;
+        vm.vma.write_qword(nsa + 8, 0x8765_4321)?;
+        vm.vma.write_dword(nsa + 16, 0x4)?;
+        vm.vma.write_dword(
+            nsa + 20,
+            (nix::libc::SA_RESTART | SA_VALIDATE_SIGRETURN_FROM_SIGTRAMP) as u32,
+        )?;
+        handler.emulate_sigaction(&mut vm.vma, sig, nsa, 0).unwrap();
+        assert_eq!(
+            handler.sigaction(sig as usize),
+            Some(&GuestSigaction {
+                handler: 0x1234_5678,
+                tramp: 0x8765_4321,
+                mask: 0x4,
+                flags: nix::libc::SA_RESTART,
+                validate_sigreturn: true,
+            })
+        );
+
+        let mut host_action: nix::libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe { nix::libc::sigaction(sig as i32, std::ptr::null(), &mut host_action) };
+        assert_eq!(host_action.sa_sigaction, SIG_DFL as usize);
+
+        handler.emulate_sigaction(&mut vm.vma, sig, 0, osa).unwrap();
+        assert_eq!(vm.vma.read_qword(osa)?, 0x1234_5678);
+        assert_eq!(vm.vma.read_dword(osa + 8)?, 0x4);
+
+        assert_eq!(
+            handler.emulate_sigaction(&mut vm.vma, nix::libc::SIGKILL as u64, nsa, 0),
+            Err(nix::libc::EINVAL)
         );
         Ok(())
     }
