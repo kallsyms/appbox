@@ -2136,7 +2136,12 @@ impl VirtMemAllocator {
         //  - I: Stage 1 instruction access Cacheability control, for accesses at EL0 and EL1.
         //  - C: Stage 1 Cacheability control, for data accesses.
         //  - M: MMU enable for EL1&0 stage 1 address translation.
-        vcpu.set_sys_reg(av::SysReg::SCTLR_EL1, 0x1005)?;
+        //  - DZE, UCT, UCI: EL0 can use DC ZVA (e.g. in bzero), read CTR_EL0, and do cache
+        //    maintenance, as XNU lets user processes.
+        vcpu.set_sys_reg(
+            av::SysReg::SCTLR_EL1,
+            0x1005 | (1 << 14) | (1 << 15) | (1 << 26),
+        )?;
         // CPACR_EL1
         //  - FPEN: This control does not cause execution of any instructions that access the
         //          Advanced SIMD and floating-point registers to be trapped.
