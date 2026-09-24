@@ -57,6 +57,9 @@ impl Caches {
     fn run_routine(vcpu: &mut av::Vcpu, addr: u64) -> Result<()> {
         let pc = vcpu.get_reg(av::Reg::PC)?;
         let cpsr = vcpu.get_reg(av::Reg::CPSR)?;
+        // A timer due meanwhile goes off once the guest runs again instead.
+        let vtimer_masked = vcpu.get_vtimer_mask()?;
+        vcpu.set_vtimer_mask(true)?;
         vcpu.set_reg(av::Reg::PC, addr)?;
         vcpu.set_reg(av::Reg::CPSR, 0x3c5)?;
         vcpu.run()?;
@@ -65,6 +68,7 @@ impl Caches {
             && exit.exception.syndrome >> 26 == 0b010110;
         vcpu.set_reg(av::Reg::PC, pc)?;
         vcpu.set_reg(av::Reg::CPSR, cpsr)?;
+        vcpu.set_vtimer_mask(vtimer_masked)?;
         if !finished {
             return Err(Error::Exception(ExceptionError::UnimplementedException(
                 exit.exception.syndrome,
