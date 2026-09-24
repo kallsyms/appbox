@@ -8,6 +8,7 @@ use crate::mach::{
     mach_vm_allocate, mach_vm_deallocate, mach_vm_map, mach_vm_read_overwrite, VM_FLAGS_OVERWRITE,
 };
 use crate::syscalls;
+use crate::threads::Threads;
 use anyhow::{Context, Result};
 use log::{debug, error, trace, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -228,7 +229,7 @@ pub fn forward_syscall(num: u64, args: &[u64; 16]) -> (u64, u64, u64) {
 pub struct DefaultTrapHandler {
     map_fixed_next: u64,
     mappings: Vec<(u64, usize)>,
-    tsd: u64,
+    threads: Threads,
     exit_status: Option<i32>,
 }
 
@@ -244,7 +245,7 @@ impl DefaultTrapHandler {
         Ok(Self {
             map_fixed_next,
             mappings: Vec::new(),
-            tsd: 0,
+            threads: Threads::new()?,
             exit_status: None,
         })
     }
@@ -285,7 +286,7 @@ impl DefaultTrapHandler {
         for (addr, size) in self.mappings.drain(..) {
             unsafe { mach_vm_deallocate(nix::libc::mach_task_self(), addr, size as u64) };
         }
-        self.tsd = 0;
+        self.threads.set_tsd(0);
     }
 
     fn align_size(size: u64) -> u64 {
@@ -521,7 +522,7 @@ impl TrapHandler for DefaultTrapHandler {
                     trace!("Fixing mach_vm_allocate address to {:x}", chosen);
                     self.release_fixed_map_range(chosen, args[2])?;
                     self.write_out_address(args[1], chosen);
-                    (ret0, ret1, cflags) = forward_syscall(num, &args);
+                    (ret0, ret1, cflags) = self.threads.forward(num, &args)?;
                     if ret0 != KERN_SUCCESS {
                         self.restore_fixed_map_range(chosen, args[2])?;
                     }
@@ -542,7 +543,7 @@ impl TrapHandler for DefaultTrapHandler {
                     trace!("Fixing mach_vm_map address to {:x}", chosen);
                     self.release_fixed_map_range(chosen, args[2])?;
                     self.write_out_address(args[1], chosen);
-                    (ret0, ret1, cflags) = forward_syscall(num, &args);
+                    (ret0, ret1, cflags) = self.threads.forward(num, &args)?;
                     if ret0 != KERN_SUCCESS {
                         self.restore_fixed_map_range(chosen, args[2])?;
                     }
@@ -736,11 +737,11 @@ impl TrapHandler for DefaultTrapHandler {
                 let code = args[3];
                 match code {
                     2 => {
-                        self.tsd = args[0];
+                        self.threads.set_tsd(args[0]);
                         handled = true;
                     }
                     3 => {
-                        ret0 = self.tsd;
+                        ret0 = self.threads.tsd();
                         handled = true;
                     }
                     _ => {
@@ -752,7 +753,7 @@ impl TrapHandler for DefaultTrapHandler {
         }
 
         if !handled {
-            (ret0, ret1, cflags) = forward_syscall(num, &args);
+            (ret0, ret1, cflags) = self.threads.forward(num, &args)?;
             if let Some((addr, size)) = released_fixed_map_range {
                 if cflags & (1 << 29) != 0 {
                     self.restore_fixed_map_range(addr, size)?;
@@ -829,7 +830,7 @@ impl TrapHandler for DefaultTrapHandler {
             _ => {}
         }
 
-        vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, self.tsd)?;
+        vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, self.threads.tsd())?;
         Ok(SyscallResult::cont(ret0, ret1, cflags))
     }
 }

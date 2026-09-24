@@ -1,3 +1,6 @@
+// For passing SIMD registers to Hypervisor.framework; see threads::set_simd_fp_reg.
+#![feature(simd_ffi)]
+
 pub mod commpage;
 pub mod debug;
 pub mod dyld;
@@ -10,6 +13,7 @@ mod mach;
 pub mod respawn;
 pub mod symbols;
 pub mod syscalls;
+pub mod threads;
 pub mod trap;
 pub mod vm;
 
