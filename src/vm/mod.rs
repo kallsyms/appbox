@@ -1,7 +1,6 @@
 use self::hooks::Hooks;
 use crate::hyperpom::applevisor as av;
 use crate::hyperpom::caches::Caches;
-use crate::hyperpom::error::{Error as HyperpomError, MemoryError};
 use crate::hyperpom::exceptions::ExceptionClass;
 pub use crate::hyperpom::memory::MemoryCheckpoint;
 use crate::hyperpom::memory::{PhysMemAllocator, VirtMemAllocator};
@@ -191,8 +190,8 @@ pub struct VmManager {
     /// guest's, once calibrated.
     run_overhead: Option<u64>,
     guest_instructions: u64,
-    /// Where a pending single step (see [`Self::single_step`]) started.
-    stepping: Option<u64>,
+    /// Whether a single step (see [`Self::single_step`]) is pending.
+    stepping: bool,
     /// By slot.
     breakpoints: Vec<Option<u64>>,
     watchpoints: Vec<Option<Watchpoint>>,
@@ -209,7 +208,7 @@ impl VmManager {
         let hooks = Hooks::new();
 
         vma.init(&mut vcpu, true)?;
-        crate::hyperpom::caches::Caches::init(&mut vcpu, &mut vma)?;
+        Caches::init(&mut vma)?;
         vcpu.set_reg(av::Reg::LR, 0xdeadf000)?;
 
         Ok(Self {
@@ -220,7 +219,7 @@ impl VmManager {
             stopped: false,
             run_overhead: None,
             guest_instructions: 0,
-            stepping: None,
+            stepping: false,
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
             _vm: vm,
@@ -376,7 +375,7 @@ impl VmManager {
         }
         self.vcpu
             .set_sys_reg(av::SysReg::MDSCR_EL1, MDSCR_MDE | MDSCR_SS)?;
-        self.stepping = Some(self.vcpu.get_reg(av::Reg::PC)?);
+        self.stepping = true;
         let cpsr = self.vcpu.get_reg(av::Reg::CPSR)?;
         self.vcpu.set_reg(av::Reg::CPSR, cpsr | PSTATE_SS)?;
         Ok(())
@@ -421,17 +420,19 @@ impl VmManager {
         let result = self.run_to_exit();
         // A single step ends with whatever stops the guest next (e.g. the instruction was a
         // syscall), not just a step exception.
-        if self.stepping.take().is_some() {
+        if std::mem::take(&mut self.stepping) {
             self.arm_debug_registers()?;
         }
         result
     }
 
     fn run_to_exit(&mut self) -> Result<VmRunResult> {
-        let mut stepped_through_handler = false;
         loop {
+            if self.vma.take_caches_stale() {
+                Caches::invalidate(&mut self.vcpu)?;
+            }
             // A step can't run a whole exclusive sequence, so steps through one may fail.
-            if self.stepping.is_none() {
+            if !self.stepping {
                 self.rewind_exclusive_sequence()?;
             }
             self.run_once()?;
@@ -447,6 +448,14 @@ impl VmManager {
                             exit_info.exception.physical_address,
                         )? =>
                     {
+                        // Hypervisor.framework installs the page's now writable stage-2 entry
+                        // lazily, on the next write, handling the fault itself: an exit that
+                        // clears the exclusive monitor without us seeing it, which would fail the
+                        // store-exclusive again once rewound. So take it now.
+                        let pc = self.vcpu.get_reg(av::Reg::PC)?;
+                        if self.resume_address(pc) != pc {
+                            Caches::rewrite(&mut self.vcpu, exit_info.exception.virtual_address)?;
+                        }
                         continue;
                     }
                     ExceptionClass::DataAbortLowerEl | ExceptionClass::InsAbortLowerEl
@@ -456,39 +465,20 @@ impl VmManager {
                     {
                         continue;
                     }
-                    ExceptionClass::DataAbortLowerEl => {
-                        if self.handle_dirty_fault()? {
-                            continue;
-                        }
-                    }
-                    ExceptionClass::HvcA64 => {
-                        let esr = self.vcpu.get_sys_reg(av::SysReg::ESR_EL1)?;
-                        match ExceptionClass::from(esr >> 26) {
-                            ExceptionClass::DataAbortLowerEl => {
-                                if self.handle_dirty_fault()? {
-                                    continue;
-                                }
-                            }
-                            _ => {
-                                if esr == 0x56000080 {
-                                    return Ok(VmRunResult::Svc);
-                                }
-                            }
-                        }
+                    ExceptionClass::HvcA64
+                        if self.vcpu.get_sys_reg(av::SysReg::ESR_EL1)? == crate::trap::SVC_ESR =>
+                    {
+                        return Ok(VmRunResult::Svc);
                     }
                     ExceptionClass::BrkA64 => return Ok(VmRunResult::Brk),
                     ExceptionClass::BreakpointLowerEl => {
                         return Ok(VmRunResult::HardwareBreakpoint)
                     }
                     ExceptionClass::SoftwareStepLowerEL => {
-                        // The stepped instruction faulted into appbox's own handling at EL1
-                        // (e.g. for dirty tracking): step on through it, then (once it's back
-                        // at the instruction to retry it) through the instruction again.
+                        // Stepped into appbox's exception vectors (e.g. from an svc): step on, to
+                        // their exit.
                         let cpsr = self.vcpu.get_reg(av::Reg::CPSR)?;
-                        let pc = self.vcpu.get_reg(av::Reg::PC)?;
-                        let retrying = stepped_through_handler && Some(pc) == self.stepping;
-                        if cpsr & PSTATE_MODE != 0 || retrying {
-                            stepped_through_handler = !retrying;
+                        if cpsr & PSTATE_MODE != 0 {
                             self.vcpu.set_reg(av::Reg::CPSR, cpsr | PSTATE_SS)?;
                             continue;
                         }
@@ -524,22 +514,6 @@ impl VmManager {
             Some(u32::from_le_bytes(insn))
         };
         exclusive::rewind_target(read, pc).unwrap_or(pc)
-    }
-
-    fn handle_dirty_fault(&mut self) -> Result<bool> {
-        let far = self.vcpu.get_sys_reg(av::SysReg::FAR_EL1)?;
-        match self.vma.page_fault_dirty_state_handler(far) {
-            Ok(true) => {
-                let elr = self.vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
-                self.vcpu.set_reg(av::Reg::PC, self.resume_address(elr))?;
-                Caches::tlbi_vaae1_on_fault(&mut self.vcpu, &mut self.vma)?;
-                Ok(true)
-            }
-            Err(HyperpomError::Memory(MemoryError::UnallocatedMemoryAccess(_))) => Ok(false),
-            Err(HyperpomError::Memory(MemoryError::InvalidAddress(_))) => Ok(false),
-            Err(e) => Err(e.into()),
-            _ => Ok(false),
-        }
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -780,12 +754,13 @@ mod tests {
         Ok(())
     }
 
-    /// A 1:1 data page the guest hasn't written yet, so its first write takes a dirty-tracking
-    /// fault.
-    fn clean_data_page(vm: &mut VmManager) -> Result<MemoryMap> {
+    /// A 1:1 data page write-protected for a memory checkpoint, so the guest's first write to it
+    /// faults.
+    fn write_protected_page(vm: &mut VmManager) -> Result<MemoryMap> {
         let data = host_map(None, HOST_PAGE)?;
         vm.vma
             .map_1to1(data.data() as u64, data.len(), av::MemPerms::RWX)?;
+        vm.checkpoint_memory()?;
         Ok(data)
     }
 
@@ -794,7 +769,7 @@ mod tests {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const STR_X0_X1: u32 = 0xf9000020;
         let (mut vm, code) = vm_running(&[STR_X0_X1, BRK_0])?;
-        let data = clean_data_page(&mut vm)?;
+        let data = write_protected_page(&mut vm)?;
         vm.vcpu.set_reg(av::Reg::X0, 7)?;
         vm.vcpu.set_reg(av::Reg::X1, data.data() as u64)?;
         vm.single_step()?;
@@ -805,11 +780,21 @@ mod tests {
     }
 
     #[test]
+    fn stepping_a_syscall_stops_for_it() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const SVC_0X80: u32 = 0xd4001001;
+        let (mut vm, _code) = vm_running(&[SVC_0X80, BRK_0])?;
+        vm.single_step()?;
+        assert!(matches!(vm.run()?, VmRunResult::Svc));
+        Ok(())
+    }
+
+    #[test]
     fn exclusive_sequences_survive_faults() -> Result<()> {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // ldxr x8, [x1]; add x8, x8, #1; stxr w9, x8, [x1]; brk #0
         let (mut vm, _code) = vm_running(&[0xc85f7c28, 0x91000508, 0xc8097c28, BRK_0])?;
-        let data = clean_data_page(&mut vm)?;
+        let data = write_protected_page(&mut vm)?;
         vm.vcpu.set_reg(av::Reg::X1, data.data() as u64)?;
         vm.vcpu.set_reg(av::Reg::X9, 0xff)?;
         assert!(matches!(vm.run()?, VmRunResult::Brk));

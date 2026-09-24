@@ -23,7 +23,7 @@ use std::time::Duration;
 const KERN_SUCCESS: u64 = 0;
 const KERN_DENIED: u64 = 53;
 const KERN_NOT_FOUND: u64 = 56;
-const SVC_ESR: u64 = 0x5600_0080;
+pub(crate) const SVC_ESR: u64 = 0x5600_0080;
 const PAGE_ALIGN: u64 = 0x4000;
 // macOS 27 reserves 0x1_8000_0000..~0x70_0000_0000 in every process (shared region).
 pub(crate) const FIXED_MAP_BASE: u64 = 0x80_0000_0000;

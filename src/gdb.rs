@@ -1010,7 +1010,7 @@ pub fn handle_command(
                 Err(_) => response_sender.send(GdbResponse::Error(1)).unwrap(),
             }
         }
-        GdbCommand::WriteMemory { addr, data } => match vm.vma.write(addr, &data) {
+        GdbCommand::WriteMemory { addr, data } => match vm.vma.write_code(addr, &data) {
             Ok(_) => response_sender.send(GdbResponse::Ok).unwrap(),
             Err(_) => response_sender.send(GdbResponse::Error(1)).unwrap(),
         },

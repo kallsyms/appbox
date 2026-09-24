@@ -850,9 +850,6 @@ bitfield! {
     /// // It's also possible to create privileged mappings restricted to EL1. This is necessary
     /// // to create EL1 mappings that do not trigger PAN.
     /// let descriptor = PageDescriptor::new(0x1235000, av::MemPerms::RWX, true);
-    ///
-    /// // And a descriptor can also be transformed into its read-only version.
-    /// let ro_descriptor = descriptor.read_only(true);
     /// ```
     #[derive(Copy, Clone, Eq, Hash, PartialEq)]
     pub struct PageDescriptor(u64);
@@ -919,48 +916,6 @@ impl PageDescriptor {
         descriptor
     }
 
-    /// Gets the read-only version of a page descriptor.
-    ///
-    /// This method is primarily used to detect dirty pages:
-    ///
-    ///  * we first map writable pages as read-only;
-    ///  * when the guest tries to write to it, we generate a fault;
-    ///  * we mark the page as dirty;
-    ///  * we then remap it as writable;
-    ///  * finally we resume the execution and retry the instruction.
-    pub fn read_only(&self, privileged: bool) -> Self {
-        // Using the access permissions table from the ARM documentation, for a set of given
-        // permissions we want the corresponding read-only AP.
-        // We can simplify the mapping a bit using the following truth table.
-        //
-        // ```text
-        // +============+======++=======+
-        // | PRIVILEGED |  AP  || AP_RO |
-        // +============+======++=======+
-        // |      0     | 0  0 ||  0 0  |
-        // |      0     | 0  1 ||  1 1  |
-        // |      0     | 1  0 ||  1 0  |
-        // |      0     | 1  1 ||  1 1  |
-        // |      1     | 0  0 ||  1 0  |
-        // |      1     | 0  1 ||  1 1  |
-        // |      1     | 1  0 ||  1 0  |
-        // |      1     | 1  1 ||  1 1  |
-        // +============+======++=======+
-        // ```
-        //
-        // The final expression can therefore be written as:
-        //
-        // ```text
-        // ((PRIVILEGED | AP[1] | AP[0]) << 1) | AP[0]
-        // ```
-        let mut descriptor_ro = *self;
-        let ap0 = self.get_ap() & 1;
-        let ap1 = (self.get_ap() >> 1) & 1;
-        let privileged = privileged as u64;
-        let ap_ro = ((privileged | ap1 | ap0) << 1) | ap0;
-        descriptor_ro.set_ap(ap_ro);
-        descriptor_ro
-    }
 }
 
 /// Represents a *Page Global Directory*.
@@ -1067,14 +1022,17 @@ impl PageTable {
         unsafe { std::ptr::read(self.entries.host_addr.add(idx * 8) as *const u64) }
     }
 
-    fn set_entry(&mut self, idx: usize, desc: u64) {
-        match (self.entry(idx) != 0, desc != 0) {
+    /// Returns whether it removed or replaced a valid descriptor, which the TLBs may hold.
+    fn set_entry(&mut self, idx: usize, desc: u64) -> bool {
+        let old = self.entry(idx);
+        match (old != 0, desc != 0) {
             (false, true) => self.used += 1,
             (true, false) => self.used -= 1,
             _ => {}
         }
         // SAFETY: as for `entry`.
         unsafe { std::ptr::write(self.entries.host_addr.add(idx * 8) as *mut u64, desc) };
+        old != 0 && old != desc
     }
 }
 
@@ -1264,42 +1222,7 @@ impl PageTable {
 ///
 /// You can refer to [`VirtMemAllocator`] for more information about the virtual memory allocator
 /// used by the fuzzer.
-///
-/// ## Handling Dirty Bits
-///
-/// Another useful feature that we want for our virtual memory management is the ability to detect
-/// pages that have been modified. This is especially important for a fuzzer because it allows us
-/// between to only restore the pages that have been modified thus reducing the downtime between
-/// every iteration.
-///
-/// Revision v8.1 of the ARM architecture introduces a hardware dirty state manager, where a page
-/// descriptor is modified directly by the processor when the page is modified. However, this
-/// feature is not implemented on Apple Silicon chips, according to the `ID_AA64MMFR1_EL1`
-/// register.
-///
-/// ```text
-/// // Value read from the CPU
-/// ID_AA64MMFR1_EL1 = 0x11212000
-///
-/// ID_AA64MMFR1_EL1[3:0] = 0b0000
-///     -> HAFDBS-> bits [3:0]: Hardware updates to Access flag and Dirty state in translation
-///                             tables.
-///         -> 0b0000: Hardware update of the Access flag and dirty state are not supported.
-/// ```
-///
-/// But since we still want this feature, we'll have to emulate it in software. To achieve this,
-/// we simply remap writable pages to read-only ones (using [`PageDescriptor::read_only`]) and
-/// store a copy of the original writable mapping descriptor.
-///
-/// When the page is written to for the first time, it will raise a data abort exception. If the
-/// page descriptor currently in use differs from the saved one, it means that it is a page that
-/// was remapped with read-only permissions for the purpose of detecting write accesses to it. In
-/// that case, the page is remapped with the original intended permissions, the fault handler then
-/// resumes the execution on the faulting address and retry the access.
-///
-/// This time around, if an exception occurs again, we know it's not related to the
-/// handling of dirty states, but an actual exception that needs to be propagated to the
-/// corresponding handler.
+
 #[derive(Clone, Debug)]
 pub struct PageTableManager {
     pub(crate) slab: SlabAllocator,
@@ -1320,6 +1243,8 @@ pub struct PageTableManager {
     write_protected: BTreeSet<u64>,
     /// Whether lazily mapped pages start out write-protected.
     write_protecting: bool,
+    /// Whether descriptors have been removed or replaced since the TLBs were last invalidated.
+    tlb_stale: bool,
 }
 
 /// Granularity at which lazily mapped 1:1 ranges are faulted in.
@@ -1439,6 +1364,7 @@ impl PageTableManager {
             one_to_one: BTreeMap::new(),
             write_protected: BTreeSet::new(),
             write_protecting: false,
+            tlb_stale: false,
         })
     }
 
@@ -1461,7 +1387,7 @@ impl PageTableManager {
             let page = self.slab.alloc()?;
             let desc = PageDescriptor::new(page.guest_addr, perms, privileged);
             self.fill_ptes(page_addr, page_addr + VIRT_PAGE_SIZE as u64, |_| {
-                desc.read_only(privileged).0
+                desc.0
             })?;
             self.slab_pages.insert(page_addr, page);
         }
@@ -1819,9 +1745,7 @@ impl PageTableManager {
         self.remove_regions(addr, end, |_| true)?;
         let paddr = self.allocate_one_to_one_paddr(size as u64);
         self.fill_ptes(addr, end, |page_addr| {
-            PageDescriptor::new(paddr + (page_addr - addr), perms, privileged)
-                .read_only(privileged)
-                .0
+            PageDescriptor::new(paddr + (page_addr - addr), perms, privileged).0
         })?;
         self.insert_region(
             addr,
@@ -1942,10 +1866,12 @@ impl PageTableManager {
         while addr < end {
             let table_end = (addr | ((1 << 21) - 1)).saturating_add(1);
             let pt = self.page_table_mut(addr)?;
+            let mut stale = false;
             while addr < end.min(table_end) {
-                pt.set_entry((addr >> 12 & 0x1ff) as usize, desc(addr));
+                stale |= pt.set_entry((addr >> 12 & 0x1ff) as usize, desc(addr));
                 addr += VIRT_PAGE_SIZE as u64;
             }
+            self.tlb_stale |= stale;
         }
         Ok(())
     }
@@ -2007,7 +1933,7 @@ impl PageTableManager {
                 continue;
             };
             while addr < end.min(table_end) {
-                pt.set_entry((addr >> 12 & 0x1ff) as usize, 0);
+                self.tlb_stale |= pt.set_entry((addr >> 12 & 0x1ff) as usize, 0);
                 addr += VIRT_PAGE_SIZE as u64;
             }
             if pt.used == 0 {
@@ -2053,38 +1979,6 @@ impl PageTableManager {
         let (_, host_page) = self.page(addr)?;
         // SAFETY: the offset is within the page.
         Ok(unsafe { host_page.add((addr & (VIRT_PAGE_SIZE as u64 - 1)) as usize) })
-    }
-
-    /// This function is called when a data abort exception occurs. Since we handle dirty states by
-    /// remapping pages with read-only permissions, it's possible that the data abort exception
-    /// comes from a write access that we want to detect to set the page as dirty.
-    ///
-    /// This function will try to remap the page with its intended permissions, if its descriptor
-    /// currently in the page table differs.
-    ///
-    /// # Return value
-    ///
-    /// This functions returns:
-    ///
-    ///  * `Ok(true)` if a remapping occured because the descriptors differ.
-    ///  * `Ok(false)` if no remapping occured since the descriptors were the same.
-    ///
-    /// This value is used by the data abort exception handler to decide whether it needs to retry
-    /// the faulting exception after a remapping or if it should propagate the exception to the
-    /// actual data abort handler.
-    fn dirty_bit_handler(&mut self, addr: u64) -> Result<bool> {
-        let page_addr = align_virt_page!(addr);
-        let (desc, _) = self.page(page_addr)?;
-        let idx = (page_addr >> 12 & 0x1ff) as usize;
-        let in_use = self
-            .page_table(page_addr)
-            .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?
-            .entry(idx);
-        if in_use == desc.0 {
-            return Ok(false);
-        }
-        self.page_table_mut(page_addr)?.set_entry(idx, desc.0);
-        Ok(true)
     }
 
     /// Adds a descriptor `desc` at index `idx` into the [`SlabObject`] `ents` that corresponds to
@@ -2234,6 +2128,8 @@ pub struct VirtMemAllocator {
     /// See [`Self::checkpoint_memory`]: oldest first.
     memory_intervals: Vec<MemoryInterval>,
     next_memory_checkpoint: u64,
+    /// See [`Self::write_code`].
+    code_written: bool,
 }
 
 /// A state of guest memory that [`VirtMemAllocator::restore_memory`] can go back to.
@@ -2257,6 +2153,7 @@ impl VirtMemAllocator {
             lower_table,
             memory_intervals: Vec::new(),
             next_memory_checkpoint: 0,
+            code_written: false,
         })
     }
 
@@ -2508,6 +2405,22 @@ impl VirtMemAllocator {
         }
     }
 
+    /// Whether the guest's TLBs may hold translations since removed or replaced, or its
+    /// instruction caches code since rewritten, which must be invalidated before it runs again.
+    /// Clears it.
+    pub fn take_caches_stale(&mut self) -> bool {
+        std::mem::take(&mut self.code_written)
+            | std::mem::take(&mut self.lower_table.tlb_stale)
+            | std::mem::take(&mut self.upper_table.tlb_stale)
+    }
+
+    /// Like [`Self::write`], for (possibly) rewriting code the guest may have run, whose stale
+    /// copies in the instruction caches are then invalidated before the guest runs again.
+    pub fn write_code(&mut self, addr: u64, buf: &[u8]) -> Result<usize> {
+        self.code_written = true;
+        self.write(addr, buf)
+    }
+
     /// See [`PageTableManager::write_protect_1to1`].
     pub fn write_protect_1to1(&mut self) -> Result<()> {
         self.lower_table.write_protect_1to1()?;
@@ -2580,17 +2493,6 @@ impl VirtMemAllocator {
             0x0000 => self.lower_table.unmap(addr, size),
             0xffff => self.upper_table.unmap(addr, size),
             _ => Err(MemoryError::InvalidAddress(addr))?,
-        }
-    }
-
-    /// Checks if the page fault was due to dirty state detection, and handles it accordingly, or
-    /// if it's a legitimate data abort exception that needs to be propagated.
-    pub fn page_fault_dirty_state_handler(&mut self, far: u64) -> Result<bool> {
-        // Determines which page table should be used based on the region the address is from.
-        match far >> 0x30 {
-            0x0000 => self.lower_table.dirty_bit_handler(far),
-            0xffff => self.upper_table.dirty_bit_handler(far),
-            _ => Err(MemoryError::InvalidAddress(far))?,
         }
     }
 
@@ -2760,18 +2662,5 @@ mod tests {
         let mut td = TableDescriptor(0);
         td.set_aptable(2);
         assert_eq!(td.0, 2 << 61);
-    }
-
-    #[test]
-    fn page_table_read_only_descriptor() {
-        let ro_ap = vec![0, 3, 2, 3, 2, 3, 2, 3];
-        for (i, expected_ap) in ro_ap.into_iter().enumerate() {
-            let ap = (i & 3) as u64;
-            let privileged = if (i >> 2) & 1 == 1 { true } else { false };
-            let mut d = PageDescriptor(0);
-            d.set_ap(ap);
-            let ro = d.read_only(privileged);
-            assert_eq!(expected_ap, ro.get_ap());
-        }
     }
 }

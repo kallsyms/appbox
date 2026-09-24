@@ -66,7 +66,7 @@ impl Hooks {
             trace!("Adding breakpoint at {:#x}", addr);
             let mut hook = Hook::new();
             vma.read(addr, &mut hook.insn)?;
-            vma.write_dword(addr, Self::BRK_STAGE_1)?;
+            vma.write_code(addr, &Self::BRK_STAGE_1.to_le_bytes())?;
             hook.applied = true;
             e.insert(hook);
         }
@@ -77,7 +77,7 @@ impl Hooks {
         if let Some(hook) = self.hooks.remove(&addr) {
             if hook.applied {
                 trace!("Removing breakpoint at {:#x}", addr);
-                vma.write(addr, &hook.insn)?;
+                vma.write_code(addr, &hook.insn)?;
             }
         }
         Ok(())
@@ -98,7 +98,7 @@ impl Hooks {
                     "Preparing for debugger at {:#x}: restoring original instruction",
                     pc
                 );
-                vma.write(pc, &hook.insn)?;
+                vma.write_code(pc, &hook.insn)?;
                 hook.applied = false;
             }
         }
