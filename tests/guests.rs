@@ -205,3 +205,14 @@ fn exec_applies_close_on_exec() {
     let after_exec = &trace[trace.find("\nexec ").expect("no exec in trace")..];
     assert!(after_exec.contains("VM exited: Exit"), "{trace}");
 }
+
+#[test]
+fn preemption() {
+    let output = run(&[&guest("preempt")]);
+    assert_output(
+        &output,
+        0,
+        &["worker ran while main spun: yes"],
+        &["<preempted, switched to thread"],
+    );
+}

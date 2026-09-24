@@ -217,6 +217,10 @@ pub struct Args {
     #[clap(short, long)]
     pub output: Option<PathBuf>,
 
+    /// Guest threads' time slice in microseconds, or 0 to only switch threads when one blocks.
+    #[clap(long)]
+    pub quantum: Option<u64>,
+
     /// Target executable
     #[clap(required = true)]
     pub executable: String,
@@ -279,6 +283,9 @@ fn main() -> Result<()> {
         .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)?;
 
     let mut handler = DefaultTrapHandler::new()?;
+    if let Some(quantum) = args.quantum {
+        handler.set_quantum((quantum > 0).then(|| std::time::Duration::from_micros(quantum)));
+    }
 
     loop {
         let exit = match vm.run()? {
@@ -331,6 +338,20 @@ fn main() -> Result<()> {
             VmRunResult::Brk => {
                 print_stack(&mut trace, &vm, &loader)?;
                 ExitKind::Crash("guest trap (brk)".to_string())
+            }
+            VmRunResult::Timer => {
+                if let Some(switch) = handler.handle_timer(&vm.vcpu, &mut vm.vma)? {
+                    writeln!(
+                        trace,
+                        "[{}] <preempted, switched to thread {}>",
+                        switch.from.unwrap_or_default(),
+                        switch.to
+                    )?;
+                }
+                ExitKind::Continue
+            }
+            VmRunResult::HardwareBreakpoint | VmRunResult::Step => {
+                ExitKind::Crash("unexpected debug exception".to_string())
             }
             VmRunResult::Other(exit_info) => match exit_info.reason {
                 av::ExitReason::EXCEPTION => {

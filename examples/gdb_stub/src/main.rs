@@ -142,6 +142,13 @@ fn main() -> Result<(), anyhow::Error> {
                     _ => result.exit,
                 }
             }
+            VmRunResult::Timer => {
+                handler.handle_timer(&vm.vcpu, &mut vm.vma)?;
+                ExitKind::Continue
+            }
+            VmRunResult::HardwareBreakpoint | VmRunResult::Step => {
+                ExitKind::Crash("unexpected debug exception".to_string())
+            }
             VmRunResult::Brk => {
                 let pc = vm.vcpu.get_reg(av::Reg::PC)?;
 

@@ -206,6 +206,13 @@ fn main() -> Result<()> {
                     _ => result.exit,
                 }
             }
+            VmRunResult::Timer => {
+                handler.handle_timer(&vm.vcpu, &mut vm.vma)?;
+                ExitKind::Continue
+            }
+            VmRunResult::HardwareBreakpoint | VmRunResult::Step => {
+                ExitKind::Crash("unexpected debug exception".to_string())
+            }
             VmRunResult::Brk => ExitKind::Continue,
             VmRunResult::Other(exit_info) => match exit_info.reason {
                 av::ExitReason::EXCEPTION => {

@@ -389,6 +389,14 @@ impl Threads {
         self.handle(Message::Completed(id, ret));
     }
 
+    /// Handles whatever has happened meanwhile (syscalls finishing, kevents arriving), without
+    /// waiting.
+    pub(crate) fn poll(&mut self) {
+        while let Ok(message) = self.messages.try_recv() {
+            self.handle(message);
+        }
+    }
+
     /// Waits for a syscall to finish or kevents to arrive.
     pub(crate) fn wait(&mut self) -> Result<()> {
         let message = self.messages.recv().context("syscall proxies exited")?;
@@ -406,6 +414,13 @@ impl Threads {
             .range(after + 1..)
             .find_map(runnable)
             .or_else(|| self.threads.range(..=after).find_map(runnable))
+    }
+
+    /// Whether any thread but the current one could run: runnable, or blocked in a syscall.
+    pub(crate) fn others_alive(&self) -> bool {
+        self.threads.iter().any(|(&id, thread)| {
+            Some(id) != self.current && !matches!(thread.state, State::Parked)
+        })
     }
 
     /// Whether any thread could still run: runnable, running or blocked in a syscall.
@@ -446,6 +461,19 @@ impl Threads {
         }
         let mut regs = Registers::save_at_syscall(vcpu)?;
         apply_return(&mut regs, ret);
+        self.current_thread().state = State::Runnable(regs);
+        self.current = None;
+        Ok(true)
+    }
+
+    /// Takes the current thread (at any instruction, not a syscall) off the vCPU as runnable, if
+    /// another thread could run instead (or might, once kevents are delivered). Returns whether
+    /// it did.
+    pub(crate) fn preempt_current(&mut self, vcpu: &av::Vcpu) -> Result<bool> {
+        if self.next_runnable().is_none() && self.kevents_pending.is_empty() {
+            return Ok(false);
+        }
+        let regs = Registers::save(vcpu)?;
         self.current_thread().state = State::Runnable(regs);
         self.current = None;
         Ok(true)
