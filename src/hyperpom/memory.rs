@@ -4,15 +4,11 @@
 use applevisor as av;
 use applevisor::Mappable;
 use bitfield::bitfield;
-use rhexdump as rh;
 
 use std::cell::RefCell;
-use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
-use std::io::prelude::*;
-use std::path::Path;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crate::hyperpom::error::*;
@@ -1028,7 +1024,7 @@ pub struct PageMiddleDirectory {
     /// A hashmap mapping the descriptor's index to the corresponding PT object.
     /// It's a more convenient way to handle page table components rather than manually parsing and
     /// changing descriptors in memory.
-    objects: HashMap<usize, Rc<RefCell<PageTable>>>,
+    objects: HashMap<usize, PageTable>,
 }
 
 impl PageMiddleDirectory {
@@ -1051,10 +1047,8 @@ pub struct PageTable {
     descriptor: TableDescriptor,
     /// The slab object pointing to memory that contains the raw descriptors.
     entries: SlabObject,
-    /// A hashmap mapping the descriptor's index to the corresponding Page object.
-    /// It's a more convenient way to handle page table components rather than manually parsing and
-    /// changing descriptors in memory.
-    objects: HashMap<usize, Rc<RefCell<Page>>>,
+    /// How many of its descriptors are valid, to free it once none are.
+    used: usize,
 }
 
 impl PageTable {
@@ -1063,58 +1057,24 @@ impl PageTable {
         Self {
             descriptor: TableDescriptor::new(entries.guest_addr as u64),
             entries,
-            objects: HashMap::new(),
+            used: 0,
         }
     }
-}
 
-/// Represents a guest physical memory page.
-///
-/// See [`PageTableManager`] for more information.
-#[derive(Clone, Debug)]
-pub struct Page {
-    /// Descriptor storing the original information and permissions of the page.
-    descriptor: PageDescriptor,
-    /// Descriptor currently stored in the page table. This field exists to handle dirty
-    /// pages.
-    descriptor_in_use: PageDescriptor,
-    /// Field used for dirty bit emulation and set when a page is written to.
-    dirty: bool,
-    /// Page memory permissions.
-    perms: av::MemPerms,
-    /// Defines if it's a privileged mapping.
-    privileged: bool,
-    /// The slab object storing the page data.
-    ///
-    /// Stored as an `Option` because `Page`s are manipulated by the virtual address space through
-    /// `RefCell`s. This allows us to take out the underlying `SlabObject` and pass it to the
-    /// `free` function of the `SlabAllocator` while it's borrowed.
-    data: Option<SlabObject>,
-    /// Reference to the parent page table.
-    ///
-    /// When tracking the dirty bit, finding the page table that corresponds to a page can be
-    /// costly. Having a weak reference directly in the object will provide better performances.
-    parent: Weak<RefCell<PageTable>>,
-}
+    fn entry(&self, idx: usize) -> u64 {
+        // SAFETY: the entries are mapped as long as the table exists, and `idx` is below
+        //         PAGE_TABLE_NB_ENTRIES.
+        unsafe { std::ptr::read(self.entries.host_addr.add(idx * 8) as *const u64) }
+    }
 
-impl Page {
-    /// Creates a new guest physical memory page.
-    pub fn new(
-        data: SlabObject,
-        perms: av::MemPerms,
-        privileged: bool,
-        parent: Weak<RefCell<PageTable>>,
-    ) -> Self {
-        let descriptor = PageDescriptor::new(data.guest_addr as u64, perms, privileged);
-        Self {
-            descriptor,
-            descriptor_in_use: descriptor.read_only(privileged),
-            perms,
-            privileged,
-            dirty: false,
-            data: Some(data),
-            parent,
+    fn set_entry(&mut self, idx: usize, desc: u64) {
+        match (self.entry(idx) != 0, desc != 0) {
+            (false, true) => self.used += 1,
+            (true, false) => self.used -= 1,
+            _ => {}
         }
+        // SAFETY: as for `entry`.
+        unsafe { std::ptr::write(self.entries.host_addr.add(idx * 8) as *mut u64, desc) };
     }
 }
 
@@ -1344,7 +1304,11 @@ impl Page {
 pub struct PageTableManager {
     pub(crate) slab: SlabAllocator,
     pub(crate) pgd: PageGlobalDirectory,
-    pub(crate) allocs: BTreeMap<u64, Rc<RefCell<Page>>>,
+    /// What's mapped, by virtual start address: non-overlapping, and coalesced where adjacent
+    /// ones agree.
+    regions: BTreeMap<u64, Region>,
+    /// The pages backing [`Backing::Slab`] regions, by virtual address.
+    slab_pages: BTreeMap<u64, SlabObject>,
     one_to_one_last: u64,
     /// Guest physical ranges below `one_to_one_last` free for reuse, as start -> size.
     free_one_to_one: BTreeMap<u64, u64>,
@@ -1375,6 +1339,53 @@ enum LazyPage {
 struct OneToOne {
     host_addr: u64,
     pages: Vec<LazyPage>,
+}
+
+/// A virtually contiguous range mapped with the same permissions and backing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Region {
+    size: u64,
+    perms: av::MemPerms,
+    privileged: bool,
+    backing: Backing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backing {
+    /// Host memory at the same address, at guest physical addresses from `paddr` on.
+    OneToOne { paddr: u64 },
+    /// Pages from the slab allocator, one per virtual page (see
+    /// [`PageTableManager::slab_pages`]).
+    Slab,
+}
+
+impl Region {
+    /// This region's part from `offset` bytes in, `size` bytes long.
+    fn slice(&self, offset: u64, size: u64) -> Self {
+        let backing = match self.backing {
+            Backing::OneToOne { paddr } => Backing::OneToOne {
+                paddr: paddr + offset,
+            },
+            Backing::Slab => Backing::Slab,
+        };
+        Self {
+            size,
+            backing,
+            ..*self
+        }
+    }
+
+    /// Whether `next`, starting right after this region, can be merged into it.
+    fn continues_into(&self, next: &Region) -> bool {
+        let backing_continues = match (self.backing, next.backing) {
+            (Backing::OneToOne { paddr }, Backing::OneToOne { paddr: next_paddr }) => {
+                paddr + self.size == next_paddr
+            }
+            (Backing::Slab, Backing::Slab) => true,
+            _ => false,
+        };
+        backing_continues && self.perms == next.perms && self.privileged == next.privileged
+    }
 }
 
 /// Sets the VM's permissions on a 1:1 range, which is always readable and executable.
@@ -1421,7 +1432,8 @@ impl PageTableManager {
         Ok(Self {
             slab,
             pgd,
-            allocs: BTreeMap::new(),
+            regions: BTreeMap::new(),
+            slab_pages: BTreeMap::new(),
             one_to_one_last: 0x1_0000_0000,
             free_one_to_one: BTreeMap::new(),
             one_to_one: BTreeMap::new(),
@@ -1431,8 +1443,9 @@ impl PageTableManager {
     }
 
     /// Maps the virtual address range of size `size` and starting at virtual address `addr` with
-    /// permissions `perms`. `privileged` determines if the mapping should be privileged or not
-    /// (i.e. whether or not instructions running at EL0 can access it).
+    /// permissions `perms`, backed by pages from the slab allocator. `privileged` determines if the
+    /// mapping should be privileged or not (i.e. whether or not instructions running at EL0 can
+    /// access it).
     pub fn map(
         &mut self,
         addr: u64,
@@ -1440,71 +1453,27 @@ impl PageTableManager {
         perms: av::MemPerms,
         privileged: bool,
     ) -> Result<()> {
-        // Makes sure the range's start address is page-aligned.
-        if addr & (VIRT_PAGE_SIZE as u64 - 1) != 0 {
-            return Err(MemoryError::UnalignedAddress(addr))?;
+        let end = Self::virt_range(addr, size)?;
+        if let Some(mapped) = self.regions_overlapping(addr, end).next() {
+            return Err(MemoryError::AlreadyMapped(mapped.0.max(addr)))?;
         }
-        // Makes sure the range's size is page-aligned.
-        if size & (VIRT_PAGE_SIZE - 1) != 0 {
-            return Err(MemoryError::UnalignedSize(size))?;
+        for page_addr in (addr..end).step_by(VIRT_PAGE_SIZE) {
+            let page = self.slab.alloc()?;
+            let desc = PageDescriptor::new(page.guest_addr, perms, privileged);
+            self.fill_ptes(page_addr, page_addr + VIRT_PAGE_SIZE as u64, |_| {
+                desc.read_only(privileged).0
+            })?;
+            self.slab_pages.insert(page_addr, page);
         }
-        // Computes the start and end of the address range.
-        let range_start = addr;
-        let range_end = round_virt_page!(addr
-            .checked_add(size as u64)
-            .ok_or(MemoryError::Overflow(addr, size))?);
-        // Iterates over the address of each page boundary and adds them to the page table.
-        for addr in (range_start..range_end).step_by(VIRT_PAGE_SIZE) {
-            let pud_idx = (addr >> 39 & 0x1ff) as usize;
-            // Adds a new PUD if one doesn't already exist at index `pud_idx`.
-            if let Entry::Vacant(e) = self.pgd.objects.entry(pud_idx) {
-                let pud = PageUpperDirectory::new(self.slab.alloc()?);
-                Self::add_entry(pud.descriptor.0, pud_idx, &mut self.pgd.entries)?;
-                e.insert(pud);
-            }
-            // We've made sure that an entry exists here, so it's safe to unwrap.
-            let pud = self.pgd.objects.get_mut(&pud_idx).unwrap();
-
-            let pmd_idx = (addr >> 30 & 0x1ff) as usize;
-            // Adds a new PMD if one doesn't already exist at index `pmd_idx`.
-            if let Entry::Vacant(e) = pud.objects.entry(pmd_idx) {
-                let pmd = PageMiddleDirectory::new(self.slab.alloc()?);
-                Self::add_entry(pmd.descriptor.0, pmd_idx, &mut pud.entries)?;
-                e.insert(pmd);
-            }
-            // We've made sure that an entry exists here, so it's safe to unwrap.
-            let pmd = pud.objects.get_mut(&pmd_idx).unwrap();
-
-            let pt_idx = (addr >> 21 & 0x1ff) as usize;
-            // Adds a new PT if one doesn't already exist at index `pt_idx`.
-            if let Entry::Vacant(e) = pmd.objects.entry(pt_idx) {
-                let pt = PageTable::new(self.slab.alloc()?);
-                Self::add_entry(pt.descriptor.0, pt_idx, &mut pmd.entries)?;
-                e.insert(Rc::new(RefCell::new(pt)));
-            }
-            // We've made sure that an entry exists here, so it's safe to unwrap.
-            let pt_cell = pmd.objects.get_mut(&pt_idx).unwrap();
-
-            let page_idx = (addr >> 12 & 0x1ff) as usize;
-            // Adds a new page entry if one doesn't already exist at index `page_idx`.
-            let pt_mut = &mut *pt_cell.borrow_mut();
-            let pt_entries = &mut pt_mut.entries;
-            let pt_objects = &mut pt_mut.objects;
-            if let Entry::Vacant(e) = pt_objects.entry(page_idx) {
-                let page = Page::new(
-                    self.slab.alloc()?,
-                    perms,
-                    privileged,
-                    Rc::downgrade(pt_cell),
-                );
-                Self::add_entry(page.descriptor_in_use.0, page_idx, pt_entries)?;
-                let page_ref = Rc::new(RefCell::new(page));
-                e.insert(page_ref.clone());
-                self.allocs.insert(addr, page_ref);
-            } else {
-                return Err(MemoryError::AlreadyMapped(addr))?;
-            }
-        }
+        self.insert_region(
+            addr,
+            Region {
+                size: end - addr,
+                perms,
+                privileged,
+                backing: Backing::Slab,
+            },
+        );
         Ok(())
     }
 
@@ -1775,9 +1744,9 @@ impl PageTableManager {
         let mut pages = Vec::new();
         let mut page_addr = addr & !(HOST_PAGE_SIZE - 1);
         while page_addr < end {
-            let is_one_to_one = self
-                .get_page_by_addr(page_addr)
-                .is_ok_and(|page| page.borrow().data.as_ref().is_some_and(|d| d.parent.is_none()));
+            let is_one_to_one = self.region_at(page_addr).is_some_and(|(_, region)| {
+                matches!(region.backing, Backing::OneToOne { .. })
+            });
             if is_one_to_one {
                 pages.push(page_addr);
             }
@@ -1799,23 +1768,19 @@ impl PageTableManager {
         if addr & (HOST_PAGE_SIZE - 1) != 0 {
             return Err(MemoryError::UnalignedAddress(addr))?;
         }
-        let range_end = addr
+        let end = addr
             .checked_add(size as u64)
             .ok_or(MemoryError::Overflow(addr, size))?;
-        let mut host_page_paddrs = Vec::new();
-        for page_addr in (addr..range_end).step_by(VIRT_PAGE_SIZE) {
-            let Ok(page) = self.get_page_by_addr(page_addr) else {
-                continue;
+        let removed = self.remove_regions(addr, end, |region| {
+            matches!(region.backing, Backing::OneToOne { .. })
+        })?;
+        let mut host_page_paddrs = BTreeSet::new();
+        for (_, region) in removed {
+            let Backing::OneToOne { paddr } = region.backing else {
+                unreachable!("only 1:1 regions were removed");
             };
-            let paddr = match page.borrow().data.as_ref() {
-                Some(data) if data.parent.is_none() => data.guest_addr,
-                _ => continue,
-            };
-            self.remove_page(page_addr)?;
-            let host_page_paddr = paddr & !(HOST_PAGE_SIZE - 1);
-            if host_page_paddrs.last() != Some(&host_page_paddr) {
-                host_page_paddrs.push(host_page_paddr);
-            }
+            let first = paddr & !(HOST_PAGE_SIZE - 1);
+            host_page_paddrs.extend((first..paddr + region.size).step_by(HOST_PAGE_SIZE as usize));
         }
 
         let mut ranges = BTreeSet::new();
@@ -1841,7 +1806,8 @@ impl PageTableManager {
     }
 
     /// Assigns guest physical addresses to a 1:1 range and adds it to the page tables, without
-    /// creating the stage-2 mapping. Returns the range's guest physical address.
+    /// creating the stage-2 mapping. Returns the range's guest physical address. Whatever was
+    /// mapped there before is replaced.
     fn map_1to1_tables(
         &mut self,
         addr: u64,
@@ -1849,211 +1815,276 @@ impl PageTableManager {
         perms: av::MemPerms,
         privileged: bool,
     ) -> Result<u64> {
-        // Makes sure the range's start address is page-aligned.
-        if addr & (VIRT_PAGE_SIZE as u64 - 1) != 0 {
-            return Err(MemoryError::UnalignedAddress(addr))?;
-        }
-        // Makes sure the range's size is page-aligned.
-        if size & (VIRT_PAGE_SIZE - 1) != 0 {
-            return Err(MemoryError::UnalignedSize(size))?;
-        }
-        // Computes the start and end of the address range.
-        let range_start = addr;
-        let range_end = round_virt_page!(addr
-            .checked_add(size as u64)
-            .ok_or(MemoryError::Overflow(addr, size))?);
-
-        let guest_paddr = self.allocate_one_to_one_paddr(size as u64);
-
-        // Iterates over the address of each page boundary and adds them to the page table.
-        for addr in (range_start..range_end).step_by(VIRT_PAGE_SIZE) {
-            let pud_idx = (addr >> 39 & 0x1ff) as usize;
-            // Adds a new PUD if one doesn't already exist at index `pud_idx`.
-            if let Entry::Vacant(e) = self.pgd.objects.entry(pud_idx) {
-                let pud = PageUpperDirectory::new(self.slab.alloc()?);
-                Self::add_entry(pud.descriptor.0, pud_idx, &mut self.pgd.entries)?;
-                e.insert(pud);
-            }
-            // We've made sure that an entry exists here, so it's safe to unwrap.
-            let pud = self.pgd.objects.get_mut(&pud_idx).unwrap();
-
-            let pmd_idx = (addr >> 30 & 0x1ff) as usize;
-            // Adds a new PMD if one doesn't already exist at index `pmd_idx`.
-            if let Entry::Vacant(e) = pud.objects.entry(pmd_idx) {
-                let pmd = PageMiddleDirectory::new(self.slab.alloc()?);
-                Self::add_entry(pmd.descriptor.0, pmd_idx, &mut pud.entries)?;
-                e.insert(pmd);
-            }
-            // We've made sure that an entry exists here, so it's safe to unwrap.
-            let pmd = pud.objects.get_mut(&pmd_idx).unwrap();
-
-            let pt_idx = (addr >> 21 & 0x1ff) as usize;
-            // Adds a new PT if one doesn't already exist at index `pt_idx`.
-            if let Entry::Vacant(e) = pmd.objects.entry(pt_idx) {
-                let pt = PageTable::new(self.slab.alloc()?);
-                Self::add_entry(pt.descriptor.0, pt_idx, &mut pmd.entries)?;
-                e.insert(Rc::new(RefCell::new(pt)));
-            }
-            // We've made sure that an entry exists here, so it's safe to unwrap.
-            let pt_cell = pmd.objects.get_mut(&pt_idx).unwrap();
-
-            let page_idx = (addr >> 12 & 0x1ff) as usize;
-            // Adds a new page entry if one doesn't already exist at index `page_idx`.
-            let pt_mut = &mut *pt_cell.borrow_mut();
-            let pt_entries = &mut pt_mut.entries;
-            let pt_objects = &mut pt_mut.objects;
-            // N.B. Not checking for already mapped
-            let page = Page::new(
-                SlabObject {
-                    host_addr: addr as _,
-                    guest_addr: guest_paddr + (addr - range_start) as u64,
-                    object_size: VIRT_PAGE_SIZE,
-                    parent: None,
-                },
+        let end = Self::virt_range(addr, size)?;
+        self.remove_regions(addr, end, |_| true)?;
+        let paddr = self.allocate_one_to_one_paddr(size as u64);
+        self.fill_ptes(addr, end, |page_addr| {
+            PageDescriptor::new(paddr + (page_addr - addr), perms, privileged)
+                .read_only(privileged)
+                .0
+        })?;
+        self.insert_region(
+            addr,
+            Region {
+                size: end - addr,
                 perms,
                 privileged,
-                Rc::downgrade(pt_cell),
-            );
-            Self::add_entry(page.descriptor_in_use.0, page_idx, pt_entries)?;
-            let page_ref = Rc::new(RefCell::new(page));
-            pt_objects.insert(page_idx, page_ref.clone());
-            self.allocs.insert(addr, page_ref);
-        }
-        Ok(guest_paddr)
+                backing: Backing::OneToOne { paddr },
+            },
+        );
+        Ok(paddr)
     }
 
     /// Unmaps the virtual address range of size `size` and starting at address `addr`.
     pub fn unmap(&mut self, addr: u64, size: usize) -> Result<()> {
-        // Makes sure the range's start address is page-aligned.
+        let end = Self::virt_range(addr, size)?;
+        self.remove_regions(addr, end, |_| true)?;
+        Ok(())
+    }
+
+    /// Checks `addr..addr + size` is page-aligned, returning its end.
+    fn virt_range(addr: u64, size: usize) -> Result<u64> {
         if addr & (VIRT_PAGE_SIZE as u64 - 1) != 0 {
             return Err(MemoryError::UnalignedAddress(addr))?;
         }
-        // Makes sure the range's size is page-aligned.
         if size & (VIRT_PAGE_SIZE - 1) != 0 {
             return Err(MemoryError::UnalignedSize(size))?;
         }
-        // Computes the start and end of the address range.
-        let range_start = addr;
-        let range_end = round_virt_page!(addr
+        Ok(addr
             .checked_add(size as u64)
-            .ok_or(MemoryError::Overflow(addr, size))?);
-        // Iterates over the address of each page boundary and removes them from the page table.
-        for addr in (range_start..range_end).step_by(VIRT_PAGE_SIZE) {
-            let page_data = self.remove_page(addr)?;
-            self.slab.free(page_data)?;
+            .ok_or(MemoryError::Overflow(addr, size))?)
+    }
+
+    /// The region containing virtual address `addr`, and where it starts.
+    fn region_at(&self, addr: u64) -> Option<(u64, &Region)> {
+        let (&start, region) = self.regions.range(..=addr).next_back()?;
+        (addr < start + region.size).then_some((start, region))
+    }
+
+    /// The regions overlapping `start..end`, and where they start.
+    fn regions_overlapping(&self, start: u64, end: u64) -> impl Iterator<Item = (u64, Region)> + '_ {
+        let first = self.region_at(start).map_or(start, |(region_start, _)| region_start);
+        self.regions
+            .range(first..end)
+            .map(|(&region_start, region)| (region_start, *region))
+    }
+
+    /// Adds a region, merging it with its neighbors where they agree.
+    fn insert_region(&mut self, mut start: u64, mut region: Region) {
+        if let Some((&before, previous)) = self.regions.range(..start).next_back() {
+            if before + previous.size == start && previous.continues_into(&region) {
+                region = Region {
+                    size: previous.size + region.size,
+                    ..*previous
+                };
+                self.regions.remove(&before);
+                start = before;
+            }
+        }
+        let end = start + region.size;
+        if let Some(next) = self.regions.get(&end).copied() {
+            if region.continues_into(&next) {
+                region.size += next.size;
+                self.regions.remove(&end);
+            }
+        }
+        self.regions.insert(start, region);
+    }
+
+    /// Unmaps the parts of the regions in `start..end` that `which` selects: splits them off,
+    /// clears their descriptors, and frees their slab pages. Returns the parts removed.
+    fn remove_regions(
+        &mut self,
+        start: u64,
+        end: u64,
+        which: impl Fn(&Region) -> bool,
+    ) -> Result<Vec<(u64, Region)>> {
+        let overlapping: Vec<(u64, Region)> = self
+            .regions_overlapping(start, end)
+            .filter(|(_, region)| which(region))
+            .collect();
+        let mut removed = Vec::new();
+        for (region_start, region) in overlapping {
+            let region_end = region_start + region.size;
+            let cut_start = region_start.max(start);
+            let cut_end = region_end.min(end);
+            self.regions.remove(&region_start);
+            if region_start < cut_start {
+                self.regions
+                    .insert(region_start, region.slice(0, cut_start - region_start));
+            }
+            if cut_end < region_end {
+                self.regions.insert(
+                    cut_end,
+                    region.slice(cut_end - region_start, region_end - cut_end),
+                );
+            }
+            self.clear_ptes(cut_start, cut_end)?;
+            if region.backing == Backing::Slab {
+                for page_addr in (cut_start..cut_end).step_by(VIRT_PAGE_SIZE) {
+                    if let Some(page) = self.slab_pages.remove(&page_addr) {
+                        self.slab.free(page)?;
+                    }
+                }
+            }
+            removed.push((
+                cut_start,
+                region.slice(cut_start - region_start, cut_end - cut_start),
+            ));
+        }
+        Ok(removed)
+    }
+
+    /// Sets the descriptors of the pages in `start..end` to `desc(page address)`, adding page
+    /// tables as needed.
+    fn fill_ptes(&mut self, start: u64, end: u64, desc: impl Fn(u64) -> u64) -> Result<()> {
+        let mut addr = start;
+        while addr < end {
+            let table_end = (addr | ((1 << 21) - 1)).saturating_add(1);
+            let pt = self.page_table_mut(addr)?;
+            while addr < end.min(table_end) {
+                pt.set_entry((addr >> 12 & 0x1ff) as usize, desc(addr));
+                addr += VIRT_PAGE_SIZE as u64;
+            }
         }
         Ok(())
     }
 
-    /// Removes the page at `addr` from the page table, freeing page tables that become empty,
-    /// and returns the page's data.
-    fn remove_page(&mut self, addr: u64) -> Result<SlabObject> {
+    /// The page table covering virtual address `addr`, added (with its parents) if needed.
+    fn page_table_mut(&mut self, addr: u64) -> Result<&mut PageTable> {
         let pud_idx = (addr >> 39 & 0x1ff) as usize;
-        let pud = self
-            .pgd
-            .objects
-            .get_mut(&pud_idx)
-            .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
+        if let Entry::Vacant(e) = self.pgd.objects.entry(pud_idx) {
+            let pud = PageUpperDirectory::new(self.slab.alloc()?);
+            Self::add_entry(pud.descriptor.0, pud_idx, &mut self.pgd.entries)?;
+            e.insert(pud);
+        }
+        let pud = self.pgd.objects.get_mut(&pud_idx).unwrap();
         let pmd_idx = (addr >> 30 & 0x1ff) as usize;
-        let pmd = pud
-            .objects
-            .get_mut(&pmd_idx)
-            .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
+        if let Entry::Vacant(e) = pud.objects.entry(pmd_idx) {
+            let pmd = PageMiddleDirectory::new(self.slab.alloc()?);
+            Self::add_entry(pmd.descriptor.0, pmd_idx, &mut pud.entries)?;
+            e.insert(pmd);
+        }
+        let pmd = pud.objects.get_mut(&pmd_idx).unwrap();
         let pt_idx = (addr >> 21 & 0x1ff) as usize;
-        let pt_cell = pmd
-            .objects
-            .get_mut(&pt_idx)
-            .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
-        let page_idx = (addr >> 12 & 0x1ff) as usize;
-        let mut pt = pt_cell.borrow_mut();
-        let page = pt
-            .objects
-            .remove(&page_idx)
-            .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
-        self.allocs.remove(&addr);
-        let mut page_ref = page.borrow_mut();
-        let page_data = page_ref.data.take().unwrap();
-        Self::del_entry(page_idx, &mut pt.entries)?;
-        // Checks if the page table is empty after removing the page.
-        let is_pt_object_empty = pt.objects.is_empty();
-        // Drops unused references to please the borrow checker.
-        drop(pt);
-        if is_pt_object_empty {
-            Self::del_entry(pt_idx, &mut pmd.entries)?;
-            // It's ok to unwrap here since we've checked that the entry exists.
-            let pt_rc = pmd.objects.remove(&pt_idx).unwrap();
-            // We can unwrap here, because the parent PMD is the only object with a strong
-            // reference to pt_rc and we know that it still exists because it always outlives
-            // its children.
-            let pt_cell = Rc::try_unwrap(pt_rc).expect("could not unwrap pt_rc");
-            let pt = pt_cell.into_inner();
-            self.slab.free(pt.entries)?;
+        if let Entry::Vacant(e) = pmd.objects.entry(pt_idx) {
+            let pt = PageTable::new(self.slab.alloc()?);
+            Self::add_entry(pt.descriptor.0, pt_idx, &mut pmd.entries)?;
+            e.insert(pt);
         }
-        if pmd.objects.is_empty() {
-            Self::del_entry(pmd_idx, &mut pud.entries)?;
-            // It's ok to unwrap here since we've checked that the entry exists.
-            let pmd = pud.objects.remove(&pmd_idx).unwrap();
-            self.slab.free(pmd.entries)?;
-        }
-        if pud.objects.is_empty() {
-            Self::del_entry(pud_idx, &mut self.pgd.entries)?;
-            // It's ok to unwrap here since we've checked that the entry exists.
-            let pud = self.pgd.objects.remove(&pud_idx).unwrap();
-            self.slab.free(pud.entries)?;
-        }
-        Ok(page_data)
+        Ok(pmd.objects.get_mut(&pt_idx).unwrap())
     }
 
-    /// Finds a [`Page`] by its address and returns a reference to it.
-    pub fn get_page_by_addr(&self, addr: u64) -> Result<Rc<RefCell<Page>>> {
-        match self.allocs.get(&addr) {
-            Some(r) => Ok(r.clone()),
-            None => Err(MemoryError::UnallocatedMemoryAccess(addr))?,
+    /// The page table covering virtual address `addr`, if there is one.
+    fn page_table(&self, addr: u64) -> Option<&PageTable> {
+        self.pgd
+            .objects
+            .get(&((addr >> 39 & 0x1ff) as usize))?
+            .objects
+            .get(&((addr >> 30 & 0x1ff) as usize))?
+            .objects
+            .get(&((addr >> 21 & 0x1ff) as usize))
+    }
+
+    /// Clears the descriptors of the pages in `start..end`, freeing page tables left empty.
+    fn clear_ptes(&mut self, start: u64, end: u64) -> Result<()> {
+        let mut addr = start;
+        while addr < end {
+            let table_end = (addr | ((1 << 21) - 1)).saturating_add(1);
+            let pud_idx = (addr >> 39 & 0x1ff) as usize;
+            let pmd_idx = (addr >> 30 & 0x1ff) as usize;
+            let pt_idx = (addr >> 21 & 0x1ff) as usize;
+            let Some(pud) = self.pgd.objects.get_mut(&pud_idx) else {
+                addr = table_end;
+                continue;
+            };
+            let Some(pmd) = pud.objects.get_mut(&pmd_idx) else {
+                addr = table_end;
+                continue;
+            };
+            let Some(pt) = pmd.objects.get_mut(&pt_idx) else {
+                addr = table_end;
+                continue;
+            };
+            while addr < end.min(table_end) {
+                pt.set_entry((addr >> 12 & 0x1ff) as usize, 0);
+                addr += VIRT_PAGE_SIZE as u64;
+            }
+            if pt.used == 0 {
+                Self::del_entry(pt_idx, &mut pmd.entries)?;
+                let pt = pmd.objects.remove(&pt_idx).unwrap();
+                self.slab.free(pt.entries)?;
+            }
+            if pmd.objects.is_empty() {
+                Self::del_entry(pmd_idx, &mut pud.entries)?;
+                let pmd = pud.objects.remove(&pmd_idx).unwrap();
+                self.slab.free(pmd.entries)?;
+            }
+            if pud.objects.is_empty() {
+                Self::del_entry(pud_idx, &mut self.pgd.entries)?;
+                let pud = self.pgd.objects.remove(&pud_idx).unwrap();
+                self.slab.free(pud.entries)?;
+            }
         }
+        Ok(())
+    }
+
+    /// The descriptor virtual address `addr`'s page should have, and the page's host address.
+    fn page(&self, addr: u64) -> Result<(PageDescriptor, *const u8)> {
+        let page_addr = align_virt_page!(addr);
+        let (start, region) = self
+            .region_at(page_addr)
+            .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?;
+        let (paddr, host_addr) = match region.backing {
+            Backing::OneToOne { paddr } => (paddr + (page_addr - start), page_addr as *const u8),
+            Backing::Slab => {
+                let page = &self.slab_pages[&page_addr];
+                (page.guest_addr, page.host_addr)
+            }
+        };
+        Ok((
+            PageDescriptor::new(paddr, region.perms, region.privileged),
+            host_addr,
+        ))
+    }
+
+    /// The host address backing virtual address `addr`.
+    pub fn host_addr(&self, addr: u64) -> Result<*const u8> {
+        let (_, host_page) = self.page(addr)?;
+        // SAFETY: the offset is within the page.
+        Ok(unsafe { host_page.add((addr & (VIRT_PAGE_SIZE as u64 - 1)) as usize) })
     }
 
     /// This function is called when a data abort exception occurs. Since we handle dirty states by
     /// remapping pages with read-only permissions, it's possible that the data abort exception
     /// comes from a write access that we want to detect to set the page as dirty.
     ///
-    /// This function will try to remap the page with its original permissions stored in the
-    /// [`Page`]'s `descriptor` field and set it as dirty. If the page has already been marked as
-    /// dirty or if the page was originally read-only, the exception needs to be propagated.
+    /// This function will try to remap the page with its intended permissions, if its descriptor
+    /// currently in the page table differs.
     ///
     /// # Return value
     ///
     /// This functions returns:
     ///
-    ///  * `Ok(true)` if a remapping occured because `descriptor_in_use` and `descriptor` differ.
+    ///  * `Ok(true)` if a remapping occured because the descriptors differ.
     ///  * `Ok(false)` if no remapping occured since the descriptors were the same.
     ///
     /// This value is used by the data abort exception handler to decide whether it needs to retry
     /// the faulting exception after a remapping or if it should propagate the exception to the
     /// actual data abort handler.
     fn dirty_bit_handler(&mut self, addr: u64) -> Result<bool> {
-        let addr = align_virt_page!(addr);
-        let mut page = self
-            .allocs
-            .get(&addr)
+        let page_addr = align_virt_page!(addr);
+        let (desc, _) = self.page(page_addr)?;
+        let idx = (page_addr >> 12 & 0x1ff) as usize;
+        let in_use = self
+            .page_table(page_addr)
             .ok_or(MemoryError::UnallocatedMemoryAccess(addr))?
-            .borrow_mut();
-        let pt_cell = page.parent.upgrade().unwrap();
-        let mut pt = pt_cell.borrow_mut();
-        let page_idx = (addr >> 12 & 0x1ff) as usize;
-        // If the descriptor differs, it means that the page should be remapped as writable and
-        // the dirty bit should be set.
-        if page.descriptor_in_use != page.descriptor {
-            Self::add_entry(page.descriptor.0, page_idx, &mut pt.entries)?;
-            page.descriptor_in_use = page.descriptor;
-            page.dirty = true;
-            // We return true to signal that we should retry the instruction that caused the
-            // exception.
-            Ok(true)
-        } else {
-            // We return false to signal that the exception does not come from the dirty bit and
-            // should be handled by the appropriate function.
-            Ok(false)
+            .entry(idx);
+        if in_use == desc.0 {
+            return Ok(false);
         }
+        self.page_table_mut(page_addr)?.set_entry(idx, desc.0);
+        Ok(true)
     }
 
     /// Adds a descriptor `desc` at index `idx` into the [`SlabObject`] `ents` that corresponds to
@@ -2076,58 +2107,6 @@ impl PageTableManager {
     #[inline]
     pub fn del_entry(idx: usize, ents: &mut SlabObject) -> Result<()> {
         Self::add_entry(0, idx, ents)
-    }
-}
-
-impl fmt::Display for PageTableManager {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "\nPGD @{:#x}", self.pgd.entries.host_addr as u64)?;
-        for (pud_idx, pud) in self.pgd.objects.iter() {
-            let desc =
-                unsafe { std::ptr::read(self.pgd.entries.host_addr.add(pud_idx * 8) as *mut u64) };
-            writeln!(
-                f,
-                "+-- PUD #{} @{:#x} ({:x})",
-                pud_idx, pud.entries.host_addr as u64, desc
-            )?;
-            for (pmd_idx, pmd) in pud.objects.iter() {
-                let desc =
-                    unsafe { std::ptr::read(pud.entries.host_addr.add(pmd_idx * 8) as *mut u64) };
-                writeln!(
-                    f,
-                    "  +-- PMD #{} @{:#x} ({:x})",
-                    pmd_idx, pmd.entries.host_addr as u64, desc
-                )?;
-                for (pt_idx, pt_cell) in pmd.objects.iter() {
-                    let desc = unsafe {
-                        std::ptr::read(pmd.entries.host_addr.add(pt_idx * 8) as *mut u64)
-                    };
-                    let pt = pt_cell.borrow();
-                    writeln!(
-                        f,
-                        "    +-- PT #{} @{:#x} ({:x})",
-                        pt_idx, pt.entries.host_addr as u64, desc
-                    )?;
-                    for (page_idx, page) in pt.objects.iter() {
-                        // SAFETY: we know that `host_addr` is mapped as long as `pt` exists and we
-                        //         made sure, when writing the descriptor in memory and storing it
-                        //         into the hashmap, that `page_idx` is not out of bounds.
-                        let desc = unsafe {
-                            std::ptr::read(pt.entries.host_addr.add(page_idx * 8) as *mut u64)
-                        };
-                        let page = page.borrow();
-                        writeln!(
-                            f,
-                            "      +-- PAGE #{} @{:#x} ({:#x})",
-                            page_idx,
-                            page.data.as_ref().unwrap().host_addr as u64,
-                            desc
-                        )?;
-                    }
-                }
-            }
-        }
-        writeln!(f)
     }
 }
 
@@ -2266,50 +2245,6 @@ pub struct MemoryCheckpoint(u64);
 struct MemoryInterval {
     checkpoint: MemoryCheckpoint,
     undo: BTreeMap<u64, Box<[u8]>>,
-}
-
-impl Clone for VirtMemAllocator {
-    fn clone(&self) -> Self {
-        // Retrieves the physical memory allocator from the SlabAllocator in PageTableManager.
-        let pma = self.upper_table.slab.pma.clone();
-        let mut vma =
-            VirtMemAllocator::new(pma).expect("error occured while cloning VirtMemAllocator");
-        // Iterates over each allocated page in the page table for the lower virtual address range.
-        for (&addr, page) in self.lower_table.allocs.iter() {
-            let page = page.borrow();
-            // If it exists, map the page in the cloned address space.
-            vma.lower_table
-                .map(addr, VIRT_PAGE_SIZE, page.perms, page.privileged)
-                .expect("could not clone the lower memory mapping to the new address space");
-            // Creates an array `data` that contains a copy of the page content.
-            // SAFETY: the pointer to the page's data is valid as long as `page` exists and we
-            //         know that all pages have a size of `VIRT_PAGE_SIZE`.
-            let data = unsafe {
-                std::slice::from_raw_parts(page.data.as_ref().unwrap().host_addr, VIRT_PAGE_SIZE)
-            };
-            // Writes `data` into the newly mapped page.
-            vma.write(addr as u64, data)
-                .expect("could not copy the memory mapping the new address space");
-        }
-        // Iterates over each allocated page in the page table for the upper virtual address range.
-        for (&addr, page) in self.upper_table.allocs.iter() {
-            let page = page.borrow();
-            // If it exists, map the page in the cloned address space.
-            vma.upper_table
-                .map(addr, VIRT_PAGE_SIZE, page.perms, page.privileged)
-                .expect("could not clone the upper memory mapping to the new address space");
-            // Creates an array `data` that contains a copy of the page content.
-            // SAFETY: the pointer to the page's data is valid as long as `page` exists and we
-            //         know that all pages have a size of `VIRT_PAGE_SIZE`.
-            let data = unsafe {
-                std::slice::from_raw_parts(page.data.as_ref().unwrap().host_addr, VIRT_PAGE_SIZE)
-            };
-            // Writes `data` into the newly mapped page.
-            vma.write(addr as u64, data)
-                .expect("could not copy the memory mapping the new address space");
-        }
-        vma
-    }
 }
 
 impl VirtMemAllocator {
@@ -2659,321 +2594,45 @@ impl VirtMemAllocator {
         }
     }
 
-    /// Restores the current virtual address space from a snapshot.
-    pub fn restore_from_snapshot(&mut self, snapshot: &VirtMemAllocator) -> Result<()> {
-        enum RestoreOperation {
-            Map(u64, Rc<RefCell<Page>>),
-            Unmap(u64),
-        }
-        let mut operations = vec![];
-        let mut lower_curr_iter = self.lower_table.allocs.iter();
-        let mut lower_snap_iter = snapshot.lower_table.allocs.iter();
-        let mut lower_curr_elem = lower_curr_iter.next();
-        let mut lower_snap_elem = lower_snap_iter.next();
-        // Allocations in the current address space and in the snapshot are sorted.
-        // This loop iterates over the allocations of both `VirtMemAllocator` objects and maps,
-        // unmaps or restores mapping depending on the conditions below.
-        //
-        //  - If the iterator over the current address space yields an allocation with an address
-        //    smaller than the one returned by the snapshot iterator, it means the allocation only
-        //    exists in the current address space. We unmap this allocation and take the next
-        //    allocation from the iterator over the current address space.
-        //
-        //    Current VMA  -> [0x1000, 0x2000, 0x3000] => yields 0x1000
-        //    Snapshot VMA -> [0x2000, 0x3000]         => yields 0x2000
-        //
-        //      -> The mapping at address 0x1000 was created during the execution of the testcase
-        //         and needs to be unmapped.
-        //
-        //  - If the iterator over the current address space yields an allocation with an address
-        //    greater than the one returned by the snapshot iterator, it means the allocation only
-        //    exists in the snapshot. We remap this allocation in the current address space and
-        //    take the next allocation from the snapshot iterator.
-        //
-        //    Current VMA  -> [0x2000, 0x3000]          => yields 0x2000
-        //    Snapshot VMA -> [0x1000, 0x2000, 0x3000]  => yields 0x1000
-        //
-        //      -> The mapping at address 0x1000 was removed during the execution of the testcase
-        //         and needs to be remapped.
-        //
-        //  - If both iterators returns an allocation with the same address, we need to check if
-        //    it was modified during the execution of the testcase using the dirty bit. If the
-        //    dirty bit is set, then the allocation in the current address space needs to be
-        //    restored using data from the snapshot.
-        //
-        //    Current VMA  -> [0x1000, 0x2000, 0x3000]  => yields 0x1000 with dirty bit set
-        //    Snapshot VMA -> [0x1000, 0x2000, 0x3000]  => yields 0x1000
-        //
-        //      -> The mapping at address 0x1000 is restored using data from the mapping at address
-        //         0x1000 in the snapshot.
-        while lower_curr_elem.is_some() || lower_snap_elem.is_some() {
-            let (src_addr, src_page) = if let Some(lower_snap_val) = lower_snap_elem.as_mut() {
-                (*lower_snap_val.0, Some(&lower_snap_val.1))
-            } else {
-                // If there are no more allocations in the snapshot, returns the minimum address
-                // in case we need to unmap an allocation from the current address space.
-                (u64::MIN, None)
-            };
-            let (dst_addr, dst_page) = if let Some(lower_curr_val) = lower_curr_elem.as_mut() {
-                (*lower_curr_val.0, Some(&lower_curr_val.1))
-            } else {
-                // If there are no more allocations in the current address space, returns the
-                // maximum address in case we need to map an allocation from the snapshot.
-                (u64::MAX, None)
-            };
-            match dst_addr.cmp(&src_addr) {
-                // If the address is only mapped in the current address space, but not the snapshot
-                // it means that the page was created during the execution of a testcase and needs
-                // to be removed.
-                Ordering::Less => {
-                    operations.push(RestoreOperation::Unmap(dst_addr));
-                    lower_curr_elem = lower_curr_iter.next();
-                }
-                // If the page exists in the snapshot but not in the current address space, it
-                // means that it was removed during the execution of a testcase and needs to be
-                // remapped.
-                Ordering::Greater => {
-                    operations.push(RestoreOperation::Map(
-                        src_addr,
-                        Rc::clone(src_page.unwrap()),
-                    ));
-                    lower_snap_elem = lower_snap_iter.next();
-                }
-                // If the address is mapped in both address spaces...
-                Ordering::Equal => {
-                    let mut dst_page = dst_page.unwrap().borrow_mut();
-                    // ... and it's been modified, then we need to restore it.
-                    if dst_page.dirty {
-                        let src_page = src_page.unwrap().borrow();
-                        unsafe {
-                            std::ptr::copy(
-                                src_page.data.as_ref().unwrap().host_addr,
-                                dst_page.data.as_ref().unwrap().host_addr as *mut u8,
-                                VIRT_PAGE_SIZE,
-                            )
-                        };
-                        // If a page has been modified and its dirty bit set, we need to reset
-                        // the descriptor used so that the dirty bit can be tracked in
-                        // subsequent iterations.
-                        let pt_cell = dst_page.parent.upgrade().unwrap();
-                        let mut pt = pt_cell.borrow_mut();
-                        let page_idx = (src_addr >> 12 & 0x1ff) as usize;
-                        // Resets the page descriptor in the page object.
-                        dst_page.descriptor_in_use = src_page.descriptor_in_use;
-                        dst_page.descriptor = src_page.descriptor;
-                        // Resets the page descriptor in the page table.
-                        PageTableManager::add_entry(
-                            dst_page.descriptor_in_use.0,
-                            page_idx,
-                            &mut pt.entries,
-                        )?;
-                        // Resets the page as clean.
-                        dst_page.dirty = false;
-                    }
-                    lower_curr_elem = lower_curr_iter.next();
-                    lower_snap_elem = lower_snap_iter.next();
-                }
-            }
-        }
-        // Performs the remaining map/unmap operations.
-        for op in operations.into_iter() {
-            match op {
-                RestoreOperation::Map(src_addr, page) => {
-                    let src_page = page.borrow();
-                    self.lower_table.map(
-                        src_addr,
-                        VIRT_PAGE_SIZE,
-                        src_page.perms,
-                        src_page.privileged,
-                    )?;
-                    let data = unsafe {
-                        std::slice::from_raw_parts(
-                            src_page.data.as_ref().unwrap().host_addr,
-                            VIRT_PAGE_SIZE,
-                        )
-                    };
-                    self.write(src_addr, data)?;
-                }
-                RestoreOperation::Unmap(dst_addr) => {
-                    self.lower_table.unmap(dst_addr, VIRT_PAGE_SIZE)?
-                }
-            }
-        }
-
-        let mut operations = vec![];
-        let mut upper_curr_iter = self.upper_table.allocs.iter();
-        let mut upper_snap_iter = snapshot.upper_table.allocs.iter();
-        let mut upper_curr_elem = upper_curr_iter.next();
-        let mut upper_snap_elem = upper_snap_iter.next();
-        // This loop uses the same algorithm than the one detailed above for the lower region
-        // allocations.
-        while upper_curr_elem.is_some() || upper_snap_elem.is_some() {
-            let (src_addr, src_page) = if let Some(upper_snap_val) = upper_snap_elem.as_mut() {
-                (*upper_snap_val.0, Some(&upper_snap_val.1))
-            } else {
-                // If there are no more allocations in the snapshot, returns the minimum address
-                // in case we need to unmap an allocation from the current address space.
-                (u64::MIN, None)
-            };
-            let (dst_addr, dst_page) = if let Some(upper_curr_val) = upper_curr_elem.as_mut() {
-                (*upper_curr_val.0, Some(&upper_curr_val.1))
-            } else {
-                // If there are no more allocations in the current address space, returns the
-                // maximum address in case we need to map an allocation from the snapshot.
-                (u64::MAX, None)
-            };
-            match dst_addr.cmp(&src_addr) {
-                // If the address is only mapped in the current address space, but not the snapshot
-                // it means that the page was created during the execution of a testcase and needs
-                // to be removed.
-                Ordering::Less => {
-                    operations.push(RestoreOperation::Unmap(dst_addr));
-                    upper_curr_elem = upper_curr_iter.next();
-                }
-                // If the page exists in the snapshot but not in the current address space, it
-                // means that it was removed during the execution of a testcase and needs to be
-                // remapped.
-                Ordering::Greater => {
-                    operations.push(RestoreOperation::Map(
-                        src_addr,
-                        Rc::clone(src_page.unwrap()),
-                    ));
-                    upper_snap_elem = upper_snap_iter.next();
-                }
-                // If the address is mapped in both address spaces...
-                Ordering::Equal => {
-                    let mut dst_page = dst_page.unwrap().borrow_mut();
-                    // ... and it's been modified, then we need to restore it.
-                    if dst_page.dirty {
-                        let src_page = src_page.unwrap().borrow();
-                        unsafe {
-                            std::ptr::copy(
-                                src_page.data.as_ref().unwrap().host_addr,
-                                dst_page.data.as_ref().unwrap().host_addr as *mut u8,
-                                VIRT_PAGE_SIZE,
-                            )
-                        };
-                        // If a page has been modified and its dirty bit set, we need to reset
-                        // the descriptor used so that the dirty bit can be tracked in
-                        // subsequent iterations.
-                        let pt_cell = dst_page.parent.upgrade().unwrap();
-                        let mut pt = pt_cell.borrow_mut();
-                        let page_idx = (src_addr >> 12 & 0x1ff) as usize;
-                        // Resets the page descriptor in the page object.
-                        dst_page.descriptor_in_use = src_page.descriptor_in_use;
-                        dst_page.descriptor = src_page.descriptor;
-                        // Resets the page descriptor in the page table.
-                        PageTableManager::add_entry(
-                            dst_page.descriptor_in_use.0,
-                            page_idx,
-                            &mut pt.entries,
-                        )?;
-                        // Resets the page as clean.
-                        dst_page.dirty = false;
-                    }
-                    upper_curr_elem = upper_curr_iter.next();
-                    upper_snap_elem = upper_snap_iter.next();
-                }
-            }
-        }
-        // Performs the remaining map/unmap operations.
-        for op in operations.into_iter() {
-            match op {
-                RestoreOperation::Map(src_addr, page) => {
-                    let src_page = page.borrow();
-                    self.upper_table.map(
-                        src_addr,
-                        VIRT_PAGE_SIZE,
-                        src_page.perms,
-                        src_page.privileged,
-                    )?;
-                    let data = unsafe {
-                        std::slice::from_raw_parts(
-                            src_page.data.as_ref().unwrap().host_addr,
-                            VIRT_PAGE_SIZE,
-                        )
-                    };
-                    self.write(src_addr, data)?;
-                }
-                RestoreOperation::Unmap(dst_addr) => {
-                    self.upper_table.unmap(dst_addr, VIRT_PAGE_SIZE)?
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Returns the host address backing virtual address `addr`.
     pub fn host_addr(&self, addr: u64) -> Result<*const u8> {
-        let page_start = align_virt_page!(addr);
-        let page = match page_start >> 0x30 {
-            0x0000 => self.lower_table.get_page_by_addr(page_start),
-            0xffff => self.upper_table.get_page_by_addr(page_start),
+        match addr >> 0x30 {
+            0x0000 => self.lower_table.host_addr(addr),
+            0xffff => self.upper_table.host_addr(addr),
             _ => Err(MemoryError::InvalidAddress(addr))?,
-        }?;
-        let host_page = page.borrow().data.as_ref().unwrap().host_addr;
-        // SAFETY: the offset is within the page.
-        Ok(unsafe { host_page.add((addr - page_start) as usize) })
+        }
     }
 
     /// Reads from virtual address `addr` into the slice `buf`. The number of bytes read is the
     /// size of `buf`.
     pub fn read(&self, addr: u64, buf: &mut [u8]) -> Result<usize> {
-        let mut read_size = 0;
-        let mut addr = addr;
-        let end_addr = addr
-            .checked_add(buf.len() as u64)
-            .ok_or(MemoryError::Overflow(addr, buf.len()))?;
-        // Loops over each page in the virtual range we're trying to read from.
-        loop {
-            // Computes the beginning and end address of the virtual page the current address is
-            // in.
-            let page_start = align_virt_page!(addr);
-            let page_end = page_start
-                .checked_add(VIRT_PAGE_SIZE as u64)
-                .ok_or(MemoryError::Overflow(page_start, VIRT_PAGE_SIZE))?;
-            // Computes the start and end offset in the current page based on the number of
-            // bytes remaining.
-            let offset_start = (addr - page_start) as usize;
-            let offset_end = if page_end >= end_addr {
-                (end_addr - page_start) as usize
-            } else {
-                VIRT_PAGE_SIZE
-            };
-            // Determines which page table should be used based on the region the address is from.
-            let page = match page_start >> 0x30 {
-                0x0000 => self.lower_table.get_page_by_addr(page_start),
-                0xffff => self.upper_table.get_page_by_addr(page_start),
-                _ => Err(MemoryError::InvalidAddress(addr))?,
-            }?;
-            // Reads from the current page into the corresponding slice of `buf`.
-            // SAFETY: because we have a reference to the page, we know that it exists, that it's
-            //         currently mapped and we made sure above that reading
-            //         `offset_end - offset_start` bytes from offset `offset_start` will not
-            //         result in an out of bound access.
-            unsafe {
-                std::ptr::copy(
-                    page.borrow()
-                        .data
-                        .as_ref()
-                        .unwrap()
-                        .host_addr
-                        .add(offset_start),
-                    buf.as_mut_ptr().add(read_size),
-                    offset_end - offset_start,
-                );
-            }
-            // Updates the number of bytes we've read so far.
-            read_size += offset_end - offset_start;
-            // Go to the next page if there is still data to write or break if we're done here.
-            addr = page_end;
-            if page_end >= end_addr {
-                break;
-            }
-        }
-
+        self.copy_pages(addr, buf.len(), |host, offset, len| unsafe {
+            // SAFETY: `host` is valid for `len` bytes, all in one guest page.
+            std::ptr::copy(host, buf.as_mut_ptr().add(offset), len)
+        })?;
         Ok(buf.len())
+    }
+
+    /// Calls `copy(host address, offset into the range, length)` for each page's part of the
+    /// virtual range `addr..addr + len`.
+    fn copy_pages(
+        &self,
+        addr: u64,
+        len: usize,
+        mut copy: impl FnMut(*mut u8, usize, usize),
+    ) -> Result<()> {
+        let end = addr
+            .checked_add(len as u64)
+            .ok_or(MemoryError::Overflow(addr, len))?;
+        let mut cursor = addr;
+        while cursor < end {
+            let page_end = align_virt_page!(cursor) + VIRT_PAGE_SIZE as u64;
+            let chunk = (page_end.min(end) - cursor) as usize;
+            let host = self.host_addr(cursor)? as *mut u8;
+            copy(host, (cursor - addr) as usize, chunk);
+            cursor += chunk as u64;
+        }
+        Ok(())
     }
 
     /// Reads one byte at virtual address `addr`.
@@ -3022,69 +2681,14 @@ impl VirtMemAllocator {
         Ok(String::from_utf8_lossy(&chars).to_string())
     }
 
-    /// Inner function that writes to virtual address `addr` from the slice `buf` and changes the
-    /// dirty bit.
-    fn write_inner(&mut self, addr: u64, buf: &[u8], dirty: bool) -> Result<usize> {
-        let mut written_size = 0;
-        let mut addr = addr;
-        let end_addr = addr
-            .checked_add(buf.len() as u64)
-            .ok_or(MemoryError::Overflow(addr, buf.len()))?;
-        // Loops over each page in the virtual range we're trying to write to.
-        loop {
-            // Computes the beginning and end address of the virtual page the current address is
-            // in.
-            let page_start = align_virt_page!(addr);
-            let page_end = page_start
-                .checked_add(VIRT_PAGE_SIZE as u64)
-                .ok_or(MemoryError::Overflow(page_start, VIRT_PAGE_SIZE))?;
-            // Computes the start and end offset in the current page based on the number of
-            // bytes remaining.
-            let offset_start = (addr - page_start) as usize;
-            let offset_end = if page_end >= end_addr {
-                (end_addr - page_start) as usize
-            } else {
-                VIRT_PAGE_SIZE
-            };
-            // Determines which page table should be used based on the region the address is from.
-            let page = match page_start >> 0x30 {
-                0x0000 => self.lower_table.get_page_by_addr(page_start),
-                0xffff => self.upper_table.get_page_by_addr(page_start),
-                _ => Err(MemoryError::InvalidAddress(addr))?,
-            }?;
-            // Writes into the current page the corresponding slice of `buf`.
-            // SAFETY: because we have a reference to the page, we know that it exists, that it's
-            //         currently mapped and we made sure above that writting
-            //         `offset_end - offset_start` bytes from offset `offset_start` will not
-            //         result in an out of bound access.
-            let mut page_b = page.borrow_mut();
-            unsafe {
-                if dirty {
-                    page_b.dirty = true;
-                }
-                std::ptr::copy(
-                    buf.as_ptr().add(written_size),
-                    page_b.data.as_ref().unwrap().host_addr.add(offset_start) as *mut u8,
-                    offset_end - offset_start,
-                );
-            }
-            // Updates the number of bytes we've written so far.
-            written_size += offset_end - offset_start;
-            // Go to the next page if there is still data to write or break if we're done here.
-            addr = page_end;
-            if page_end >= end_addr {
-                break;
-            }
-        }
-
-        Ok(buf.len())
-    }
-
     /// Writes to virtual address `addr` from the slice `buf`. The number of bytes written is the
     /// size of `buf`.
-    #[inline]
     pub fn write(&mut self, addr: u64, buf: &[u8]) -> Result<usize> {
-        self.write_inner(addr, buf, false)
+        self.copy_pages(addr, buf.len(), |host, offset, len| unsafe {
+            // SAFETY: `host` is valid for `len` bytes, all in one guest page.
+            std::ptr::copy(buf.as_ptr().add(offset), host, len)
+        })?;
+        Ok(buf.len())
     }
 
     /// Writes one byte at virtual address `addr`.
@@ -3119,69 +2723,6 @@ impl VirtMemAllocator {
         }
         self.write_byte(addr + s.len() as u64, 0)?;
         Ok(s.len())
-    }
-
-    /// Writes to virtual address `addr` from the slice `buf`. The number of bytes written is the
-    /// size of `buf`. Sets the dirty bit.
-    #[inline]
-    pub fn write_dirty(&mut self, addr: u64, buf: &[u8]) -> Result<usize> {
-        self.write_inner(addr, buf, true)
-    }
-
-    /// Writes one byte at virtual address `addr`. Sets the dirty bit.
-    #[inline]
-    pub fn write_byte_dirty(&mut self, addr: u64, data: u8) -> Result<usize> {
-        self.write_dirty(addr, &[data])
-    }
-
-    /// Writes one word at virtual address `addr`. Sets the dirty bit.
-    #[inline]
-    pub fn write_word_dirty(&mut self, addr: u64, data: u16) -> Result<usize> {
-        self.write_dirty(addr, &data.to_le_bytes())
-    }
-
-    /// Writes one dword at virtual address `addr`. Sets the dirty bit.
-    #[inline]
-    pub fn write_dword_dirty(&mut self, addr: u64, data: u32) -> Result<usize> {
-        self.write_dirty(addr, &data.to_le_bytes())
-    }
-
-    /// Writes one qword at virtual address `addr`. Sets the dirty bit.
-    #[inline]
-    pub fn write_qword_dirty(&mut self, addr: u64, data: u64) -> Result<usize> {
-        self.write_dirty(addr, &data.to_le_bytes())
-    }
-
-    /// Writes a C-string at virtual address `addr`. Sets the dirty bit.
-    #[inline]
-    pub fn write_cstring_dirty(&mut self, addr: u64, s: &str) -> Result<usize> {
-        for (i, c) in s.chars().enumerate() {
-            self.write_byte_dirty(addr + i as u64, c as u8)?;
-        }
-        self.write_byte_dirty(addr + s.len() as u64, 0)?;
-        Ok(s.len())
-    }
-
-    /// Dumps the current virtual memory content in hex into a file.
-    pub fn mem_hexdump(&self, outfile: impl AsRef<Path>) -> Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(outfile)?;
-        for (addr, _) in self.lower_table.allocs.iter() {
-            let mut data = vec![0; VIRT_PAGE_SIZE];
-            self.read(*addr, &mut data)?;
-            writeln!(f, "{:#x}", *addr)?;
-            writeln!(f, "{}", rh::hexdump_offset(&data, *addr as u32))?;
-        }
-        for (addr, _) in self.upper_table.allocs.iter() {
-            let mut data = vec![0; VIRT_PAGE_SIZE];
-            self.read(*addr, &mut data)?;
-            writeln!(f, "{:#x}", *addr)?;
-            writeln!(f, "{}", rh::hexdump_offset(&data, *addr as u32))?;
-        }
-        Ok(())
     }
 }
 

@@ -589,6 +589,34 @@ mod tests {
     }
 
     #[test]
+    fn unmapping_the_middle_of_a_1to1_range_keeps_its_ends() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let data = host_map(None, 4 * HOST_PAGE)?;
+        let page = |i: usize| data.data() as u64 + (i * HOST_PAGE) as u64;
+        for i in 0..4 {
+            unsafe { (page(i) as *mut u64).write(i as u64) };
+        }
+        let mut vm = VmManager::new()?;
+        vm.vma.map_1to1(page(0), data.len(), av::MemPerms::RWX)?;
+
+        vm.vma.unmap_1to1(page(1), 2 * HOST_PAGE)?;
+        assert_eq!(vm.vma.read_qword(page(0))?, 0);
+        assert_eq!(vm.vma.read_qword(page(3))?, 3);
+        assert!(vm.vma.read_qword(page(1)).is_err());
+        assert!(vm.vma.read_qword(page(2) + HOST_PAGE as u64 - 8).is_err());
+        assert_eq!(
+            vm.vma.one_to_one_host_pages(page(0), data.len()),
+            [page(0), page(3)]
+        );
+
+        // And the hole can be mapped again.
+        vm.vma.map_1to1(page(1), 2 * HOST_PAGE, av::MemPerms::RWX)?;
+        assert_eq!(vm.vma.read_qword(page(2))?, 2);
+        assert_eq!(vm.vma.one_to_one_host_pages(page(0), data.len()).len(), 4);
+        Ok(())
+    }
+
+    #[test]
     fn unmap_1to1_then_remap_sees_new_memory() -> Result<()> {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
