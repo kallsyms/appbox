@@ -17,7 +17,7 @@ use log::{debug, warn};
 use crate::hyperpom::crash::ExitKind;
 use crate::loader::Loader;
 use crate::threading::ThreadingModel;
-use crate::threads::{Message, ThreadId, ThreadSwitch};
+use crate::threads::{Message, ThreadId};
 use crate::trap::{DefaultTrapHandler, SyscallContext, SyscallResult, TrapHandler};
 use crate::vm::{SharedVm, VmManager};
 
@@ -74,11 +74,6 @@ impl GuestThread {
             return Ok(result);
         }
         self.wait(&handler_ref, handler, vm)
-    }
-
-    /// See [`DefaultTrapHandler::handle_timer`].
-    pub fn handle_timer(&mut self, vm: &mut VmManager) -> Result<Option<ThreadSwitch>> {
-        self.handler().handle_timer(vm)
     }
 
     /// In parallel: waits (with `handler` unlocked) until the thread can run, and puts it on

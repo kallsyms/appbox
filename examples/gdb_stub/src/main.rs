@@ -1,13 +1,7 @@
 use clap::Parser;
-use log::info;
-use std::path::PathBuf;
 
-use appbox::applevisor as av;
-use appbox::hyperpom::crash::ExitKind;
-use appbox::hyperpom::error::ExceptionError;
-use appbox::hyperpom::exceptions::ExceptionClass;
-use appbox::trap::{read_syscall_context, write_syscall_result, DefaultTrapHandler, TrapHandler};
-use appbox::vm::{VmManager, VmRunResult};
+use appbox::gdb::GdbHooks;
+use appbox::guest::{Guest, Program};
 
 #[derive(Parser)]
 pub struct Args {
@@ -38,184 +32,17 @@ fn main() -> Result<(), anyhow::Error> {
         .filter_level(args.verbose.log_level_filter())
         .init();
 
-    appbox::respawn::respawn()?;
+    let program = appbox::guest::prepare()?.unwrap_or_else(|| {
+        let mut argv = vec![args.executable.clone()];
+        argv.extend(args.arguments.iter().cloned());
+        Program::new(&args.executable, argv, vec![])
+    });
 
-    let mut vm = VmManager::new()?;
-
-    let mut argv = Vec::new();
-    argv.push(args.executable.clone());
-    argv.extend(args.arguments.iter().cloned());
-    let loader = appbox::loader::load_macho(
-        &mut vm,
-        &PathBuf::from(args.executable.clone()),
-        argv,
-        vec![],
-    )?;
-
-    vm.vcpu.set_reg(av::Reg::PC, loader.entry_point)?;
-    vm.vcpu
-        .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)?;
-
-    let (command_sender, command_receiver) = std::sync::mpsc::channel();
-    let (response_sender, response_receiver) = std::sync::mpsc::channel();
-
-    let notification_sender = if let Some(port) = args.gdb_port {
-        Some(appbox::gdb::start_gdb_server(
-            port,
-            command_sender,
-            response_receiver,
-            None,
-            appbox::gdb::GdbFeatures::default(),
-        )?)
-    } else {
-        None
-    };
-
-    if args.gdb_port.is_some() {
-        if args.gdb_wait {
-            info!("Waiting for GDB connection...");
-            loop {
-                if let Ok(cmd) = command_receiver.recv() {
-                    match cmd {
-                        appbox::gdb::GdbCommand::Continue => break,
-                        appbox::gdb::GdbCommand::Kill => return Ok(()),
-                        _ => appbox::gdb::handle_command(cmd, &mut vm, &response_sender),
-                    }
-                }
-            }
-        }
+    let mut guest = Guest::builder(program);
+    if let Some(port) = args.gdb_port {
+        guest = guest.hooks(GdbHooks::new(port, args.gdb_wait)?);
     }
-
-    let mut single_step_breakpoint: Option<u64> = None;
-    let mut handler = DefaultTrapHandler::new(appbox::threading::ThreadingModel::TimeShared)?;
-
-    loop {
-        let run_result = vm.run()?;
-        while let Ok(cmd) = command_receiver.try_recv() {
-            match cmd {
-                appbox::gdb::GdbCommand::Continue => {
-                    // Remove single step breakpoint if it exists
-                    if let Some(addr) = single_step_breakpoint.take() {
-                        let _ = vm.hooks().remove_breakpoint(addr, &mut vm.vma());
-                    }
-                    break;
-                }
-                appbox::gdb::GdbCommand::Step => {
-                    // Remove previous single step breakpoint if it exists
-                    if let Some(addr) = single_step_breakpoint.take() {
-                        let _ = vm.hooks().remove_breakpoint(addr, &mut vm.vma());
-                    }
-
-                    // Compute correct next PC using emulator
-                    let next_pc = vm.hooks().compute_step_target(&vm.vcpu, &vm.vma())?;
-
-                    // Set new single step breakpoint
-                    vm.hooks().add_breakpoint(next_pc, &mut vm.vma())?;
-                    single_step_breakpoint = Some(next_pc);
-                    break;
-                }
-                appbox::gdb::GdbCommand::Kill => return Ok(()),
-                _ => {
-                    appbox::gdb::handle_command(cmd, &mut vm, &response_sender);
-                }
-            }
-        }
-
-        // https://github.com/kallsyms/hyperpom/blob/a1dd1aebd8f306bb8549595d9d1506c2a361f0d7/src/core.rs#L1535
-        let exit = match run_result {
-            VmRunResult::Svc => {
-                let ctx = read_syscall_context(&mut vm.vcpu)?;
-                let result = handler.handle_syscall(&ctx, &mut vm, &loader)?;
-                match result.exit {
-                    ExitKind::Continue => {
-                        if result.write_back {
-                            write_syscall_result(
-                                &mut vm.vcpu,
-                                ctx.elr,
-                                result.ret0,
-                                result.ret1,
-                                result.cflags,
-                            )?;
-                        }
-                        ExitKind::Continue
-                    }
-                    _ => result.exit,
-                }
-            }
-            VmRunResult::Stopped => ExitKind::Exit,
-            VmRunResult::Timer => {
-                handler.handle_timer(&mut vm)?;
-                ExitKind::Continue
-            }
-            VmRunResult::HardwareBreakpoint | VmRunResult::Step | VmRunResult::Watchpoint { .. } => {
-                ExitKind::Crash("unexpected debug exception".to_string())
-            }
-            VmRunResult::Brk => {
-                let pc = vm.vcpu.get_reg(av::Reg::PC)?;
-
-                // Check if this is our single step breakpoint
-                if Some(pc) == single_step_breakpoint {
-                    println!("Single step completed at {:#x}", pc);
-                    // Remove the single step breakpoint
-                    vm.hooks().remove_breakpoint(pc, &mut vm.vma())?;
-                    single_step_breakpoint = None;
-                    // Don't handle as normal breakpoint since we removed it
-                    ExitKind::Continue
-                } else {
-                    println!("Breakpoint hit at {:#x}", pc);
-                    // Restore original instruction at PC for debugger visibility
-                    vm.prepare_for_debugger()?;
-                    ExitKind::Continue
-                }
-            }
-            VmRunResult::Other(exit_info) => match exit_info.reason {
-                av::ExitReason::EXCEPTION => {
-                    match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
-                        ExceptionClass::InsAbortLowerEl => {
-                            let pc = vm.vcpu.get_reg(av::Reg::PC)?;
-                            println!("Instruction Abort (Lower EL) at {:#x}", pc);
-
-                            // Send SIGSEGV signal to GDB to indicate fault
-                            if let Some(ref sender) = notification_sender {
-                                appbox::gdb::send_sigsegv(sender);
-                            }
-
-                            // Enter GDB evaluation loop for system state inspection
-                            loop {
-                                if let Ok(cmd) = command_receiver.recv() {
-                                    match cmd {
-                                        appbox::gdb::GdbCommand::Continue => break,
-                                        _ => appbox::gdb::handle_command(
-                                            cmd,
-                                            &mut vm,
-                                            &response_sender,
-                                        ),
-                                    }
-                                }
-                            }
-
-                            // Always crash after inspection - no recovery possible
-                            ExitKind::Crash("Instruction Abort".to_string())
-                        }
-                        _ => Err(ExceptionError::UnimplementedException(
-                            exit_info.exception.syndrome,
-                        ))?,
-                    }
-                }
-                av::ExitReason::CANCELED => ExitKind::Timeout,
-                av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
-                av::ExitReason::UNKNOWN => panic!(
-                    "Vcpu exited unexpectedly at address {:#x}",
-                    vm.vcpu.get_reg(av::Reg::PC)?
-                ),
-            },
-        };
-
-        match exit {
-            ExitKind::Continue => continue,
-            _ => break,
-        };
-    }
-
-    Ok(())
+    let end = guest.run()?;
+    println!("guest ended: {end:?}");
+    end.end_process()
 }

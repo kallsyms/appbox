@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::vm::{VmManager, WatchKind, Watchpoint};
+use crate::guest::{GuestEnd, GuestFault, Hooks, Resume, Stop, ThreadCx};
+use crate::vm::{WatchKind, Watchpoint};
 use applevisor as av;
 
 #[derive(Debug, Clone)]
@@ -262,25 +263,25 @@ fn handle_unknown_command(writer: &mut mio::net::TcpStream) {
 }
 
 // Register operation helpers
-fn read_vm_register(vm: &mut VmManager, gdb_reg: GdbRegister) -> Result<u64, ()> {
+fn read_vm_register(vcpu: &av::Vcpu, gdb_reg: GdbRegister) -> Result<u64, ()> {
     match gdb_reg.to_av_reg() {
-        Ok(av_reg) => vm.vcpu.get_reg(av_reg).map_err(|_| ()),
-        Err(sys_reg) => vm.vcpu.get_sys_reg(sys_reg).map_err(|_| ()),
+        Ok(av_reg) => vcpu.get_reg(av_reg).map_err(|_| ()),
+        Err(sys_reg) => vcpu.get_sys_reg(sys_reg).map_err(|_| ()),
     }
 }
 
-fn write_vm_register(vm: &mut VmManager, gdb_reg: GdbRegister, val: u64) -> Result<(), ()> {
+fn write_vm_register(vcpu: &av::Vcpu, gdb_reg: GdbRegister, val: u64) -> Result<(), ()> {
     match gdb_reg.to_av_reg() {
-        Ok(av_reg) => vm.vcpu.set_reg(av_reg, val).map_err(|_| ()),
-        Err(sys_reg) => vm.vcpu.set_sys_reg(sys_reg, val).map_err(|_| ()),
+        Ok(av_reg) => vcpu.set_reg(av_reg, val).map_err(|_| ()),
+        Err(sys_reg) => vcpu.set_sys_reg(sys_reg, val).map_err(|_| ()),
     }
 }
 
-fn get_all_registers(vm: &mut VmManager) -> Vec<u64> {
+fn get_all_registers(vcpu: &av::Vcpu) -> Vec<u64> {
     let mut regs = Vec::with_capacity(34);
     for i in 0..=33 {
         if let Some(gdb_reg) = GdbRegister::from_index(i) {
-            if let Ok(val) = read_vm_register(vm, gdb_reg) {
+            if let Ok(val) = read_vm_register(vcpu, gdb_reg) {
                 regs.push(val);
             } else {
                 regs.push(0);
@@ -567,7 +568,7 @@ fn move_fd_high<T: std::os::fd::IntoRawFd + std::os::fd::FromRawFd>(socket: T) -
     Ok(unsafe { T::from_raw_fd(high) })
 }
 
-pub fn start_gdb_server(
+fn start_gdb_server(
     port: u16,
     command_sender: Sender<GdbCommand>,
     response_receiver: Receiver<GdbResponse>,
@@ -954,98 +955,208 @@ fn handle_connection(
     }
 }
 
-/// Handles core GDB commands sent by the client, including:
-///   * Adding breakpoints
-///   * Reading and writing memory
-///   * Reading and writing registers
-///   * Continuing execution
-pub fn handle_command(
-    cmd: GdbCommand,
-    vm: &mut VmManager,
-    response_sender: &std::sync::mpsc::Sender<GdbResponse>,
-) {
-    trace!("Handling GDB command: {:?}", cmd);
-    match cmd {
-        GdbCommand::AddBreakpoint { addr, .. } => {
-            vm.hooks().add_breakpoint(addr, &mut vm.vma()).unwrap();
-            response_sender.send(GdbResponse::Ok).unwrap();
-        }
-        GdbCommand::RemoveBreakpoint { addr, .. } => {
-            vm.hooks().remove_breakpoint(addr, &mut vm.vma()).unwrap();
-            response_sender.send(GdbResponse::Ok).unwrap();
-        }
-        GdbCommand::AddWatchpoint { addr, len, kind } => {
-            let watchpoint = Watchpoint { addr, len, kind };
-            let result = (|| {
-                let slot = (0..vm.watchpoint_slots()?)
-                    .find(|&slot| vm.hardware_watchpoints().get(slot).is_none_or(Option::is_none))
-                    .ok_or_else(|| anyhow::anyhow!("no free hardware watchpoints"))?;
-                vm.set_hardware_watchpoint(slot, Some(watchpoint))
-            })();
-            response_sender
-                .send(match result {
-                    Ok(()) => GdbResponse::Ok,
+/// A debugger connection: the commands it sends, and what to tell it.
+pub struct GdbServer {
+    commands: Receiver<GdbCommand>,
+    responses: Sender<GdbResponse>,
+    notifications: Sender<GdbNotification>,
+}
+
+impl GdbServer {
+    /// Listens for a debugger on `port` (in the background).
+    pub fn start(port: u16, features: GdbFeatures) -> Result<Self> {
+        let (command_sender, commands) = std::sync::mpsc::channel();
+        let (responses, response_receiver) = std::sync::mpsc::channel();
+        let notifications =
+            start_gdb_server(port, command_sender, response_receiver, None, features)?;
+        Ok(Self {
+            commands,
+            responses,
+            notifications,
+        })
+    }
+
+    /// Waits for the debugger's next command; `None` once it's gone.
+    pub fn recv(&self) -> Option<GdbCommand> {
+        self.commands.recv().ok()
+    }
+
+    /// Tells the debugger the guest stopped (or ended).
+    pub fn notify(&self, notification: GdbNotification) -> Result<()> {
+        self.notifications
+            .send(notification)
+            .map_err(|_| anyhow::anyhow!("debugger connection gone"))
+    }
+
+    /// Answers a breakpoint, watchpoint, memory or register command from `t`'s thread, and
+    /// returns true; returns false for anything else (e.g. resuming).
+    pub fn handle(&self, command: &GdbCommand, t: &mut ThreadCx) -> bool {
+        trace!("Handling GDB command: {:?}", command);
+        let status = |result: Result<()>| match result {
+            Ok(()) => GdbResponse::Ok,
+            Err(err) => {
+                debug!("GDB command failed: {err:#}");
+                GdbResponse::Error(1)
+            }
+        };
+        let response = match *command {
+            GdbCommand::AddBreakpoint { addr, .. } => status(set_slot(
+                t.hardware_breakpoint_slots(),
+                t.hardware_breakpoints(),
+                Some(addr),
+                |t, slot, value| t.set_hardware_breakpoint(slot, value),
+                t,
+            )),
+            GdbCommand::RemoveBreakpoint { addr, .. } => {
+                let slot = t.hardware_breakpoints().iter().position(|&b| b == Some(addr));
+                status(match slot {
+                    Some(slot) => t.set_hardware_breakpoint(slot, None),
+                    None => Err(anyhow::anyhow!("no breakpoint at {addr:#x}")),
+                })
+            }
+            GdbCommand::AddWatchpoint { addr, len, kind } => status(set_slot(
+                t.hardware_watchpoint_slots(),
+                t.hardware_watchpoints(),
+                Some(Watchpoint { addr, len, kind }),
+                |t, slot, value| t.set_hardware_watchpoint(slot, value),
+                t,
+            )),
+            GdbCommand::RemoveWatchpoint { addr, len, kind } => {
+                let watchpoint = Some(Watchpoint { addr, len, kind });
+                let slot = t.hardware_watchpoints().iter().position(|&w| w == watchpoint);
+                status(match slot {
+                    Some(slot) => t.set_hardware_watchpoint(slot, None),
+                    None => Err(anyhow::anyhow!("no such watchpoint")),
+                })
+            }
+            GdbCommand::ReadMemory { addr, len } => {
+                let mut data = vec![0; len];
+                match t.memory().read(addr, &mut data) {
+                    Ok(_) => GdbResponse::MemoryData(data),
                     Err(_) => GdbResponse::Error(1),
-                })
-                .unwrap();
-        }
-        GdbCommand::RemoveWatchpoint { addr, len, kind } => {
-            let watchpoint = Some(Watchpoint { addr, len, kind });
-            let slot = vm
-                .hardware_watchpoints()
-                .iter()
-                .position(|set| *set == watchpoint);
-            let result = slot.map(|slot| vm.set_hardware_watchpoint(slot, None));
-            response_sender
-                .send(match result {
-                    Some(Ok(())) => GdbResponse::Ok,
-                    _ => GdbResponse::Error(1),
-                })
-                .unwrap();
-        }
-        GdbCommand::ReadMemory { addr, len } => {
-            let mut data = vec![0; len];
-            match vm.vma().read(addr, &mut data) {
-                Ok(_) => response_sender.send(GdbResponse::MemoryData(data)).unwrap(),
-                Err(_) => response_sender.send(GdbResponse::Error(1)).unwrap(),
+                }
             }
-        }
-        GdbCommand::WriteMemory { addr, data } => match vm.vma().write_code(addr, &data) {
-            Ok(_) => response_sender.send(GdbResponse::Ok).unwrap(),
-            Err(_) => response_sender.send(GdbResponse::Error(1)).unwrap(),
-        },
-        GdbCommand::ReadRegisters => {
-            let regs = get_all_registers(vm);
-            response_sender
-                .send(GdbResponse::RegisterData(regs))
-                .unwrap();
-        }
-        GdbCommand::WriteRegister { reg, val } => {
-            if let Some(gdb_reg) = GdbRegister::from_index(reg) {
-                let _ = write_vm_register(vm, gdb_reg, val);
+            GdbCommand::WriteMemory { addr, ref data } => match t.memory().write_code(addr, data) {
+                Ok(_) => GdbResponse::Ok,
+                Err(_) => GdbResponse::Error(1),
+            },
+            GdbCommand::ReadRegisters => GdbResponse::RegisterData(get_all_registers(t.vcpu())),
+            GdbCommand::WriteRegister { reg, val } => {
+                if let Some(gdb_reg) = GdbRegister::from_index(reg) {
+                    let _ = write_vm_register(t.vcpu(), gdb_reg, val);
+                }
+                GdbResponse::Ok
             }
-            response_sender.send(GdbResponse::Ok).unwrap();
-        }
-        GdbCommand::ReadRegister { reg } => {
-            let val = if let Some(gdb_reg) = GdbRegister::from_index(reg) {
-                read_vm_register(vm, gdb_reg).unwrap_or(0)
-            } else {
-                0
-            };
-            response_sender
-                .send(GdbResponse::RegisterValue(val))
-                .unwrap();
-        }
-        // These do not respond with anything
-        GdbCommand::Continue => {}
-        GdbCommand::Step => {}
-        GdbCommand::Kill => {}
-        GdbCommand::BackwardsContinue => {}
-        GdbCommand::BackwardsStep => {}
+            GdbCommand::ReadRegister { reg } => GdbResponse::RegisterValue(
+                GdbRegister::from_index(reg)
+                    .and_then(|gdb_reg| read_vm_register(t.vcpu(), gdb_reg).ok())
+                    .unwrap_or(0),
+            ),
+            GdbCommand::Continue
+            | GdbCommand::Step
+            | GdbCommand::Kill
+            | GdbCommand::BackwardsContinue
+            | GdbCommand::BackwardsStep => return false,
+        };
+        let _ = self.responses.send(response);
+        true
     }
 }
 
-/// Send a SIGSEGV signal to the GDB client to indicate a segmentation fault
-pub fn send_sigsegv(sender: &Sender<GdbNotification>) {
-    sender.send(GdbNotification::Stop(11)).unwrap();
+/// Puts `value` in the first free of `slots` (whose current values are `current`).
+fn set_slot<T: PartialEq>(
+    slots: Result<usize>,
+    current: Vec<Option<T>>,
+    value: Option<T>,
+    set: impl FnOnce(&mut ThreadCx, usize, Option<T>) -> Result<()>,
+    t: &mut ThreadCx,
+) -> Result<()> {
+    if current.contains(&value) {
+        return Ok(());
+    }
+    let slot = (0..slots?)
+        .find(|&slot| current.get(slot).is_none_or(Option::is_none))
+        .ok_or_else(|| anyhow::anyhow!("no free hardware slots"))?;
+    set(t, slot, value)
+}
+
+/// Hooks that let a debugger (see [`GdbServer`]) stop the guest at breakpoints, watchpoints and
+/// faults, and step it (forwards).
+pub struct GdbHooks {
+    server: GdbServer,
+    /// Stop before the guest's first instruction.
+    wait_at_start: bool,
+}
+
+impl GdbHooks {
+    pub fn new(port: u16, wait_at_start: bool) -> Result<Self> {
+        Ok(Self {
+            server: GdbServer::start(port, GdbFeatures::default())?,
+            wait_at_start,
+        })
+    }
+
+    /// Takes the debugger's commands until it resumes the guest.
+    fn wait(&mut self, t: &mut ThreadCx) -> Result<Resume> {
+        while let Some(command) = self.server.recv() {
+            if self.server.handle(&command, t) {
+                continue;
+            }
+            return Ok(match command {
+                GdbCommand::Continue => Resume::Continue,
+                GdbCommand::Step => Resume::Step,
+                GdbCommand::Kill => Resume::End(killed()),
+                _ => {
+                    warn!("{command:?} isn't supported");
+                    self.server.notify(GdbNotification::Stop(5))?;
+                    continue;
+                }
+            });
+        }
+        Ok(Resume::Continue)
+    }
+}
+
+fn killed() -> GuestEnd {
+    GuestEnd::Crashed {
+        signal: nix::sys::signal::Signal::SIGKILL,
+        reason: "killed by the debugger".into(),
+    }
+}
+
+impl Hooks for GdbHooks {
+    fn start(&mut self, t: &mut ThreadCx) -> Result<Resume> {
+        if !self.wait_at_start {
+            return Ok(Resume::Continue);
+        }
+        info!("Waiting for GDB connection...");
+        self.wait(t)
+    }
+
+    fn stopped(&mut self, t: &mut ThreadCx, stop: &Stop) -> Result<Resume> {
+        self.server.notify(match *stop {
+            Stop::Watchpoint { addr, kind } => GdbNotification::Watchpoint { kind, addr },
+            Stop::Breakpoint { .. } | Stop::Step | Stop::Scheduled => GdbNotification::Stop(5),
+        })?;
+        self.wait(t)
+    }
+
+    fn fault(&mut self, t: &mut ThreadCx, fault: &GuestFault) -> Result<Resume> {
+        self.server
+            .notify(GdbNotification::Stop(fault.signal() as u8))?;
+        // A debugger can inspect the guest, but not recover it.
+        match self.wait(t)? {
+            Resume::End(end) => Ok(Resume::End(end)),
+            _ => Ok(Resume::End(fault.crash())),
+        }
+    }
+
+    fn ending(&mut self, _t: &mut ThreadCx, end: &GuestEnd) -> Result<Resume> {
+        let notification = match end {
+            GuestEnd::Exited(status) => GdbNotification::Exited(*status as u8),
+            GuestEnd::Crashed { signal, .. } => GdbNotification::Stop(*signal as u8),
+        };
+        let _ = self.server.notify(notification);
+        Ok(Resume::End(end.clone()))
+    }
 }

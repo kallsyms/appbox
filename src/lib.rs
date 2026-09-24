@@ -9,6 +9,7 @@ pub mod checkpoint;
 pub mod exec;
 mod fds;
 pub mod gdb;
+pub mod guest;
 pub mod layout;
 pub mod loader;
 mod mach;

@@ -203,6 +203,10 @@ struct Thread {
     mailbox: Option<Sender<Message>>,
 }
 
+/// Picks which of the runnable threads (in round-robin order) to switch to, after the one that
+/// was on the vCPU (unless it exited).
+pub(crate) type PickThread = dyn FnMut(Option<ThreadId>, &[ThreadId]) -> ThreadId + Send;
+
 /// A change of which guest thread is on the vCPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThreadSwitch {
@@ -562,21 +566,38 @@ impl Threads {
             .any(|thread| !matches!(thread.state, State::Parked))
     }
 
-    /// Puts the next runnable thread on the vCPU, if there is one. No thread may be on it.
+    /// The runnable threads, in turn after the last one scheduled (by id, wrapping around).
+    fn runnable_in_turn(&self) -> Vec<ThreadId> {
+        let after = self.current.unwrap_or(0);
+        let runnable = |(&id, thread): (&ThreadId, &Thread)| {
+            matches!(thread.state, State::Runnable(_)).then_some(id)
+        };
+        self.threads
+            .range(after + 1..)
+            .filter_map(runnable)
+            .chain(self.threads.range(..=after).filter_map(runnable))
+            .collect()
+    }
+
+    /// Puts a runnable thread (the one `pick` picks) on the vCPU, if there is one. No thread may
+    /// be on it.
     pub(crate) fn switch_to_next(
         &mut self,
         vcpu: &av::Vcpu,
         from: Option<ThreadId>,
+        pick: &mut PickThread,
     ) -> Result<Option<ThreadSwitch>> {
         debug_assert!(self.current.is_none());
         self.current = from;
-        let Some(to) = self.next_runnable() else {
+        let runnable = self.runnable_in_turn();
+        if runnable.is_empty() {
             self.current = None;
             return Ok(None);
-        };
-        let thread = self.threads.get_mut(&to).expect("runnable thread exists");
+        }
+        let to = pick(from, &runnable);
+        let thread = self.threads.get_mut(&to).expect("picked a thread that exists");
         let State::Runnable(regs) = std::mem::replace(&mut thread.state, State::Running) else {
-            unreachable!("next_runnable returned a runnable thread");
+            anyhow::bail!("picked thread {to}, which isn't runnable");
         };
         regs.restore(vcpu)?;
         vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, thread.tsd)?;

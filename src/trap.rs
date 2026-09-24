@@ -11,7 +11,9 @@ use crate::mach::{
 };
 use crate::syscalls;
 use crate::threading::ThreadingModel;
-use crate::threads::{Forwarded, Registers, ThreadId, ThreadSwitch, Threads, MAIN_THREAD};
+use crate::threads::{
+    Forwarded, PickThread, Registers, ThreadId, ThreadSwitch, Threads, MAIN_THREAD,
+};
 use crate::vm::VmManager;
 use crate::workq::{WorkqReturn, Workqueue, KEVENT_FLAG_WORKQ};
 use anyhow::{Context, Result};
@@ -282,10 +284,8 @@ pub struct DefaultTrapHandler {
     pub(crate) next_checkpoint: u64,
     /// See [`Self::take_guest_memory_changes`].
     guest_memory_changes: GuestMemoryChanges,
-    /// See [`Self::set_quantum`].
-    quantum: Option<Duration>,
-    /// Whether the vCPU's timer is set to end the current thread's time slice.
-    slice_timer_armed: bool,
+    /// Time-shared: picks the thread to switch to (by default, the next in turn).
+    pub(crate) pick_thread: Option<Box<PickThread>>,
     /// In parallel, once running (see [`crate::runner`]): what starting threads' host threads
     /// takes.
     pub(crate) runtime: Option<crate::runner::Runtime>,
@@ -402,9 +402,7 @@ impl DefaultTrapHandler {
             guest_memory_changes: GuestMemoryChanges::default(),
             checkpoints: Vec::new(),
             next_checkpoint: 0,
-            // In parallel, threads don't take turns.
-            quantum: (threading == ThreadingModel::TimeShared).then_some(DEFAULT_QUANTUM),
-            slice_timer_armed: false,
+            pick_thread: None,
             runtime: None,
         })
     }
@@ -456,51 +454,19 @@ impl DefaultTrapHandler {
         }
     }
 
-    /// Sets how long a guest thread runs before being preempted for another that's ready, or
-    /// `None` to only switch threads when one blocks (e.g. for replaying a recording, whose
-    /// thread switches come from the recording).
-    ///
-    /// Preemption uses the vCPU's timer, so an embedder's run loop must pass
-    /// [`VmRunResult::Timer`](crate::vm::VmRunResult::Timer) to [`Self::handle_timer`].
-    pub fn set_quantum(&mut self, quantum: Option<Duration>) {
-        self.quantum = quantum;
+    /// Whether a thread other than the current one could run, or might once kevents arrive.
+    pub(crate) fn contended(&self) -> bool {
+        self.threads.others_alive() || self.workq.has_event_sources()
     }
 
-    /// Arms the vCPU's timer for the current thread's time slice if another thread could run, or
-    /// disarms it otherwise. A `fresh` slice starts now; otherwise an already armed one continues.
-    fn arm_slice_timer(&mut self, vcpu: &av::Vcpu, fresh: bool) -> Result<()> {
-        let contended = self.threads.others_alive() || self.workq.has_event_sources();
-        match self.quantum {
-            Some(quantum) if contended => {
-                if fresh || !self.slice_timer_armed {
-                    crate::vm::arm_vtimer(vcpu, quantum)?;
-                    self.slice_timer_armed = true;
-                }
-            }
-            _ if self.slice_timer_armed => {
-                crate::vm::disarm_vtimer(vcpu)?;
-                self.slice_timer_armed = false;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// Handles the current thread's time slice ending
-    /// ([`VmRunResult::Timer`](crate::vm::VmRunResult::Timer)): switches to another thread if one
-    /// is ready, returning the switch.
-    pub fn handle_timer(&mut self, vm: &mut VmManager) -> Result<Option<ThreadSwitch>> {
-        let shared = vm.shared().clone();
-        let switch = self.timer(&vm.vcpu, &mut shared.vma());
-        switch
-    }
-
-    fn timer(
+    /// Time-shared: takes the current thread off the vCPU for another that's ready, if there's
+    /// one (and it can be, which isn't the case in appbox's exception vectors, on the way to a
+    /// syscall), returning the switch.
+    pub(crate) fn preempt(
         &mut self,
         vcpu: &av::Vcpu,
         vma: &mut VirtMemAllocator,
     ) -> Result<Option<ThreadSwitch>> {
-        self.slice_timer_armed = false;
         self.threads.poll();
         // In appbox's exception vectors on the way to a syscall, the thread's state is partly in
         // EL1 registers that aren't saved, so it runs on to the syscall.
@@ -509,7 +475,6 @@ impl DefaultTrapHandler {
         if at_el0 && self.threads.preempt_current(vcpu)? {
             return Ok(self.schedule(vcpu, vma, Some(id))?.thread_switch);
         }
-        self.arm_slice_timer(vcpu, true)?;
         Ok(None)
     }
 
@@ -532,8 +497,6 @@ impl DefaultTrapHandler {
         // They're of the old image.
         self.checkpoints.clear();
         self.pthread = None;
-        // The timer goes with the old VM.
-        self.slice_timer_armed = false;
         // Like the kernel: caught signals revert to their default action, ignored ones stay so.
         for action in &mut self.signals {
             if action.handler != SIG_IGN {
@@ -685,7 +648,12 @@ impl DefaultTrapHandler {
                     None => SyscallResult::exit(ExitKind::ThreadExit),
                 });
             }
-            if let Some(switch) = self.threads.switch_to_next(vcpu, from)? {
+            let mut in_turn = |_: Option<ThreadId>, runnable: &[ThreadId]| runnable[0];
+            let pick: &mut PickThread = match &mut self.pick_thread {
+                Some(pick) => pick.as_mut(),
+                None => &mut in_turn,
+            };
+            if let Some(switch) = self.threads.switch_to_next(vcpu, from, pick)? {
                 if !self.switched_in(vcpu, vma, switch.to)? {
                     continue;
                 }
@@ -720,7 +688,6 @@ impl DefaultTrapHandler {
             );
             self.fds.resumed(vma, to, ret);
         }
-        self.arm_slice_timer(vcpu, true)?;
         Ok(true)
     }
 
@@ -1572,7 +1539,6 @@ impl DefaultTrapHandler {
         }
 
         vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, self.threads.tsd())?;
-        self.arm_slice_timer(vcpu, false)?;
         Ok(SyscallResult::cont(ret0, ret1, cflags))
     }
 }

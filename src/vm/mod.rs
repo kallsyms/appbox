@@ -376,6 +376,11 @@ impl VmManager {
         Ok(())
     }
 
+    /// Whether [`Self::count_instructions`] was called.
+    pub fn counting_instructions(&self) -> bool {
+        self.run_overhead.is_some()
+    }
+
     /// The guest instructions retired since [`Self::count_instructions`], as an upper bound (see
     /// there), or 0 if not counting.
     pub fn guest_instructions(&self) -> u64 {

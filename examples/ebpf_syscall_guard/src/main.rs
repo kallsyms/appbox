@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use log::{debug, info};
+use log::info;
 use rbpf::assembler::assemble;
 use rbpf::EbpfVmRaw;
 use std::cell::RefCell;
@@ -8,15 +8,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::{mem, ptr};
 
-use appbox::applevisor as av;
-use appbox::hyperpom::crash::ExitKind;
-use appbox::hyperpom::error::ExceptionError;
-use appbox::hyperpom::exceptions::ExceptionClass;
-use appbox::hyperpom::memory::VirtMemAllocator;
-use appbox::trap::{
-    read_syscall_context, write_syscall_result, DefaultTrapHandler, SyscallResult, TrapHandler,
+use appbox::guest::{
+    Decision, Guest, GuestEnd, Hooks, Memory as VirtMemAllocator, Program, Returned, Syscall,
+    ThreadCx,
 };
-use appbox::vm::{VmManager, VmRunResult};
+use nix::sys::signal::Signal;
 
 const DEFAULT_BPF_ASM: &str = "mov64 r0, 0\nexit\n";
 const SCRATCH_SIZE: usize = 4096;
@@ -120,6 +116,52 @@ fn load_bpf_program(args: &Args) -> Result<Vec<u8>> {
     assemble(&asm).map_err(|e| anyhow!("assemble: {e}"))
 }
 
+/// Asks the eBPF program about each syscall: 0 to allow it, 1 to fail it with EPERM, 2 to kill
+/// the guest.
+struct Guard {
+    bpf: EbpfVmRaw<'static>,
+    memory: Vec<u8>,
+}
+
+// SAFETY: appbox calls hooks one at a time, so the eBPF VM (whose helper table isn't Send) is
+// never used from two threads at once, just possibly from one and then another.
+unsafe impl Send for Guard {}
+
+impl Hooks for Guard {
+    fn syscall(&mut self, t: &mut ThreadCx, call: &Syscall) -> Result<Decision> {
+        let context = BpfSyscallContext {
+            syscall_number: call.number,
+            args: call.args,
+        };
+        self.memory.fill(0);
+        unsafe {
+            ptr::copy_nonoverlapping(
+                &context as *const BpfSyscallContext as *const u8,
+                self.memory.as_mut_ptr(),
+                mem::size_of::<BpfSyscallContext>(),
+            );
+        }
+        let verdict = {
+            let _guard = HelperGuard::new(&mut t.memory(), &mut self.memory);
+            self.bpf
+                .execute_program(&mut self.memory)
+                .map_err(|e| anyhow!("rbpf exec: {e}"))?
+        };
+        Ok(match verdict {
+            0 => Decision::Default,
+            1 => Decision::Return(Returned::errno(nix::libc::EPERM)),
+            2 => {
+                info!("Killed by eBPF policy");
+                Decision::End(GuestEnd::Crashed {
+                    signal: Signal::SIGKILL,
+                    reason: "killed by eBPF policy".into(),
+                })
+            }
+            _ => return Err(anyhow!("Invalid eBPF return value: {verdict}")),
+        })
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -127,122 +169,23 @@ fn main() -> Result<()> {
         .filter_level(args.verbose.log_level_filter())
         .init();
 
-    appbox::respawn::respawn()?;
+    let program = appbox::guest::prepare()?.unwrap_or_else(|| {
+        let mut argv = vec![args.executable.clone()];
+        argv.extend(args.arguments.iter().cloned());
+        Program::new(&args.executable, argv, vec![])
+    });
 
-    let prog = load_bpf_program(&args)?;
-    let mut bpf_vm = EbpfVmRaw::new(Some(&prog)).map_err(|e| anyhow!("rbpf: {e}"))?;
-    bpf_vm
-        .register_helper(HELPER_READ_MEM, bpf_read_mem)
+    let prog: &'static [u8] = Box::leak(load_bpf_program(&args)?.into_boxed_slice());
+    let mut bpf = EbpfVmRaw::new(Some(prog)).map_err(|e| anyhow!("rbpf: {e}"))?;
+    bpf.register_helper(HELPER_READ_MEM, bpf_read_mem)
         .map_err(|e| anyhow!("rbpf helper: {e}"))?;
 
-    let mut vm = VmManager::new()?;
-
-    let mut argv = Vec::new();
-    argv.push(args.executable.clone());
-    argv.extend(args.arguments.iter().cloned());
-    let loader = appbox::loader::load_macho(
-        &mut vm,
-        &PathBuf::from(args.executable.clone()),
-        argv,
-        vec![],
-    )?;
-
-    vm.vcpu.set_reg(av::Reg::PC, loader.entry_point)?;
-    vm.vcpu
-        .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)?;
-
-    let mut handler = DefaultTrapHandler::new(appbox::threading::ThreadingModel::TimeShared)?;
-    let mut bpf_mem = vec![0u8; mem::size_of::<BpfSyscallContext>() + SCRATCH_SIZE];
-
-    loop {
-        let exit = match vm.run()? {
-            VmRunResult::Svc => {
-                let ctx = read_syscall_context(&mut vm.vcpu)?;
-                let bpf_ctx = BpfSyscallContext {
-                    syscall_number: ctx.num,
-                    args: ctx.args,
-                };
-                bpf_mem.fill(0);
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        &bpf_ctx as *const BpfSyscallContext as *const u8,
-                        bpf_mem.as_mut_ptr(),
-                        mem::size_of::<BpfSyscallContext>(),
-                    );
-                }
-
-                let _guard = HelperGuard::new(&mut vm.vma(), &mut bpf_mem);
-                let decision = bpf_vm
-                    .execute_program(&mut bpf_mem)
-                    .map_err(|e| anyhow!("rbpf exec: {e}"))?;
-
-                let result = match decision {
-                    0 => handler.handle_syscall(&ctx, &mut vm, &loader)?,
-                    1 => SyscallResult::cont(nix::libc::EPERM as u64, 0, 1 << 29),
-                    2 => {
-                        info!("Killed by eBPF policy");
-                        SyscallResult::exit(ExitKind::Crash("Killed by eBPF policy".to_string()))
-                    }
-                    _ => return Err(anyhow!("Invalid eBPF return value: {decision}")),
-                };
-
-                match result.exit {
-                    ExitKind::Continue => {
-                        if result.write_back {
-                            debug!(
-                                "Returning x0={:x} x1={:x} cflags={:x}",
-                                result.ret0, result.ret1, result.cflags
-                            );
-                            write_syscall_result(
-                                &mut vm.vcpu,
-                                ctx.elr,
-                                result.ret0,
-                                result.ret1,
-                                result.cflags,
-                            )?;
-                        }
-                        ExitKind::Continue
-                    }
-                    _ => result.exit,
-                }
-            }
-            VmRunResult::Stopped => ExitKind::Exit,
-            VmRunResult::Timer => {
-                handler.handle_timer(&mut vm)?;
-                ExitKind::Continue
-            }
-            VmRunResult::HardwareBreakpoint | VmRunResult::Step | VmRunResult::Watchpoint { .. } => {
-                ExitKind::Crash("unexpected debug exception".to_string())
-            }
-            VmRunResult::Brk => ExitKind::Continue,
-            VmRunResult::Other(exit_info) => match exit_info.reason {
-                av::ExitReason::EXCEPTION => {
-                    match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
-                        ExceptionClass::InsAbortLowerEl => {
-                            ExitKind::Crash("Instruction Abort".to_string())
-                        }
-                        _ => Err(ExceptionError::UnimplementedException(
-                            exit_info.exception.syndrome,
-                        ))?,
-                    }
-                }
-                av::ExitReason::CANCELED => ExitKind::Timeout,
-                av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
-                av::ExitReason::UNKNOWN => panic!(
-                    "Vcpu exited unexpectedly at address {:#x}",
-                    vm.vcpu.get_reg(av::Reg::PC)?
-                ),
-            },
-        };
-
-        match exit {
-            ExitKind::Continue => continue,
-            _ => {
-                println!("VM exited: {:?}", exit);
-                break;
-            }
-        }
-    }
-
-    Ok(())
+    let end = Guest::builder(program)
+        .hooks(Guard {
+            bpf,
+            memory: vec![0u8; mem::size_of::<BpfSyscallContext>() + SCRATCH_SIZE],
+        })
+        .run()?;
+    println!("guest ended: {end:?}");
+    end.end_process()
 }
