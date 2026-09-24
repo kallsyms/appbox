@@ -79,25 +79,34 @@ fn run(args: &[&Path]) -> Output {
     }
 }
 
+/// Checks the guest's exit status, its output, and strace's trace (on stderr).
 #[track_caller]
-fn assert_output(output: &Output, expected_status: i32, expected: &[&str]) {
+fn assert_output(
+    output: &Output,
+    expected_status: i32,
+    expected: &[&str],
+    expected_trace: &[&str],
+) {
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let context = || {
-        format!(
-            "stdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = || format!("stdout:\n{stdout}\nstderr:\n{stderr}");
     assert_eq!(output.status.code(), Some(expected_status), "{}", context());
     for line in expected {
         assert!(stdout.contains(line), "missing {line:?}\n{}", context());
+    }
+    for line in expected_trace {
+        assert!(
+            stderr.contains(line),
+            "missing {line:?} in trace\n{}",
+            context()
+        );
     }
 }
 
 #[test]
 fn echo() {
     let output = run(&[Path::new("/bin/echo"), Path::new("hello from the guest")]);
-    assert_output(&output, 0, &["hello from the guest"]);
+    assert_output(&output, 0, &["hello from the guest"], &[]);
 }
 
 #[test]
@@ -107,7 +116,7 @@ fn exec() {
         Path::new("/bin/echo"),
         Path::new("exec works"),
     ]);
-    assert_output(&output, 0, &["exec \"/bin/echo\"", "exec works"]);
+    assert_output(&output, 0, &["exec works"], &["exec \"/bin/echo\""]);
 }
 
 #[test]
@@ -117,6 +126,7 @@ fn spawned_processes() {
         &output,
         3,
         &["child says hi", "echo exited 0", "false exited 1"],
+        &[],
     );
 }
 
@@ -131,6 +141,7 @@ fn sigaction() {
             "write to closed pipe: EPIPE ok",
             "catch SIGKILL: EINVAL ok",
         ],
+        &[],
     );
 }
 
@@ -140,9 +151,7 @@ fn pthreads() {
     assert_output(
         &output,
         0,
-        &[
-            "counter=40000/40000 joins=60/60 distinct_ports=1",
-            "<switched to thread",
-        ],
+        &["counter=40000/40000 joins=60/60 distinct_ports=1"],
+        &["<switched to thread"],
     );
 }

@@ -212,6 +212,11 @@ pub struct Args {
     #[clap(flatten)]
     pub verbose: clap_verbosity_flag::Verbosity,
 
+    /// Write the trace to this file (which processes the guest spawns append to too) instead of
+    /// stderr.
+    #[clap(short, long)]
+    pub output: Option<PathBuf>,
+
     /// Target executable
     #[clap(required = true)]
     pub executable: String,
@@ -219,6 +224,21 @@ pub struct Args {
     /// Target arguments
     #[clap(allow_hyphen_values = true)]
     pub arguments: Vec<String>,
+}
+
+fn print_stack(
+    trace: &mut dyn Write,
+    vm: &VmManager,
+    loader: &appbox::loader::Loader,
+) -> Result<()> {
+    for (idx, addr) in appbox::unwind_user_stack(vm, 32).iter().enumerate() {
+        let symbol = loader
+            .symbolicate(*addr)
+            .map(|s| format!("{}!{}+{:#x}", s.image, s.symbol, addr - s.symbol_addr))
+            .unwrap_or_default();
+        writeln!(trace, "{:02} {:#018x} {}", idx, addr, symbol)?;
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -229,6 +249,17 @@ fn main() -> Result<()> {
         .init();
 
     appbox::respawn::respawn()?;
+
+    // Not stdout, which is the guest's (and a spawned guest's may well be a pipe its parent reads).
+    let mut trace: Box<dyn Write> = match &args.output {
+        Some(path) => Box::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?,
+        ),
+        None => Box::new(std::io::stderr()),
+    };
 
     // Processes the guest spawns get their own copy of this program, running the spawned guest.
     let (executable, argv, envp) = match appbox::respawn::spawned_guest()? {
@@ -257,23 +288,24 @@ fn main() -> Result<()> {
                     .map(|name| name.to_string())
                     .unwrap_or_else(|| format!("<unknown 0x{:x}>", ctx.num));
                 let args = format_syscall_args(&mut vm.vma, ctx.num, &ctx.args);
-                print!(
+                write!(
+                    trace,
                     "[{}] {}({}) = ",
                     handler.current_thread(),
                     name,
                     args.join(", ")
                 );
-                std::io::stdout().flush()?;
+                trace.flush()?;
 
                 let result = handler.handle_syscall(&ctx, &mut vm.vcpu, &mut vm.vma, &loader)?;
                 match result.exit {
                     ExitKind::Continue if result.thread_switch.is_some() => {
                         let switch = result.thread_switch.unwrap();
-                        println!("<switched to thread {}>", switch.to);
+                        writeln!(trace, "<switched to thread {}>", switch.to)?;
                         ExitKind::Continue
                     }
                     ExitKind::Continue => {
-                        println!("{}", format_syscall_result(&result));
+                        writeln!(trace, "{}", format_syscall_result(&result))?;
                         if result.write_back {
                             debug!(
                                 "Returning x0={:x} x1={:x} cflags={:x}",
@@ -290,20 +322,14 @@ fn main() -> Result<()> {
                         ExitKind::Continue
                     }
                     _ => {
-                        println!("{:?}", result.exit);
+                        writeln!(trace, "{:?}", result.exit)?;
                         result.exit
                     }
                 }
             }
             // Nothing here sets breakpoints, so this is the guest trapping (e.g. abort()).
             VmRunResult::Brk => {
-                for (idx, addr) in appbox::unwind_user_stack(&vm, 32).iter().enumerate() {
-                    let symbol = loader
-                        .symbolicate(*addr)
-                        .map(|s| format!("{}!{}+{:#x}", s.image, s.symbol, addr - s.symbol_addr))
-                        .unwrap_or_default();
-                    eprintln!("{:02} {:#018x} {}", idx, addr, symbol);
-                }
+                print_stack(&mut trace, &vm, &loader)?;
                 ExitKind::Crash("guest trap (brk)".to_string())
             }
             VmRunResult::Other(exit_info) => match exit_info.reason {
@@ -311,6 +337,18 @@ fn main() -> Result<()> {
                     match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
                         ExceptionClass::InsAbortLowerEl => {
                             ExitKind::Crash("Instruction Abort".to_string())
+                        }
+                        // The guest faulted, e.g. accessing memory that isn't mapped.
+                        ExceptionClass::HvcA64 => {
+                            let esr = vm.vcpu.get_sys_reg(av::SysReg::ESR_EL1)?;
+                            let far = vm.vcpu.get_sys_reg(av::SysReg::FAR_EL1)?;
+                            let elr = vm.vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
+                            writeln!(
+                                trace,
+                                "guest exception: ESR_EL1={esr:#x} FAR_EL1={far:#x} ELR_EL1={elr:#x}"
+                            )?;
+                            print_stack(&mut trace, &vm, &loader)?;
+                            ExitKind::Crash(format!("guest exception (ESR_EL1 {esr:#x})"))
                         }
                         _ => Err(ExceptionError::UnimplementedException(
                             exit_info.exception.syndrome,
@@ -332,11 +370,11 @@ fn main() -> Result<()> {
         match exit {
             ExitKind::Continue => continue,
             ExitKind::Exec(request) => {
-                println!("exec {:?} {:?}", request.path, request.argv);
+                writeln!(trace, "exec {:?} {:?}", request.path, request.argv)?;
                 (vm, loader) = appbox::exec::exec(vm, loader, &mut handler, &request)?;
             }
             _ => {
-                println!("VM exited: {:?}", exit);
+                writeln!(trace, "VM exited: {:?}", exit)?;
                 break;
             }
         }
