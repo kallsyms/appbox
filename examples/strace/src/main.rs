@@ -13,6 +13,7 @@ use appbox::hyperpom::error::ExceptionError;
 use appbox::hyperpom::exceptions::ExceptionClass;
 use appbox::loader::Loader;
 use appbox::runner::{GuestThread, ThreadRunner};
+use appbox::threading::ThreadingModel;
 use appbox::trap::{read_syscall_context, write_syscall_result, DefaultTrapHandler, SyscallResult};
 use appbox::vm::{VmManager, VmRunResult};
 
@@ -280,9 +281,6 @@ fn main() -> Result<()> {
         .filter_level(args.verbose.log_level_filter())
         .init();
 
-    if args.parallel {
-        appbox::threading::use_parallel_vcpus();
-    }
     appbox::respawn::respawn()?;
 
     // Not stdout, which is the guest's (and a spawned guest's may well be a pipe its parent reads).
@@ -295,8 +293,6 @@ fn main() -> Result<()> {
         ),
         None => Box::new(std::io::stderr()),
     }));
-
-    writeln!(trace.lock().unwrap(), "threading: {:?}", appbox::threading::model())?;
 
     // Processes the guest spawns get their own copy of this program, running the spawned guest.
     let (executable, argv, envp) = match appbox::respawn::spawned_guest()? {
@@ -315,7 +311,12 @@ fn main() -> Result<()> {
     vm.vcpu
         .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)?;
 
-    let mut handler = DefaultTrapHandler::new()?;
+    let mut handler = DefaultTrapHandler::new(if args.parallel {
+        ThreadingModel::Parallel
+    } else {
+        ThreadingModel::TimeShared
+    })?;
+    writeln!(trace.lock().unwrap(), "threading: {:?}", handler.threading())?;
     if let Some(quantum) = args.quantum {
         handler.set_quantum((quantum > 0).then(|| std::time::Duration::from_micros(quantum)));
     }

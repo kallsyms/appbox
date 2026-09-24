@@ -1,5 +1,5 @@
 //! Running a guest's threads, time-shared on one vCPU or each on a vCPU (and host thread) of its
-//! own; see [`crate::threading`].
+//! own; see [`ThreadingModel`].
 //!
 //! An embedder writes one loop that runs a guest thread's vCPU and handles its traps (a
 //! [`ThreadRunner`]), and [`DefaultTrapHandler::run`] runs it for the guest's main thread, on the

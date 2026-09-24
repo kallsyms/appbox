@@ -87,7 +87,7 @@ fn main() -> Result<(), anyhow::Error> {
     }
 
     let mut single_step_breakpoint: Option<u64> = None;
-    let mut handler = DefaultTrapHandler::new()?;
+    let mut handler = DefaultTrapHandler::new(appbox::threading::ThreadingModel::TimeShared)?;
 
     loop {
         let run_result = vm.run()?;

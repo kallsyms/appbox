@@ -6,7 +6,7 @@ pub enum ExitKind {
     Crash(String),
     Timeout,
     Exit,
-    /// In parallel (see [`crate::threading`]): the guest thread on this vCPU is gone, so its host
+    /// In parallel (see [`crate::threading::ThreadingModel`]): the guest thread on this vCPU is gone, so its host
     /// thread is done; the process carries on.
     ThreadExit,
     /// The guest called `execve()`; see [`crate::exec`].

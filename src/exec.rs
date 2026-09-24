@@ -213,7 +213,7 @@ mod tests {
             strings(&["true"]),
             vec![],
         )?;
-        let mut handler = DefaultTrapHandler::new()?;
+        let mut handler = DefaultTrapHandler::new(crate::threading::ThreadingModel::TimeShared)?;
         let old_entry = loader.entry_point;
 
         let request = ExecRequest::resolve(

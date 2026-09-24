@@ -376,18 +376,24 @@ const SA_USERSPACE_MASK: i32 = 0x7f;
 const SA_VALIDATE_SIGRETURN_FROM_SIGTRAMP: i32 = 0x400;
 
 impl DefaultTrapHandler {
-    pub fn new() -> Result<Self> {
-        Self::new_with_map_base(FIXED_MAP_BASE)
-    }
-
-    pub fn new_with_map_base(map_fixed_next: u64) -> Result<Self> {
+    /// A handler running the guest's threads as `threading` says, unless this process was
+    /// spawned for a guest, which runs its threads like its spawner.
+    pub fn new(threading: ThreadingModel) -> Result<Self> {
         if !cfg!(test) {
             Self::ensure_fixed_map_pool()?;
         }
+        let threading = match ThreadingModel::inherited() {
+            Some(inherited) if inherited != threading => {
+                debug!("running guest threads {inherited:?}, like the spawning process");
+                inherited
+            }
+            _ => threading,
+        };
+        let map_fixed_next = FIXED_MAP_BASE;
         Ok(Self {
             map_fixed_next,
             mappings: Vec::new(),
-            threads: Threads::new()?,
+            threads: Threads::new(threading)?,
             pthread: None,
             workq: Workqueue::default(),
             fds: GuestFds::new(),
@@ -397,11 +403,15 @@ impl DefaultTrapHandler {
             checkpoints: Vec::new(),
             next_checkpoint: 0,
             // In parallel, threads don't take turns.
-            quantum: (crate::threading::model() == ThreadingModel::TimeShared)
-                .then_some(DEFAULT_QUANTUM),
+            quantum: (threading == ThreadingModel::TimeShared).then_some(DEFAULT_QUANTUM),
             slice_timer_armed: false,
             runtime: None,
         })
+    }
+
+    /// How the guest's threads run.
+    pub fn threading(&self) -> ThreadingModel {
+        self.threads.model()
     }
 
     /// The status the guest passed to `exit()`, once it has.
@@ -1048,7 +1058,7 @@ impl DefaultTrapHandler {
                 }
                 // A new process, which gets its own host process and VM.
                 Ok(spawn) => {
-                    match crate::respawn::spawn_guest(&spawn) {
+                    match crate::respawn::spawn_guest(&spawn, self.threads.model()) {
                         Ok(pid) => {
                             if args[0] != 0 {
                                 vma.write_dword(args[0], pid.as_raw() as u32)?;
@@ -1809,7 +1819,7 @@ mod tests {
 
     #[test]
     fn remove_mapping_handles_partial_unmaps() {
-        let mut handler = DefaultTrapHandler::new().unwrap();
+        let mut handler = DefaultTrapHandler::new(ThreadingModel::TimeShared).unwrap();
         handler.record_mapping(0x1000, 0x4000);
         handler.record_mapping(0x8000, 0x1000);
 
@@ -1936,7 +1946,7 @@ mod tests {
         let mut vm = VmManager::new()?;
         let (nsa, osa) = (region.data() as u64, region.data() as u64 + 0x100);
         vm.vma().map_1to1(nsa, region.len(), av::MemPerms::RWX)?;
-        let mut handler = DefaultTrapHandler::new()?;
+        let mut handler = DefaultTrapHandler::new(ThreadingModel::TimeShared)?;
         let sig = nix::libc::SIGUSR1 as u64;
 
         // struct __sigaction: handler, tramp, mask, flags.

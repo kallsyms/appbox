@@ -458,7 +458,7 @@ mod tests {
         vm.vcpu.set_reg(av::Reg::PC, loader.entry_point)?;
         vm.vcpu
             .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)?;
-        let mut handler = DefaultTrapHandler::new()?;
+        let mut handler = DefaultTrapHandler::new(crate::threading::ThreadingModel::TimeShared)?;
 
         run_syscalls(&mut vm, &mut handler, &loader, 30).context("before checkpointing")?;
         let checkpoint = handler.checkpoint(&mut vm)?;

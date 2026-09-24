@@ -119,10 +119,11 @@ ends (see below).
 
 ### Or a vCPU each, in parallel (opt-in)
 
-`appbox::threading::use_parallel_vcpus()` gives each guest thread a vCPU of its own, on a host
-thread of its own, so threads really run at once. The cost is determinism: no record/replay and
-no checkpoints. It's an environment variable (`APPBOX_THREADING`), so every process a guest
-spawns inherits it, and so does the image it execs.
+`DefaultTrapHandler::new(ThreadingModel::Parallel)` gives each guest thread a vCPU of its own, on
+a host thread of its own, so threads really run at once. The cost is determinism: no
+record/replay and no checkpoints. Processes a guest spawns get the same model whatever their
+embedder asks for: it's passed down in their environment (`APPBOX_THREADING`). An exec keeps the
+handler, and so the model.
 
 The two models share nearly all their code:
 - The thread states and transitions in `Threads` are the same. A thread becoming runnable

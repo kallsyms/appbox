@@ -31,6 +31,7 @@ use crate::mach::{
     KERN_SUCCESS, VM_PROT_READ, VM_PROT_WRITE, VM_REGION_BASIC_INFO_64,
     VM_REGION_BASIC_INFO_COUNT_64,
 };
+use crate::threading::ThreadingModel;
 use crate::trap::PosixSpawn;
 
 const RESPAWNED_ENV: &str = "APPBOX_RESPAWNED";
@@ -98,7 +99,10 @@ pub fn spawned_guest() -> Result<Option<ExecRequest>> {
 /// Starts a new host process for a guest's `posix_spawn()`: another copy of this program, pinned
 /// like [`respawn`]'s child, which runs the requested guest in its own VM (see [`spawned_guest`]).
 /// Returns its pid, which is also the guest process's pid.
-pub(crate) fn spawn_guest(spawn: &PosixSpawn) -> Result<nix::unistd::Pid> {
+pub(crate) fn spawn_guest(
+    spawn: &PosixSpawn,
+    threading: ThreadingModel,
+) -> Result<nix::unistd::Pid> {
     const PASSED_THROUGH: i16 = POSIX_SPAWN_RESETIDS
         | POSIX_SPAWN_SETPGROUP
         | POSIX_SPAWN_SETSIGDEF
@@ -114,7 +118,10 @@ pub(crate) fn spawn_guest(spawn: &PosixSpawn) -> Result<nix::unistd::Pid> {
     let flags = spawn.flags & PASSED_THROUGH;
 
     let pid = spawn_pinned(
-        &[(SPAWN_REQUEST_ENV, encode_request(&spawn.request))],
+        &[
+            (SPAWN_REQUEST_ENV, encode_request(&spawn.request)),
+            threading.env(),
+        ],
         |attr| {
             let check = |ret: i32, what: &str| match ret {
                 0 => Ok(()),

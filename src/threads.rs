@@ -1,5 +1,5 @@
 //! Guest threads, time-shared on the VM's one vCPU, or each on a vCPU of its own (see
-//! [`crate::threading`]).
+//! [`ThreadingModel`]).
 //!
 //! Time-shared, only one guest thread runs at a time; the others are saved register states. That
 //! keeps the guest's execution deterministic apart from where threads are switched, which callers
@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::applevisor as av;
-use crate::threading::{self, ThreadingModel};
+use crate::threading::ThreadingModel;
 use crate::trap::forward_syscall;
 use crate::workq::EventSource;
 
@@ -244,10 +244,10 @@ fn apply_return(regs: &mut Registers, (ret0, ret1, flags): SyscallReturn) {
 }
 
 impl Threads {
-    pub(crate) fn new() -> Result<Self> {
+    pub(crate) fn new(model: ThreadingModel) -> Result<Self> {
         let (messages_tx, messages) = channel();
         let mut threads = Self {
-            model: threading::model(),
+            model,
             threads: BTreeMap::new(),
             current: Some(MAIN_THREAD),
             next_id: MAIN_THREAD + 1,
@@ -670,7 +670,7 @@ mod tests {
     fn forwards_syscalls_on_a_proxy_thread() -> Result<()> {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let vm = VmManager::new()?;
-        let mut threads = Threads::new()?;
+        let mut threads = Threads::new(ThreadingModel::TimeShared)?;
         let args = [0u64; 16];
         let mut forward = |num| match threads.forward(&vm.vcpu, num, &args, true)? {
             Forwarded::Returned(ret) => Ok::<_, anyhow::Error>(ret),
