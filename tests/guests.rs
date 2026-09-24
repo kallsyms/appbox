@@ -155,3 +155,25 @@ fn pthreads() {
         &["<switched to thread"],
     );
 }
+
+#[test]
+fn dispatch() {
+    let output = run(&[&guest("dispatch")]);
+    assert_output(
+        &output,
+        0,
+        &[
+            "dispatch_async: ok",
+            "group: 100/100",
+            "serial order: ok",
+            "dispatch_after: ok",
+            "timer source: ok",
+            "read source: ok",
+            "read: x",
+            "mach receive source: ok",
+            "mach message id: 1234",
+            "main queue: ok",
+        ],
+        &["<switched to thread"],
+    );
+}

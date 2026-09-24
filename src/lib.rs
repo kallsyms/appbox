@@ -16,6 +16,7 @@ pub mod syscalls;
 pub mod threads;
 pub mod trap;
 pub mod vm;
+mod workq;
 
 pub mod hyperpom;
 pub mod applevisor {

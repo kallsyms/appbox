@@ -5,10 +5,12 @@ use crate::hyperpom::memory::VirtMemAllocator;
 use crate::layout::AddressSpaceConflict;
 use crate::loader::Loader;
 use crate::mach::{
-    mach_vm_allocate, mach_vm_deallocate, mach_vm_map, mach_vm_read_overwrite, VM_FLAGS_OVERWRITE,
+    mach_vm_allocate, mach_vm_deallocate, mach_vm_map, mach_vm_read_overwrite, VM_FLAGS_FIXED,
+    VM_FLAGS_OVERWRITE,
 };
 use crate::syscalls;
-use crate::threads::{Forwarded, Registers, ThreadSwitch, Threads, MAIN_THREAD};
+use crate::threads::{Forwarded, Registers, ThreadId, ThreadSwitch, Threads, MAIN_THREAD};
+use crate::workq::{WorkqReturn, Workqueue, KEVENT_FLAG_WORKQ};
 use anyhow::{Context, Result};
 use log::{debug, error, trace, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -245,8 +247,9 @@ pub fn forward_syscall(num: u64, args: &[u64; 16]) -> (u64, u64, u64) {
 pub struct DefaultTrapHandler {
     map_fixed_next: u64,
     mappings: Vec<(u64, usize)>,
-    threads: Threads,
-    pthread: Option<PthreadRegistration>,
+    pub(crate) threads: Threads,
+    pub(crate) pthread: Option<PthreadRegistration>,
+    pub(crate) workq: Workqueue,
     signals: [GuestSigaction; NSIG],
     exit_status: Option<i32>,
 }
@@ -271,25 +274,26 @@ pub struct GuestSigaction {
 
 /// What libpthread registered with `__bsdthread_register`.
 #[derive(Clone, Copy, Default, Debug)]
-struct PthreadRegistration {
-    thread_start: u64,
-    wq_thread: u64,
-    pthread_size: u32,
-    dispatch_queue_offset: u64,
-    tsd_offset: u32,
-    mach_thread_self_offset: u32,
+pub(crate) struct PthreadRegistration {
+    pub(crate) thread_start: u64,
+    pub(crate) wq_thread: u64,
+    pub(crate) pthread_size: u32,
+    pub(crate) dispatch_queue_offset: u64,
+    pub(crate) tsd_offset: u32,
+    pub(crate) mach_thread_self_offset: u32,
 }
 
 const PTHREAD_REGISTRATION_DATA_SIZE: usize = 56;
 
 // See libpthread's kern/kern_internal.h and src/pthread.c. Everything the kernel supports but
-// workloops and the cooperative workqueue.
+// the cooperative workqueue.
 const PTHREAD_FEATURES: u64 = 0x01 // DISPATCHFUNC
     | 0x02 // FINEPRIO
     | 0x04 // BSDTHREADCTL
     | 0x08 // SETSELF
     | 0x10 // QOS_MAINTENANCE
     | 0x40 // KEVENT
+    | 0x80 // WORKLOOP
     | 0x4000_0000; // QOS_DEFAULT
 const PTHREAD_START_CUSTOM: u64 = 0x0100_0000;
 const PTHREAD_START_TSD_BASE_SET: u64 = 0x1000_0000;
@@ -328,6 +332,7 @@ impl DefaultTrapHandler {
             mappings: Vec::new(),
             threads: Threads::new()?,
             pthread: None,
+            workq: Workqueue::default(),
             signals: [GuestSigaction::default(); NSIG],
             exit_status: None,
         })
@@ -364,7 +369,7 @@ impl DefaultTrapHandler {
     }
 
     /// The guest thread currently on the vCPU.
-    pub fn current_thread(&self) -> crate::threads::ThreadId {
+    pub fn current_thread(&self) -> ThreadId {
         self.threads.current()
     }
 
@@ -377,6 +382,7 @@ impl DefaultTrapHandler {
     pub fn prepare_for_exec(&mut self) {
         self.release_guest_memory();
         self.threads.retain_only_current();
+        self.reset_workq();
         self.pthread = None;
         // Like the kernel: caught signals revert to their default action, ignored ones stay so.
         for action in &mut self.signals {
@@ -476,7 +482,56 @@ impl DefaultTrapHandler {
     ) -> Result<(u64, u64, u64)> {
         match self.threads.forward(vcpu, num, args, false)? {
             Forwarded::Returned(ret) => Ok(ret),
-            Forwarded::Blocked(_) => unreachable!("forwarding without blocking"),
+            Forwarded::Blocked => unreachable!("forwarding without blocking"),
+        }
+    }
+
+    /// Allocates `size` bytes of guest memory (on the host, mapped into the VM) for appbox's own
+    /// use on the guest's behalf, like thread stacks the kernel would allocate.
+    pub(crate) fn allocate_guest_memory(
+        &mut self,
+        vma: &mut VirtMemAllocator,
+        size: u64,
+    ) -> Result<u64> {
+        let size = Self::align_size(size);
+        let addr = self.reserve_fixed_address(size, None);
+        self.release_fixed_map_range(addr, size)?;
+        let mut allocated = addr;
+        let kr = unsafe {
+            mach_vm_allocate(nix::libc::mach_task_self(), &mut allocated, size, VM_FLAGS_FIXED)
+        };
+        if kr != KERN_SUCCESS as i32 {
+            self.restore_fixed_map_range(addr, size)?;
+            anyhow::bail!("allocating {size:#x} bytes of guest memory: kern_return_t={kr}");
+        }
+        vma.map_1to1(addr, size as usize, av::MemPerms::RWX)?;
+        self.record_mapping(addr, size as usize);
+        Ok(addr)
+    }
+
+    /// Puts the next thread to run on the vCPU, which no thread is on, waiting for one to become
+    /// runnable if needed. `from` is the thread that was on it, unless it exited. Ends the
+    /// process if no thread can ever run again.
+    fn schedule(
+        &mut self,
+        vcpu: &av::Vcpu,
+        vma: &mut VirtMemAllocator,
+        from: Option<ThreadId>,
+    ) -> Result<SyscallResult> {
+        loop {
+            for source in self.threads.take_kevents_pending() {
+                self.kevents_pending(vcpu, vma, source)?;
+            }
+            if let Some(switch) = self.threads.switch_to_next(vcpu, from)? {
+                return Ok(SyscallResult::switched(switch));
+            }
+            // As with the kernel, the process ends with its last thread. Parked workqueue threads
+            // only count while something could wake them.
+            if !self.threads.any_alive() && !self.workq.has_event_sources() {
+                self.exit_status = Some(0);
+                return Ok(SyscallResult::exit(ExitKind::Exit));
+            }
+            self.threads.wait()?;
         }
     }
 
@@ -599,14 +654,8 @@ impl DefaultTrapHandler {
         if kport != 0 {
             unsafe { crate::mach::mach_port_deallocate(nix::libc::mach_task_self(), kport) };
         }
-        match self.threads.exit_current(vcpu)? {
-            Some(switch) => Ok(SyscallResult::switched(switch)),
-            // As with the kernel, the process ends with its last thread.
-            None => {
-                self.exit_status = Some(0);
-                Ok(SyscallResult::exit(ExitKind::Exit))
-            }
-        }
+        self.threads.exit_current();
+        self.schedule(vcpu, vma, None)
     }
 
     /// `__sigaction(sig, nsa, osa)`: records the guest's action, applying only `SIG_DFL` or
@@ -819,9 +868,38 @@ impl TrapHandler for DefaultTrapHandler {
             }
             // Forwarding these would have the host kernel start real host threads running the
             // host's libdispatch.
-            syscalls::SYS_workq_open | syscalls::SYS_workq_kernreturn => {
-                ret0 = nix::libc::ENOTSUP as u64;
-                cflags = 1 << 29;
+            syscalls::SYS_workq_open => {
+                ret0 = 0;
+                handled = true;
+            }
+            syscalls::SYS_workq_kernreturn => {
+                let id = self.threads.current();
+                match self.workq_kernreturn(vcpu, vma, &args)? {
+                    WorkqReturn::Done(Ok(ret)) => ret0 = ret,
+                    WorkqReturn::Done(Err(errno)) => {
+                        ret0 = errno as u64;
+                        cflags = 1 << 29;
+                    }
+                    WorkqReturn::Descheduled => return self.schedule(vcpu, vma, Some(id)),
+                }
+                handled = true;
+            }
+            syscalls::SYS_kevent_qos => {
+                if args[7] & KEVENT_FLAG_WORKQ != 0 {
+                    args[0] = self.workq_kqueue()? as u64;
+                    args[7] &= !KEVENT_FLAG_WORKQ;
+                }
+            }
+            syscalls::SYS_kevent_id => {
+                let id = self.threads.current();
+                match self.kevent_id(vcpu, vma, &args)? {
+                    WorkqReturn::Done(Ok(ret)) => ret0 = ret,
+                    WorkqReturn::Done(Err(errno)) => {
+                        ret0 = errno as u64;
+                        cflags = 1 << 29;
+                    }
+                    WorkqReturn::Descheduled => return self.schedule(vcpu, vma, Some(id)),
+                }
                 handled = true;
             }
             syscalls::SYS_bsdthread_terminate => {
@@ -1124,16 +1202,17 @@ impl TrapHandler for DefaultTrapHandler {
                     | syscalls::TRAP_mach_vm_map
                     | syscalls::TRAP_mach_vm_deallocate
             );
+            let id = self.threads.current();
             match self.threads.forward(vcpu, num, &args, may_block)? {
                 Forwarded::Returned(ret) => (ret0, ret1, cflags) = ret,
-                Forwarded::Blocked(switch) => return Ok(SyscallResult::switched(switch)),
+                Forwarded::Blocked => return self.schedule(vcpu, vma, Some(id)),
             }
             if matches!(
                 num,
                 syscalls::TRAP_swtch_pri | syscalls::TRAP_swtch | syscalls::TRAP_thread_switch
             ) {
-                if let Some(switch) = self.threads.yield_current(vcpu, (ret0, ret1, cflags))? {
-                    return Ok(SyscallResult::switched(switch));
+                if self.threads.yield_current(vcpu, (ret0, ret1, cflags))? {
+                    return self.schedule(vcpu, vma, Some(id));
                 }
             }
             if let Some((addr, size)) = released_fixed_map_range {
