@@ -54,7 +54,10 @@ fn formatters_by_syscall() -> &'static HashMap<u64, Vec<ArgFormat>> {
         map.insert(appbox::syscalls::SYS_getegid, vec![]);
         map.insert(appbox::syscalls::SYS_getgid, vec![]);
         map.insert(appbox::syscalls::SYS_execve, vec![Str, Ptr, Ptr]);
-        map.insert(appbox::syscalls::SYS_posix_spawn, vec![Ptr, Str, Ptr, Ptr, Ptr]);
+        map.insert(
+            appbox::syscalls::SYS_posix_spawn,
+            vec![Ptr, Str, Ptr, Ptr, Ptr],
+        );
         map.insert(appbox::syscalls::SYS_munmap, vec![Ptr, Size]);
         map.insert(appbox::syscalls::SYS_mprotect, vec![Ptr, Size, Hex]);
         map.insert(appbox::syscalls::SYS_setreuid, vec![Dec, Dec]);
@@ -227,16 +230,18 @@ fn main() -> Result<()> {
 
     appbox::respawn::respawn()?;
 
+    // Processes the guest spawns get their own copy of this program, running the spawned guest.
+    let (executable, argv, envp) = match appbox::respawn::spawned_guest()? {
+        Some(request) => (request.path, request.argv, request.envp),
+        None => {
+            let mut argv = vec![args.executable.clone()];
+            argv.extend(args.arguments.iter().cloned());
+            (PathBuf::from(&args.executable), argv, vec![])
+        }
+    };
+
     let mut vm = VmManager::new()?;
-    let mut argv = Vec::new();
-    argv.push(args.executable.clone());
-    argv.extend(args.arguments.iter().cloned());
-    let mut loader = appbox::loader::load_macho(
-        &mut vm,
-        &PathBuf::from(args.executable.clone()),
-        argv,
-        vec![],
-    )?;
+    let mut loader = appbox::loader::load_macho(&mut vm, &executable, argv, envp)?;
 
     vm.vcpu.set_reg(av::Reg::PC, loader.entry_point)?;
     vm.vcpu
@@ -327,5 +332,10 @@ fn main() -> Result<()> {
         }
     }
 
+    // Exit like the guest did, so e.g. a guest parent's waitpid() sees its status.
+    if let Some(status) = handler.exit_status() {
+        drop(vm);
+        std::process::exit(status);
+    }
     Ok(())
 }

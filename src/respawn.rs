@@ -24,18 +24,26 @@ use std::ffi::CString;
 use anyhow::{bail, Context, Result};
 use log::debug;
 
+use crate::exec::ExecRequest;
 use crate::layout::pinned_host_malloc_entropy;
 use crate::mach::{
     mach_port_deallocate, mach_vm_read_overwrite, mach_vm_region, mach_vm_write, task_for_pid,
     KERN_SUCCESS, VM_PROT_READ, VM_PROT_WRITE, VM_REGION_BASIC_INFO_64,
     VM_REGION_BASIC_INFO_COUNT_64,
 };
+use crate::trap::PosixSpawn;
 
 const RESPAWNED_ENV: &str = "APPBOX_RESPAWNED";
+const SPAWN_REQUEST_ENV: &str = "APPBOX_SPAWN_REQUEST";
 
 // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/sys/spawn.h
+const POSIX_SPAWN_RESETIDS: i16 = 0x0001;
+const POSIX_SPAWN_SETPGROUP: i16 = 0x0002;
+const POSIX_SPAWN_SETSIGDEF: i16 = 0x0004;
+const POSIX_SPAWN_SETSIGMASK: i16 = 0x0008;
 const POSIX_SPAWN_START_SUSPENDED: i16 = 0x0080;
 const _POSIX_SPAWN_DISABLE_ASLR: i16 = 0x0100;
+const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
 
 /// Whether this process is a child started by [`respawn`].
 pub fn is_respawned() -> bool {
@@ -50,6 +58,92 @@ pub fn respawn() -> Result<()> {
         return Ok(());
     }
 
+    let pid = spawn_pinned(&[], |_| Ok(()), None)?;
+    debug!("respawned as pid {}", pid);
+    nix::sys::signal::kill(pid, nix::sys::signal::SIGCONT)?;
+
+    use nix::sys::wait::{waitpid, WaitStatus};
+    match waitpid(pid, None)? {
+        WaitStatus::Exited(_, code) => std::process::exit(code),
+        WaitStatus::Signaled(_, signal, _) => std::process::exit(128 + signal as i32),
+        status => bail!("unexpected child wait status: {:?}", status),
+    }
+}
+
+/// In a process started for a guest's `posix_spawn()`, the guest to run instead of the program's
+/// usual one. Embedders should check this right after [`respawn`].
+pub fn spawned_guest() -> Result<Option<ExecRequest>> {
+    let Some(encoded) = std::env::var_os(SPAWN_REQUEST_ENV) else {
+        return Ok(None);
+    };
+    decode_request(encoded.to_str().context("malformed spawn request")?).map(Some)
+}
+
+/// Starts a new host process for a guest's `posix_spawn()`: another copy of this program, pinned
+/// like [`respawn`]'s child, which runs the requested guest in its own VM (see [`spawned_guest`]).
+/// Returns its pid, which is also the guest process's pid.
+pub(crate) fn spawn_guest(spawn: &PosixSpawn) -> Result<nix::unistd::Pid> {
+    const PASSED_THROUGH: i16 = POSIX_SPAWN_RESETIDS
+        | POSIX_SPAWN_SETPGROUP
+        | POSIX_SPAWN_SETSIGDEF
+        | POSIX_SPAWN_SETSIGMASK
+        | POSIX_SPAWN_START_SUSPENDED
+        | POSIX_SPAWN_CLOEXEC_DEFAULT;
+    if spawn.flags & !PASSED_THROUGH != 0 {
+        debug!(
+            "ignoring posix_spawn flags {:#x}",
+            spawn.flags & !PASSED_THROUGH
+        );
+    }
+    let flags = spawn.flags & PASSED_THROUGH;
+
+    let pid = spawn_pinned(
+        &[(SPAWN_REQUEST_ENV, encode_request(&spawn.request))],
+        |attr| {
+            let check = |ret: i32, what: &str| match ret {
+                0 => Ok(()),
+                errno => Err(std::io::Error::from_raw_os_error(errno)).context(what.to_string()),
+            };
+            unsafe {
+                check(
+                    nix::libc::posix_spawnattr_setflags(attr, flags | spawn_flags()),
+                    "posix_spawnattr_setflags",
+                )?;
+                check(
+                    nix::libc::posix_spawnattr_setsigmask(attr, &spawn.sigmask),
+                    "posix_spawnattr_setsigmask",
+                )?;
+                check(
+                    nix::libc::posix_spawnattr_setsigdefault(attr, &spawn.sigdefault),
+                    "posix_spawnattr_setsigdefault",
+                )?;
+                check(
+                    nix::libc::posix_spawnattr_setpgroup(attr, spawn.pgroup),
+                    "posix_spawnattr_setpgroup",
+                )
+            }
+        },
+        spawn.file_actions,
+    )?;
+    debug!("spawned guest {:?} as pid {}", spawn.request, pid);
+    if flags & POSIX_SPAWN_START_SUSPENDED == 0 {
+        nix::sys::signal::kill(pid, nix::sys::signal::SIGCONT)?;
+    }
+    Ok(pid)
+}
+
+fn spawn_flags() -> i16 {
+    POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_DISABLE_ASLR
+}
+
+/// Starts a suspended copy of this program with ASLR disabled and its malloc entropy pinned.
+/// `extra_env` is added to (replacing any existing values in) this process's environment.
+/// `file_actions` is a `struct _posix_spawn_file_actions` pointer, if any.
+fn spawn_pinned(
+    extra_env: &[(&str, String)],
+    configure: impl FnOnce(&mut nix::libc::posix_spawnattr_t) -> Result<()>,
+    file_actions: Option<u64>,
+) -> Result<nix::unistd::Pid> {
     let entropy = pinned_host_malloc_entropy()
         .context("host malloc layout unknown for this macOS version")?;
     let executable = CString::new(
@@ -60,50 +154,76 @@ pub fn respawn() -> Result<()> {
     let argv = CStringArray::new(std::env::args())?;
     let envp = CStringArray::new(
         std::env::vars()
+            .filter(|(k, _)| k != RESPAWNED_ENV && !extra_env.iter().any(|(e, _)| e == k))
             .map(|(k, v)| format!("{k}={v}"))
-            .chain(std::iter::once(format!("{RESPAWNED_ENV}=1"))),
+            .chain(std::iter::once(format!("{RESPAWNED_ENV}=1")))
+            .chain(extra_env.iter().map(|(k, v)| format!("{k}={v}"))),
     )?;
 
     let mut attr: nix::libc::posix_spawnattr_t = std::ptr::null_mut();
     if unsafe { nix::libc::posix_spawnattr_init(&mut attr) } != 0 {
         return Err(std::io::Error::last_os_error()).context("posix_spawnattr_init");
     }
-    let flags = POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_DISABLE_ASLR;
-    if unsafe { nix::libc::posix_spawnattr_setflags(&mut attr, flags) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("posix_spawnattr_setflags");
-    }
+    let spawned = (|| {
+        if unsafe { nix::libc::posix_spawnattr_setflags(&mut attr, spawn_flags()) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("posix_spawnattr_setflags");
+        }
+        configure(&mut attr)?;
+        let file_actions =
+            file_actions.map(|actions| actions as nix::libc::posix_spawn_file_actions_t);
+        let mut pid: nix::libc::pid_t = 0;
+        let ret = unsafe {
+            nix::libc::posix_spawn(
+                &mut pid,
+                executable.as_ptr(),
+                file_actions
+                    .as_ref()
+                    .map_or(std::ptr::null(), |actions| actions as *const _),
+                &attr,
+                argv.as_ptr(),
+                envp.as_ptr(),
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::from_raw_os_error(ret)).context("posix_spawn");
+        }
+        Ok(nix::unistd::Pid::from_raw(pid))
+    })();
+    unsafe { nix::libc::posix_spawnattr_destroy(&mut attr) };
+    let pid = spawned?;
 
-    let mut pid: nix::libc::pid_t = 0;
-    let ret = unsafe {
-        nix::libc::posix_spawn(
-            &mut pid,
-            executable.as_ptr(),
-            std::ptr::null(),
-            &attr,
-            argv.as_ptr(),
-            envp.as_ptr(),
-        )
-    };
-    if ret != 0 {
-        return Err(std::io::Error::from_raw_os_error(ret)).context("posix_spawn");
-    }
-    debug!("respawned as pid {}", pid);
-    let pid = nix::unistd::Pid::from_raw(pid);
-
-    use nix::sys::signal::{kill, Signal};
     if let Err(err) = pin_malloc_entropy(pid.as_raw(), entropy) {
-        let _ = kill(pid, Signal::SIGKILL);
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::SIGKILL);
         let _ = nix::sys::wait::waitpid(pid, None);
         return Err(err.context("pinning the host malloc layout"));
     }
-    kill(pid, Signal::SIGCONT)?;
+    Ok(pid)
+}
 
-    use nix::sys::wait::{waitpid, WaitStatus};
-    match waitpid(pid, None)? {
-        WaitStatus::Exited(_, code) => std::process::exit(code),
-        WaitStatus::Signaled(_, signal, _) => std::process::exit(128 + signal as i32),
-        status => bail!("unexpected child wait status: {:?}", status),
+// Environment values can't contain NULs, so the NUL-separated fields are hex encoded.
+fn encode_request(request: &ExecRequest) -> String {
+    let fields: Vec<String> = std::iter::once(request.path.to_string_lossy().into_owned())
+        .chain(std::iter::once(request.argv.len().to_string()))
+        .chain(request.argv.iter().cloned())
+        .chain(request.envp.iter().cloned())
+        .collect();
+    hex::encode(fields.join("\0"))
+}
+
+fn decode_request(encoded: &str) -> Result<ExecRequest> {
+    let decoded = String::from_utf8(hex::decode(encoded).context("malformed spawn request")?)?;
+    let mut fields = decoded.split('\0').map(str::to_string);
+    let path = fields.next().context("malformed spawn request")?.into();
+    let argc: usize = fields.next().context("malformed spawn request")?.parse()?;
+    let argv: Vec<String> = fields.by_ref().take(argc).collect();
+    if argv.len() != argc {
+        bail!("malformed spawn request");
     }
+    Ok(ExecRequest {
+        path,
+        argv,
+        envp: fields.collect(),
+    })
 }
 
 /// Overwrites the `malloc_entropy` apple[] string of suspended process `pid`, which the kernel
@@ -233,6 +353,22 @@ impl CStringArray {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_requests_roundtrip() {
+        for (argv, envp) in [
+            (vec!["a", "", "b c"], vec!["K=V", "EMPTY="]),
+            (vec!["only"], vec![]),
+            (vec![], vec![""]),
+        ] {
+            let request = ExecRequest {
+                path: "/bin/echo".into(),
+                argv: argv.iter().map(|s| s.to_string()).collect(),
+                envp: envp.iter().map(|s| s.to_string()).collect(),
+            };
+            assert_eq!(decode_request(&encode_request(&request)).unwrap(), request);
+        }
+    }
 
     #[test]
     fn recognizes_kernel_entropy_string() {

@@ -229,6 +229,7 @@ pub struct DefaultTrapHandler {
     map_fixed_next: u64,
     mappings: Vec<(u64, usize)>,
     tsd: u64,
+    exit_status: Option<i32>,
 }
 
 impl DefaultTrapHandler {
@@ -244,7 +245,13 @@ impl DefaultTrapHandler {
             map_fixed_next,
             mappings: Vec::new(),
             tsd: 0,
+            exit_status: None,
         })
+    }
+
+    /// The status the guest passed to `exit()`, once it has.
+    pub fn exit_status(&self) -> Option<i32> {
+        self.exit_status
     }
 
     fn record_mapping(&mut self, addr: u64, size: usize) {
@@ -418,14 +425,50 @@ impl TrapHandler for DefaultTrapHandler {
         // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/arm64/sleh.c#L1686
         // for dispatch code.
         match num {
+            syscalls::SYS_posix_spawn => match read_posix_spawn(vma, &args) {
+                // Replacing the calling process: an exec.
+                Ok(spawn) if spawn.flags & POSIX_SPAWN_SETEXEC != 0 => {
+                    if spawn.file_actions.is_some() {
+                        ret0 = nix::libc::ENOTSUP as u64;
+                        cflags = 1 << 29;
+                    } else {
+                        return Ok(SyscallResult::exit(ExitKind::Exec(spawn.request)));
+                    }
+                    handled = true;
+                }
+                // A new process, which gets its own host process and VM.
+                Ok(spawn) => {
+                    match crate::respawn::spawn_guest(&spawn) {
+                        Ok(pid) => {
+                            if args[0] != 0 {
+                                vma.write_dword(args[0], pid.as_raw() as u32)?;
+                            }
+                            ret0 = 0;
+                        }
+                        Err(err) => {
+                            warn!("failed to spawn guest process: {:#}", err);
+                            ret0 = err
+                                .downcast_ref::<io::Error>()
+                                .and_then(io::Error::raw_os_error)
+                                .unwrap_or(nix::libc::EAGAIN)
+                                as u64;
+                            cflags = 1 << 29;
+                        }
+                    }
+                    handled = true;
+                }
+                Err(errno) => {
+                    ret0 = errno as u64;
+                    cflags = 1 << 29;
+                    handled = true;
+                }
+            },
             syscalls::SYS_execve
             | syscalls::SYS___mac_execve
-            | syscalls::SYS_posix_spawn
             | syscalls::SYS_fork
             | syscalls::SYS_vfork => {
                 let request = match num {
-                    syscalls::SYS_posix_spawn => posix_spawn_exec(vma, &args),
-                    // A child would run on the host, outside the VM.
+                    // The child would have to be a copy of this process's guest.
                     syscalls::SYS_fork | syscalls::SYS_vfork => Err(nix::libc::ENOTSUP),
                     _ => read_exec_args(vma, args[0], args[1], args[2])
                         .map_or(Err(nix::libc::EFAULT), |(path, argv, envp)| {
@@ -443,6 +486,7 @@ impl TrapHandler for DefaultTrapHandler {
                 }
             }
             syscalls::SYS_exit => {
+                self.exit_status = Some(args[0] as i32);
                 return Ok(SyscallResult::exit(ExitKind::Exit));
             }
             syscalls::SYS_mprotect => {
@@ -926,10 +970,19 @@ const CPU_TYPE_ARM64: i32 = 0x0100_000c;
 const CPU_TYPE_ANY: i32 = -1;
 const EBADARCH: i32 = 86;
 
-/// Reads a `posix_spawn()` that replaces the calling process (`POSIX_SPAWN_SETEXEC`) as an exec.
-/// Spawning a new process isn't supported, since it would run on the host outside the VM, and
-/// neither are file or port actions.
-fn posix_spawn_exec(vma: &VirtMemAllocator, args: &[u64; 16]) -> Result<ExecRequest, i32> {
+/// A guest `posix_spawn()` call, read from guest memory.
+pub(crate) struct PosixSpawn {
+    pub(crate) request: ExecRequest,
+    pub(crate) flags: i16,
+    pub(crate) sigdefault: u32,
+    pub(crate) sigmask: u32,
+    pub(crate) pgroup: i32,
+    /// Guest pointer to the `struct _posix_spawn_file_actions`, which is usable as is on the host
+    /// since guest memory is mapped 1:1.
+    pub(crate) file_actions: Option<u64>,
+}
+
+fn read_posix_spawn(vma: &VirtMemAllocator, args: &[u64; 16]) -> Result<PosixSpawn, i32> {
     let (path, argv, envp) =
         read_exec_args(vma, args[1], args[3], args[4]).ok_or(nix::libc::EFAULT)?;
     let read_u64 = |addr: u64| {
@@ -940,31 +993,43 @@ fn posix_spawn_exec(vma: &VirtMemAllocator, args: &[u64; 16]) -> Result<ExecRequ
         let mut bytes = [0u8; 4];
         read_guest(vma, addr, &mut bytes).map(|_| i32::from_le_bytes(bytes))
     };
+    // Both action structs start with (alloc, count).
+    let action_count = |actions: u64| read_i32(actions + 4).ok_or(nix::libc::EFAULT);
 
     // struct _posix_spawn_args_desc: (size, pointer) pairs, starting with attributes, file
     // actions and port actions.
     let desc = args[2];
-    let mut flags = 0i16;
+    let mut spawn = PosixSpawn {
+        request: ExecRequest { path, argv, envp },
+        flags: 0,
+        sigdefault: 0,
+        sigmask: 0,
+        pgroup: 0,
+        file_actions: None,
+    };
     let mut binprefs = [0i32; 4];
     if desc != 0 {
         let attrs = read_u64(desc + 8).ok_or(nix::libc::EFAULT)?;
-        for actions in [desc + 24, desc + 40] {
-            let actions = read_u64(actions).ok_or(nix::libc::EFAULT)?;
-            // Both action structs start with (alloc, count).
-            if actions != 0 && read_i32(actions + 4).ok_or(nix::libc::EFAULT)? != 0 {
-                return Err(nix::libc::ENOTSUP);
-            }
+        let file_actions = read_u64(desc + 24).ok_or(nix::libc::EFAULT)?;
+        let port_actions = read_u64(desc + 40).ok_or(nix::libc::EFAULT)?;
+        if port_actions != 0 && action_count(port_actions)? != 0 {
+            return Err(nix::libc::ENOTSUP);
+        }
+        if file_actions != 0 && action_count(file_actions)? != 0 {
+            spawn.file_actions = Some(file_actions);
         }
         if attrs != 0 {
-            // struct _posix_spawnattr: psa_flags at 0, psa_binprefs[4] at 16.
-            flags = read_i32(attrs).ok_or(nix::libc::EFAULT)? as i16;
+            // struct _posix_spawnattr: psa_flags, padding, psa_sigdefault, psa_sigmask,
+            // psa_pgroup, psa_binprefs[4].
+            let field = |offset: u64| read_i32(attrs + offset).ok_or(nix::libc::EFAULT);
+            spawn.flags = field(0)? as i16;
+            spawn.sigdefault = field(4)? as u32;
+            spawn.sigmask = field(8)? as u32;
+            spawn.pgroup = field(12)?;
             for (i, binpref) in binprefs.iter_mut().enumerate() {
-                *binpref = read_i32(attrs + 16 + 4 * i as u64).ok_or(nix::libc::EFAULT)?;
+                *binpref = field(16 + 4 * i as u64)?;
             }
         }
-    }
-    if flags & POSIX_SPAWN_SETEXEC == 0 {
-        return Err(nix::libc::ENOTSUP);
     }
     let binprefs: Vec<i32> = binprefs.into_iter().take_while(|&p| p != 0).collect();
     if !binprefs.is_empty()
@@ -974,13 +1039,9 @@ fn posix_spawn_exec(vma: &VirtMemAllocator, args: &[u64; 16]) -> Result<ExecRequ
     {
         return Err(EBADARCH);
     }
-    if flags & !POSIX_SPAWN_SETEXEC != 0 {
-        debug!(
-            "ignoring posix_spawn flags {:#x}",
-            flags & !POSIX_SPAWN_SETEXEC
-        );
-    }
-    ExecRequest::resolve(path, argv, envp)
+    let ExecRequest { path, argv, envp } = spawn.request;
+    spawn.request = ExecRequest::resolve(path, argv, envp)?;
+    Ok(spawn)
 }
 
 fn read_exec_args(
@@ -1056,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn posix_spawn_is_only_supported_as_exec() -> Result<()> {
+    fn reads_posix_spawn_arguments() -> Result<()> {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let region = mmap_fixed_fixed::MemoryMap::new(
@@ -1104,19 +1165,27 @@ mod tests {
         const CPU_TYPE_X86_64: u32 = 0x0100_0007;
 
         set_attrs(&mut vm, POSIX_SPAWN_SETEXEC as u32, CPU_TYPE_ARM64 as u32)?;
-        let request = posix_spawn_exec(&vm.vma, &args).unwrap();
-        assert_eq!(request.path, std::path::PathBuf::from("/bin/echo"));
-        assert_eq!(request.argv, vec!["echo".to_string(), "hi".to_string()]);
+        let spawn = read_posix_spawn(&vm.vma, &args).unwrap();
+        assert_eq!(spawn.flags, POSIX_SPAWN_SETEXEC);
+        assert_eq!(spawn.request.path, std::path::PathBuf::from("/bin/echo"));
+        assert_eq!(
+            spawn.request.argv,
+            vec!["echo".to_string(), "hi".to_string()]
+        );
+        assert_eq!(spawn.file_actions, None);
 
         set_attrs(&mut vm, 0, 0)?;
-        assert_eq!(posix_spawn_exec(&vm.vma, &args), Err(nix::libc::ENOTSUP));
+        assert_eq!(read_posix_spawn(&vm.vma, &args).unwrap().flags, 0);
 
         set_attrs(&mut vm, POSIX_SPAWN_SETEXEC as u32, CPU_TYPE_X86_64)?;
-        assert_eq!(posix_spawn_exec(&vm.vma, &args), Err(EBADARCH));
+        assert_eq!(read_posix_spawn(&vm.vma, &args).err(), Some(EBADARCH));
 
-        set_attrs(&mut vm, POSIX_SPAWN_SETEXEC as u32, 0)?;
+        set_attrs(&mut vm, 0, 0)?;
         vm.vma.write_dword(file_actions + 4, 1)?;
-        assert_eq!(posix_spawn_exec(&vm.vma, &args), Err(nix::libc::ENOTSUP));
+        assert_eq!(
+            read_posix_spawn(&vm.vma, &args).unwrap().file_actions,
+            Some(file_actions)
+        );
         Ok(())
     }
 
