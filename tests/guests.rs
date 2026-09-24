@@ -1,7 +1,7 @@
 //! End-to-end tests: guest programs run under the strace example, which does everything a real
 //! embedder does (respawning with a pinned host layout, handling exec and spawned processes).
 
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{mpsc, Mutex, OnceLock};
@@ -218,6 +218,25 @@ fn preemption() {
         &["worker ran while main spun: yes"],
         &["<preempted, switched to thread"],
     );
+}
+
+#[test]
+fn crashing_guests_die_by_their_signal() {
+    let crash = guest("crash");
+    for (how, signal) in [
+        ("trap", nix::libc::SIGTRAP),
+        ("segv", nix::libc::SIGSEGV),
+        ("abort", nix::libc::SIGABRT),
+    ] {
+        let output = run(&[&crash, Path::new(how)]);
+        assert_eq!(
+            output.status.signal(),
+            Some(signal),
+            "{how}: {:?}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 /// Runs the guest with each of its threads on a vCPU of its own.

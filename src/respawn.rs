@@ -65,9 +65,25 @@ pub fn respawn() -> Result<()> {
     use nix::sys::wait::{waitpid, WaitStatus};
     match waitpid(pid, None)? {
         WaitStatus::Exited(_, code) => std::process::exit(code),
-        WaitStatus::Signaled(_, signal, _) => std::process::exit(128 + signal as i32),
+        WaitStatus::Signaled(_, signal, _) => die_by_signal(signal),
         status => bail!("unexpected child wait status: {:?}", status),
     }
+}
+
+/// Terminates the process by `signal`, as if it had been delivered with its default action (so
+/// whoever waits for it sees that, e.g. a guest crash as the signal it'd natively have died of).
+pub fn die_by_signal(signal: nix::sys::signal::Signal) -> ! {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow};
+    let default = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+    unsafe {
+        let _ = sigaction(signal, &default);
+    }
+    let mut only = SigSet::empty();
+    only.add(signal);
+    let _ = nix::sys::signal::pthread_sigmask(SigmaskHow::SIG_UNBLOCK, Some(&only), None);
+    let _ = nix::sys::signal::raise(signal);
+    // Its default action may be to carry on (e.g. SIGCHLD).
+    std::process::exit(128 + signal as i32)
 }
 
 /// In a process started for a guest's `posix_spawn()`, the guest to run instead of the program's

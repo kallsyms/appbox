@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use appbox::applevisor as av;
+use nix::sys::signal::Signal;
 use appbox::hyperpom::crash::ExitKind;
 use appbox::hyperpom::error::ExceptionError;
 use appbox::hyperpom::exceptions::ExceptionClass;
@@ -253,6 +254,25 @@ fn print_stack(
 /// The trace output, which every guest thread writes to.
 type Trace = Mutex<Box<dyn Write + Send>>;
 
+/// The signal the guest would natively have died of, when (first) it crashed.
+static CRASH_SIGNAL: OnceLock<Signal> = OnceLock::new();
+
+fn crash(signal: Signal, reason: impl Into<String>) -> ExitKind {
+    let _ = CRASH_SIGNAL.set(signal);
+    ExitKind::Crash(reason.into())
+}
+
+/// The signal the kernel sends for an exception the guest took (as `ESR_EL1` has it).
+fn exception_signal(esr: u64) -> Signal {
+    match ExceptionClass::from(esr >> 26) {
+        ExceptionClass::PcALignmentFault | ExceptionClass::SpALignmentFault => Signal::SIGBUS,
+        ExceptionClass::Unknown(0) => Signal::SIGILL,
+        ExceptionClass::FpTrapA64 => Signal::SIGFPE,
+        ExceptionClass::BrkA64 => Signal::SIGTRAP,
+        _ => Signal::SIGSEGV,
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -306,7 +326,7 @@ fn main() -> Result<()> {
             run_thread(vm, thread, loader, &trace)
         })
     };
-    loop {
+    let exit = loop {
         let exit;
         (exit, handler) = handler.run(&mut vm, &loader, &runner)?;
         match exit {
@@ -319,15 +339,19 @@ fn main() -> Result<()> {
             }
             exit => {
                 writeln!(trace.lock().unwrap(), "VM exited: {:?}", exit)?;
-                break;
+                break exit;
             }
         }
-    }
+    };
 
-    // Exit like the guest did, so e.g. a guest parent's waitpid() sees its status.
+    // End like the guest did, so e.g. a guest parent's waitpid() sees its status.
     if let Some(status) = handler.exit_status() {
         drop(vm);
         std::process::exit(status);
+    }
+    if let ExitKind::Crash(_) = exit {
+        drop(vm);
+        appbox::respawn::die_by_signal(*CRASH_SIGNAL.get().unwrap_or(&Signal::SIGABRT));
     }
     Ok(())
 }
@@ -383,7 +407,7 @@ fn run_thread(
             // Nothing here sets breakpoints, so this is the guest trapping (e.g. abort()).
             VmRunResult::Brk => {
                 print_stack(&mut **trace.lock().unwrap(), vm, loader)?;
-                ExitKind::Crash("guest trap (brk)".to_string())
+                crash(Signal::SIGTRAP, "guest trap (brk)")
             }
             VmRunResult::Timer => {
                 if let Some(switch) = thread.handle_timer(vm)? {
@@ -398,13 +422,13 @@ fn run_thread(
             }
             VmRunResult::Stopped => ExitKind::ThreadExit,
             VmRunResult::HardwareBreakpoint | VmRunResult::Step | VmRunResult::Watchpoint { .. } => {
-                ExitKind::Crash("unexpected debug exception".to_string())
+                crash(Signal::SIGTRAP, "unexpected debug exception")
             }
             VmRunResult::Other(exit_info) => match exit_info.reason {
                 av::ExitReason::EXCEPTION => {
                     match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
                         ExceptionClass::InsAbortLowerEl => {
-                            ExitKind::Crash("Instruction Abort".to_string())
+                            crash(Signal::SIGSEGV, "Instruction Abort")
                         }
                         // The guest faulted, e.g. accessing memory that isn't mapped.
                         ExceptionClass::HvcA64 => {
@@ -417,7 +441,7 @@ fn run_thread(
                                 "guest exception: ESR_EL1={esr:#x} FAR_EL1={far:#x} ELR_EL1={elr:#x}"
                             )?;
                             print_stack(&mut **trace, vm, loader)?;
-                            ExitKind::Crash(format!("guest exception (ESR_EL1 {esr:#x})"))
+                            crash(exception_signal(esr), format!("guest exception (ESR_EL1 {esr:#x})"))
                         }
                         _ => Err(ExceptionError::UnimplementedException(
                             exit_info.exception.syndrome,
