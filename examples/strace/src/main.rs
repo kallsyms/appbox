@@ -54,6 +54,7 @@ fn formatters_by_syscall() -> &'static HashMap<u64, Vec<ArgFormat>> {
         map.insert(appbox::syscalls::SYS_getegid, vec![]);
         map.insert(appbox::syscalls::SYS_getgid, vec![]);
         map.insert(appbox::syscalls::SYS_execve, vec![Str, Ptr, Ptr]);
+        map.insert(appbox::syscalls::SYS_posix_spawn, vec![Ptr, Str, Ptr, Ptr, Ptr]);
         map.insert(appbox::syscalls::SYS_munmap, vec![Ptr, Size]);
         map.insert(appbox::syscalls::SYS_mprotect, vec![Ptr, Size, Hex]);
         map.insert(appbox::syscalls::SYS_setreuid, vec![Dec, Dec]);
