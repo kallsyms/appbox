@@ -1000,34 +1000,13 @@ impl GdbServer {
             }
         };
         let response = match *command {
-            GdbCommand::AddBreakpoint { addr, .. } => status(set_slot(
-                t.hardware_breakpoint_slots(),
-                t.hardware_breakpoints(),
-                Some(addr),
-                |t, slot, value| t.set_hardware_breakpoint(slot, value),
-                t,
-            )),
-            GdbCommand::RemoveBreakpoint { addr, .. } => {
-                let slot = t.hardware_breakpoints().iter().position(|&b| b == Some(addr));
-                status(match slot {
-                    Some(slot) => t.set_hardware_breakpoint(slot, None),
-                    None => Err(anyhow::anyhow!("no breakpoint at {addr:#x}")),
-                })
+            GdbCommand::AddBreakpoint { addr, .. } => status(t.add_breakpoint(addr)),
+            GdbCommand::RemoveBreakpoint { addr, .. } => status(t.remove_breakpoint(addr)),
+            GdbCommand::AddWatchpoint { addr, len, kind } => {
+                status(t.add_watchpoint(Watchpoint { addr, len, kind }))
             }
-            GdbCommand::AddWatchpoint { addr, len, kind } => status(set_slot(
-                t.hardware_watchpoint_slots(),
-                t.hardware_watchpoints(),
-                Some(Watchpoint { addr, len, kind }),
-                |t, slot, value| t.set_hardware_watchpoint(slot, value),
-                t,
-            )),
             GdbCommand::RemoveWatchpoint { addr, len, kind } => {
-                let watchpoint = Some(Watchpoint { addr, len, kind });
-                let slot = t.hardware_watchpoints().iter().position(|&w| w == watchpoint);
-                status(match slot {
-                    Some(slot) => t.set_hardware_watchpoint(slot, None),
-                    None => Err(anyhow::anyhow!("no such watchpoint")),
-                })
+                status(t.remove_watchpoint(Watchpoint { addr, len, kind }))
             }
             GdbCommand::ReadMemory { addr, len } => {
                 let mut data = vec![0; len];
@@ -1058,23 +1037,6 @@ impl GdbServer {
         let _ = self.responses.send(response);
         true
     }
-}
-
-/// Puts `value` in the first free of `slots` (whose current values are `current`).
-fn set_slot<T: PartialEq>(
-    slots: Result<usize>,
-    current: Vec<Option<T>>,
-    value: Option<T>,
-    set: impl FnOnce(&mut ThreadCx, usize, Option<T>) -> Result<()>,
-    t: &mut ThreadCx,
-) -> Result<()> {
-    if current.contains(&value) {
-        return Ok(());
-    }
-    let slot = (0..slots?)
-        .find(|&slot| current.get(slot).is_none_or(Option::is_none))
-        .ok_or_else(|| anyhow::anyhow!("no free hardware slots"))?;
-    set(t, slot, value)
 }
 
 /// Hooks that let a debugger (see [`GdbServer`]) stop the guest at breakpoints, watchpoints and

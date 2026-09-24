@@ -14,11 +14,14 @@ mod exclusive;
 
 pub enum VmRunResult {
     Svc,
+    /// A `brk` in the guest's own code.
     Brk,
     /// The timer set with [`VmManager::arm_timer`] (or [`arm_vtimer`]) went off.
     Timer,
-    /// The guest reached the address set with [`VmManager::set_hardware_breakpoint`].
-    HardwareBreakpoint,
+    /// The guest reached the address of a hardware breakpoint (see
+    /// [`VmManager::set_hardware_breakpoint_slot`]) or of one planted in its code (see
+    /// [`VirtMemAllocator::plant_breakpoint`]).
+    Breakpoint,
     /// The guest executed the instruction [`VmManager::single_step`] was asked for.
     Step,
     /// The guest is about to access `addr`, watched with [`VmManager::set_hardware_watchpoint`].
@@ -75,7 +78,7 @@ pub fn disarm_vtimer(vcpu: &av::Vcpu) -> Result<()> {
 const CNTV_CTL_ENABLE: u64 = 1;
 
 // See the Arm ARM's MDSCR_EL1, DBGBCR<n>_EL1, DBGWCR<n>_EL1 and SPSR descriptions.
-const MDSCR_SS: u64 = 1 << 0;
+pub(crate) const MDSCR_SS: u64 = 1 << 0;
 const MDSCR_MDE: u64 = 1 << 15;
 const DBGBCR_EL0_ALL_BYTES: u64 = 1 | (0b10 << 1) | (0xf << 5);
 const DBGWCR_EL0: u64 = 1 | (0b10 << 1);
@@ -360,7 +363,7 @@ impl VmManager {
         disarm_vtimer(&self.vcpu)
     }
 
-    /// Has [`Self::run`] return [`VmRunResult::HardwareBreakpoint`] whenever the guest is about
+    /// Has [`Self::run`] return [`VmRunResult::Breakpoint`] whenever the guest is about
     /// to execute `addr` at EL0, or stops doing so. Uses breakpoint slot 0; see
     /// [`Self::set_hardware_breakpoint_slot`] for the others.
     #[cfg(test)]
@@ -493,7 +496,14 @@ impl VmManager {
     }
 
     pub fn run(&mut self) -> Result<VmRunResult> {
+        // Stepping from a planted breakpoint executes the instruction it replaced. In parallel,
+        // other vCPUs could run past the breakpoint meanwhile.
+        let pc = self.vcpu.get_reg(av::Reg::PC)?;
+        let lifted = self.stepping && self.vma().lift_breakpoint(pc)?;
         let result = self.run_to_exit();
+        if lifted {
+            self.vma().replant_breakpoint(pc)?;
+        }
         // A single step ends with whatever stops the guest next (e.g. the instruction was a
         // syscall), not just a step exception.
         if std::mem::take(&mut self.stepping) {
@@ -547,9 +557,15 @@ impl VmManager {
                     {
                         return Ok(VmRunResult::Svc);
                     }
-                    ExceptionClass::BrkA64 => return Ok(VmRunResult::Brk),
+                    ExceptionClass::BrkA64 => {
+                        let pc = self.vcpu.get_reg(av::Reg::PC)?;
+                        return Ok(match self.vma().breakpoint_at(pc) {
+                            true => VmRunResult::Breakpoint,
+                            false => VmRunResult::Brk,
+                        });
+                    }
                     ExceptionClass::BreakpointLowerEl => {
-                        return Ok(VmRunResult::HardwareBreakpoint)
+                        return Ok(VmRunResult::Breakpoint)
                     }
                     ExceptionClass::SoftwareStepLowerEL => {
                         // Stepped into appbox's exception vectors (e.g. from an svc): step on, to
@@ -818,7 +834,7 @@ mod tests {
         let mut hits = 0;
         loop {
             match vm.run()? {
-                VmRunResult::HardwareBreakpoint => {
+                VmRunResult::Breakpoint => {
                     hits += 1;
                     assert_eq!(vm.vcpu.get_reg(av::Reg::PC)?, loop_branch);
                     assert_eq!(vm.vcpu.get_reg(av::Reg::X0)?, 10 - hits);
@@ -841,6 +857,60 @@ mod tests {
             .map_1to1(data.data() as u64, data.len(), av::MemPerms::RWX)?;
         vm.checkpoint_memory()?;
         Ok(data)
+    }
+
+    #[test]
+    fn planted_breakpoints_stop_and_step_like_hardware_ones() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut vm, region) = vm_running(&[SUBS_X0_1, BNE_BACK_1, BRK_0])?;
+        let loop_branch = region.data() as u64 + 4;
+        vm.vcpu.set_reg(av::Reg::X0, 10)?;
+        vm.vma().plant_breakpoint(loop_branch)?;
+        let mut word = [0; 4];
+        vm.vma().read(loop_branch, &mut word)?;
+        assert_eq!(u32::from_le_bytes(word), BNE_BACK_1);
+        let mut hits = 0;
+        loop {
+            match vm.run()? {
+                VmRunResult::Breakpoint => {
+                    hits += 1;
+                    assert_eq!(vm.vcpu.get_reg(av::Reg::PC)?, loop_branch);
+                    assert_eq!(vm.vcpu.get_reg(av::Reg::X0)?, 10 - hits);
+                    vm.single_step()?;
+                    assert!(matches!(vm.run()?, VmRunResult::Step));
+                }
+                VmRunResult::Brk => break,
+                _ => panic!("unexpected exit"),
+            }
+        }
+        assert_eq!(hits, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn restoring_memory_keeps_planted_breakpoints_as_they_are_now() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut vm, region) = vm_running(&[SUBS_X0_1, BNE_BACK_1, BRK_0])?;
+        let start = region.data() as u64;
+        let loop_branch = start + 4;
+        let checkpoint = vm.checkpoint_memory()?;
+        // Saved as it is now (with the breakpoint), then removed.
+        vm.vma().plant_breakpoint(loop_branch)?;
+        vm.vma().log_host_write(loop_branch, 4);
+        assert!(vm.vma().remove_breakpoint(loop_branch)?);
+        vm.restore_memory(checkpoint)?;
+        vm.vcpu.set_reg(av::Reg::X0, 3)?;
+        assert!(matches!(vm.run()?, VmRunResult::Brk));
+
+        // And the other way round.
+        let checkpoint = vm.checkpoint_memory()?;
+        vm.vma().log_host_write(loop_branch, 4);
+        vm.vma().plant_breakpoint(loop_branch)?;
+        vm.restore_memory(checkpoint)?;
+        vm.vcpu.set_reg(av::Reg::PC, start)?;
+        vm.vcpu.set_reg(av::Reg::X0, 3)?;
+        assert!(matches!(vm.run()?, VmRunResult::Breakpoint));
+        Ok(())
     }
 
     #[test]

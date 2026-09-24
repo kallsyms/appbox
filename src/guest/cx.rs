@@ -99,35 +99,63 @@ impl ThreadCx<'_> {
         self.handler().take_guest_memory_changes()
     }
 
-    /// How many hardware breakpoints there are for [`Self::set_hardware_breakpoint`].
-    pub fn hardware_breakpoint_slots(&self) -> Result<usize> {
-        Ok(self.vm.breakpoint_slots()? - 1)
+    /// Stops threads with [`super::Stop::Breakpoint`] whenever they're about to execute `addr`:
+    /// with a hardware breakpoint while there are any left, then with a `brk` planted there
+    /// (which reads of guest memory don't see). Hardware breakpoints are the thread's own vCPU's,
+    /// so in parallel only planted ones stop other threads.
+    pub fn add_breakpoint(&mut self, addr: u64) -> Result<()> {
+        if self.breakpoints().contains(&addr) {
+            return Ok(());
+        }
+        let hardware = self.vm.hardware_breakpoints();
+        let free = (LANDING_SLOT + 1..self.vm.breakpoint_slots()?)
+            .find(|&slot| hardware.get(slot).is_none_or(Option::is_none));
+        match free {
+            Some(slot) => self.vm.set_hardware_breakpoint_slot(slot, Some(addr)),
+            None => Ok(self.vm.vma().plant_breakpoint(addr)?),
+        }
     }
 
-    /// Stops the thread with [`super::Stop::Breakpoint`] whenever it's about to execute `addr`
-    /// (or stops doing so, with `None`).
-    pub fn set_hardware_breakpoint(&mut self, slot: usize, addr: Option<u64>) -> Result<()> {
-        self.vm.set_hardware_breakpoint_slot(slot + 1, addr)
+    pub fn remove_breakpoint(&mut self, addr: u64) -> Result<()> {
+        let slot = self.vm.hardware_breakpoints().iter().position(|&b| b == Some(addr));
+        if let Some(slot) = slot.filter(|&slot| slot != LANDING_SLOT) {
+            return self.vm.set_hardware_breakpoint_slot(slot, None);
+        }
+        anyhow::ensure!(
+            self.vm.vma().remove_breakpoint(addr)?,
+            "no breakpoint at {addr:#x}"
+        );
+        Ok(())
     }
 
-    /// The breakpoints set with [`Self::set_hardware_breakpoint`], by slot.
-    pub fn hardware_breakpoints(&self) -> Vec<Option<u64>> {
-        let breakpoints = self.vm.hardware_breakpoints();
-        breakpoints.get(1..).map_or_else(Vec::new, <[_]>::to_vec)
-    }
-
-    pub fn hardware_watchpoint_slots(&self) -> Result<usize> {
-        self.vm.watchpoint_slots()
+    /// The addresses of the breakpoints added with [`Self::add_breakpoint`].
+    pub fn breakpoints(&self) -> Vec<u64> {
+        let hardware = self.vm.hardware_breakpoints();
+        let hardware = hardware.iter().skip(LANDING_SLOT + 1).flatten().copied();
+        hardware.chain(self.vm.vma().planted_breakpoints()).collect()
     }
 
     /// Stops the thread with [`super::Stop::Watchpoint`] right after it accesses what
-    /// `watchpoint` covers (or stops doing so, with `None`).
-    pub fn set_hardware_watchpoint(&mut self, slot: usize, watchpoint: Option<Watchpoint>) -> Result<()> {
-        self.vm.set_hardware_watchpoint(slot, watchpoint)
+    /// `watchpoint` covers, with one of its vCPU's few hardware watchpoints.
+    pub fn add_watchpoint(&mut self, watchpoint: Watchpoint) -> Result<()> {
+        let watchpoints = self.vm.hardware_watchpoints().to_vec();
+        if watchpoints.contains(&Some(watchpoint)) {
+            return Ok(());
+        }
+        let free = (0..self.vm.watchpoint_slots()?)
+            .find(|&slot| watchpoints.get(slot).is_none_or(Option::is_none))
+            .ok_or_else(|| anyhow::anyhow!("no hardware watchpoints left"))?;
+        self.vm.set_hardware_watchpoint(free, Some(watchpoint))
     }
 
-    pub fn hardware_watchpoints(&self) -> Vec<Option<Watchpoint>> {
-        self.vm.hardware_watchpoints().to_vec()
+    pub fn remove_watchpoint(&mut self, watchpoint: Watchpoint) -> Result<()> {
+        let slot = self.vm.hardware_watchpoints().iter().position(|&w| w == Some(watchpoint));
+        let slot = slot.ok_or_else(|| anyhow::anyhow!("no such watchpoint"))?;
+        self.vm.set_hardware_watchpoint(slot, None)
+    }
+
+    pub fn watchpoints(&self) -> Vec<Watchpoint> {
+        self.vm.hardware_watchpoints().iter().flatten().copied().collect()
     }
 
     /// Records the guest's state, to [`Self::restore`] later. Only for a time-shared guest with a

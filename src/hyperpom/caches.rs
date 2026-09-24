@@ -4,6 +4,7 @@ use applevisor as av;
 
 use crate::hyperpom::error::*;
 use crate::hyperpom::memory::*;
+use crate::vm::MDSCR_SS;
 
 /// Where the maintenance routine is mapped (privileged).
 pub const ROUTINE_ADDR: u64 = 0xffff_ffff_fffe_0000;
@@ -52,11 +53,15 @@ impl Caches {
         Self::run_routine(vcpu, ROUTINE_ADDR)
     }
 
-    /// Runs the routine at `addr` on `vcpu` at EL1, with interrupts masked, then puts back its pc
-    /// and PSTATE.
+    /// Runs the routine at `addr` on `vcpu` at EL1, with interrupts masked and not single
+    /// stepping, then puts back its pc, PSTATE and stepping.
     fn run_routine(vcpu: &mut av::Vcpu, addr: u64) -> Result<()> {
         let pc = vcpu.get_reg(av::Reg::PC)?;
         let cpsr = vcpu.get_reg(av::Reg::CPSR)?;
+        // Debug exceptions go to EL2, so a step armed for the guest would stop the routine at
+        // once, masked or not.
+        let mdscr = vcpu.get_sys_reg(av::SysReg::MDSCR_EL1)?;
+        vcpu.set_sys_reg(av::SysReg::MDSCR_EL1, mdscr & !MDSCR_SS)?;
         // A timer due meanwhile goes off once the guest runs again instead.
         let vtimer_masked = vcpu.get_vtimer_mask()?;
         vcpu.set_vtimer_mask(true)?;
@@ -68,6 +73,7 @@ impl Caches {
             && exit.exception.syndrome >> 26 == 0b010110;
         vcpu.set_reg(av::Reg::PC, pc)?;
         vcpu.set_reg(av::Reg::CPSR, cpsr)?;
+        vcpu.set_sys_reg(av::SysReg::MDSCR_EL1, mdscr)?;
         vcpu.set_vtimer_mask(vtimer_masked)?;
         if !finished {
             return Err(Error::Exception(ExceptionError::UnimplementedException(

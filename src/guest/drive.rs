@@ -193,7 +193,7 @@ impl<'a> Driver<'a> {
         }
         if std::mem::take(&mut self.leaving_stop) {
             let pc = self.vm.vcpu.get_reg(av::Reg::PC)?;
-            if self.vm.hardware_breakpoints().contains(&Some(pc)) {
+            if self.hooks_breakpoint_at(pc) {
                 self.vm.single_step()?;
                 return match self.vm.run()? {
                     VmRunResult::Step => Ok(None),
@@ -294,15 +294,13 @@ impl<'a> Driver<'a> {
             let mut hits = 0u64;
             loop {
                 match self.vm.run()? {
-                    VmRunResult::HardwareBreakpoint => {
+                    VmRunResult::Breakpoint => {
                         let registers = Registers::save(&self.vm.vcpu)?;
                         if target.is_at(&registers) {
                             return Ok(Landing::Reached);
                         }
-                        let hooks_breakpoint = self.vm.hardware_breakpoints()[LANDING_SLOT + 1..]
-                            .contains(&Some(registers.pc));
-                        if hooks_breakpoint {
-                            return Ok(Landing::Event(VmRunResult::HardwareBreakpoint));
+                        if self.hooks_breakpoint_at(registers.pc) {
+                            return Ok(Landing::Event(VmRunResult::Breakpoint));
                         }
                         hits += 1;
                         if hits > max_hits {
@@ -318,6 +316,13 @@ impl<'a> Driver<'a> {
         })();
         self.vm.set_hardware_breakpoint_slot(LANDING_SLOT, None)?;
         landing
+    }
+
+    /// Whether a hook's breakpoint (see [`ThreadCx::add_breakpoint`]) is at `pc`.
+    fn hooks_breakpoint_at(&self, pc: u64) -> bool {
+        let hardware = self.vm.hardware_breakpoints();
+        hardware.iter().skip(LANDING_SLOT + 1).any(|&b| b == Some(pc))
+            || self.vm.vma().breakpoint_at(pc)
     }
 
     /// The thread's slice ended.
@@ -368,7 +373,7 @@ impl<'a> Driver<'a> {
     fn handle(&mut self, result: VmRunResult) -> Result<Option<ExitKind>> {
         match result {
             VmRunResult::Svc => self.syscall(),
-            VmRunResult::HardwareBreakpoint => {
+            VmRunResult::Breakpoint => {
                 let addr = self.vm.vcpu.get_reg(av::Reg::PC)?;
                 self.stop(Stop::Breakpoint { addr })
             }

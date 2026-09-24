@@ -179,6 +179,22 @@ later.) Two things stand in for it:
   The result is exact except for host interrupts, which only ever add, up to about 100k in a few
   ms.
 
+## Debugging
+
+### Breakpoints beyond the hardware ones
+
+There are only a few hardware breakpoints (one of which finding exact points in a thread's
+execution takes), so `ThreadCx::add_breakpoint` plants `brk #0` in guest code once they're used
+up:
+- Reads of guest memory see the original instruction, and writes there replace it instead.
+- Single-stepping from one puts the original back for the step.
+- Restoring a checkpoint can bring back a page with a breakpoint that's since been removed, or
+  without one that's since been added. So every address one was ever planted at is rewritten
+  afterwards, to how it should be now.
+- Planting one rewrites code, so the instruction cache is invalidated before the guest runs
+  again. That runs a routine at EL1, which must disarm a pending single step: debug exceptions
+  are routed to EL2, so an armed step fires in the routine whatever `PSTATE.D` says.
+
 ## Record/replay (warpspeed)
 
 ### Capturing syscall side effects

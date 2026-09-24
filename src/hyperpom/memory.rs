@@ -2129,7 +2129,24 @@ pub struct VirtMemAllocator {
     next_memory_checkpoint: u64,
     /// See [`Self::write_code`].
     code_written: bool,
+    /// Every address a breakpoint was ever planted at (see [`Self::plant_breakpoint`]).
+    /// Restoring memory can bring a page back with or without one, so all of them are put back
+    /// how they should be now.
+    breakpoints: BTreeMap<u64, PlantedBreakpoint>,
 }
+
+/// A `brk` put in place of a guest instruction.
+#[derive(Clone, Copy, Debug)]
+struct PlantedBreakpoint {
+    /// The instruction it replaced.
+    original: [u8; 4],
+    /// Whether it's there (or only lifted, see [`VirtMemAllocator::lift_breakpoint`]), rather
+    /// than removed.
+    set: bool,
+}
+
+/// `brk #0`.
+const BRK: [u8; 4] = 0xd420_0000u32.to_le_bytes();
 
 /// A state of guest memory that [`VirtMemAllocator::restore_memory`] can go back to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2153,6 +2170,7 @@ impl VirtMemAllocator {
             memory_intervals: Vec::new(),
             next_memory_checkpoint: 0,
             code_written: false,
+            breakpoints: BTreeMap::new(),
         })
     }
 
@@ -2251,6 +2269,11 @@ impl VirtMemAllocator {
         self.memory_intervals.truncate(index + 1);
         self.memory_intervals[index].undo.clear();
         self.write_protect_1to1()?;
+        let sites: Vec<_> = self.breakpoints.iter().map(|(&addr, &b)| (addr, b)).collect();
+        for (addr, breakpoint) in sites {
+            let code = if breakpoint.set { BRK } else { breakpoint.original };
+            self.write_code_unmasked(addr, &code)?;
+        }
         Ok(true)
     }
 
@@ -2426,6 +2449,81 @@ impl VirtMemAllocator {
         self.write(addr, buf)
     }
 
+    fn write_code_unmasked(&mut self, addr: u64, code: &[u8]) -> Result<()> {
+        self.code_written = true;
+        self.copy_pages(addr, code.len(), |host, offset, len| unsafe {
+            // SAFETY: `host` is valid for `len` bytes, all in one guest page.
+            std::ptr::copy(code.as_ptr().add(offset), host, len)
+        })
+    }
+
+    /// Plants a `brk` at `addr`, so the guest stops there. Reads of guest memory still see the
+    /// instruction it replaced, and writes there replace that instead.
+    pub fn plant_breakpoint(&mut self, addr: u64) -> Result<()> {
+        if addr % 4 != 0 {
+            return Err(MemoryError::UnalignedAddress(addr))?;
+        }
+        if self.breakpoint_at(addr) {
+            return Ok(());
+        }
+        let mut original = [0; 4];
+        self.read(addr, &mut original)?;
+        self.write_code_unmasked(addr, &BRK)?;
+        self.breakpoints.insert(addr, PlantedBreakpoint { original, set: true });
+        Ok(())
+    }
+
+    /// Removes the breakpoint planted at `addr`, returning whether there was one.
+    pub fn remove_breakpoint(&mut self, addr: u64) -> Result<bool> {
+        let Some(breakpoint) = self.breakpoints.get_mut(&addr).filter(|b| b.set) else {
+            return Ok(false);
+        };
+        breakpoint.set = false;
+        let original = breakpoint.original;
+        self.write_code_unmasked(addr, &original)?;
+        Ok(true)
+    }
+
+    pub fn breakpoint_at(&self, addr: u64) -> bool {
+        self.breakpoints.get(&addr).is_some_and(|b| b.set)
+    }
+
+    /// The addresses breakpoints are planted at.
+    pub fn planted_breakpoints(&self) -> Vec<u64> {
+        let set = self.breakpoints.iter().filter(|(_, b)| b.set);
+        set.map(|(&addr, _)| addr).collect()
+    }
+
+    /// Puts back the instruction the breakpoint planted at `addr` replaced, if there is one,
+    /// until [`Self::replant_breakpoint`]. Returns whether there was.
+    pub fn lift_breakpoint(&mut self, addr: u64) -> Result<bool> {
+        let Some(breakpoint) = self.breakpoints.get(&addr).filter(|b| b.set) else {
+            return Ok(false);
+        };
+        let original = breakpoint.original;
+        self.write_code_unmasked(addr, &original)?;
+        Ok(true)
+    }
+
+    pub fn replant_breakpoint(&mut self, addr: u64) -> Result<()> {
+        if self.breakpoint_at(addr) {
+            self.write_code_unmasked(addr, &BRK)?;
+        }
+        Ok(())
+    }
+
+    /// The planted breakpoints (address, and the instruction replaced) overlapping
+    /// `addr..addr + len`.
+    fn planted_in(&self, addr: u64, len: usize) -> Vec<(u64, [u8; 4])> {
+        let start = addr.saturating_sub(BRK.len() as u64 - 1);
+        let end = addr.saturating_add(len as u64);
+        self.breakpoints
+            .range(start..end)
+            .filter(|(_, b)| b.set)
+            .map(|(&site, b)| (site, b.original))
+            .collect()
+    }
+
     /// See [`PageTableManager::write_protect_1to1`].
     pub fn write_protect_1to1(&mut self) -> Result<()> {
         self.lower_table.write_protect_1to1()?;
@@ -2517,6 +2615,13 @@ impl VirtMemAllocator {
             // SAFETY: `host` is valid for `len` bytes, all in one guest page.
             std::ptr::copy(host, buf.as_mut_ptr().add(offset), len)
         })?;
+        for (site, original) in self.planted_in(addr, buf.len()) {
+            for (byte_addr, byte) in (site..).zip(original) {
+                if let Some(offset) = byte_addr.checked_sub(addr).filter(|&o| o < buf.len() as u64) {
+                    buf[offset as usize] = byte;
+                }
+            }
+        }
         Ok(buf.len())
     }
 
@@ -2595,6 +2700,17 @@ impl VirtMemAllocator {
             // SAFETY: `host` is valid for `len` bytes, all in one guest page.
             std::ptr::copy(buf.as_ptr().add(offset), host, len)
         })?;
+        for (site, mut original) in self.planted_in(addr, buf.len()) {
+            for (byte_addr, byte) in (site..).zip(original.iter_mut()) {
+                if let Some(offset) = byte_addr.checked_sub(addr).filter(|&o| o < buf.len() as u64) {
+                    *byte = buf[offset as usize];
+                }
+            }
+            if let Some(breakpoint) = self.breakpoints.get_mut(&site) {
+                breakpoint.original = original;
+            }
+            self.write_code_unmasked(site, &BRK)?;
+        }
         Ok(buf.len())
     }
 
