@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::macos::fs::MetadataExt;
@@ -31,7 +32,10 @@ pub struct SharedCache {
     // touches get copied. A private copy of the files (see `private_copy`) has no such pages.
     executable_mappings: Vec<Rc<MemoryMap>>,
     executable_pages_shared: bool,
-    symbol_map: Option<SymbolMap>,
+    /// Loaded on first use: it's large (every symbol the cache exports, millions), and only
+    /// needed to symbolicate.
+    symbol_map: OnceCell<Option<SymbolMap>>,
+    cache_path: PathBuf,
 }
 
 unsafe impl Send for SharedCache {}
@@ -111,16 +115,10 @@ impl SharedCache {
             mappings: vec![],
             executable_mappings: vec![],
             executable_pages_shared,
-            symbol_map: None,
+            symbol_map: OnceCell::new(),
+            cache_path: cache_path.to_path_buf(),
         };
         cache.map_single_cache(cache_path)?;
-        cache.symbol_map = match load_symbol_map(&cache_file, &cache_header, slide) {
-            Ok(symbol_map) => symbol_map,
-            Err(err) => {
-                warn!("failed to load dyld symbols: {}", err);
-                None
-            }
-        };
 
         let dyndata_mapping = MemoryMap::new(
             std::mem::size_of::<dyld_cache_dynamic_data_header>() + 4096, // sizeof struct plus path strings
@@ -175,7 +173,23 @@ impl SharedCache {
     }
 
     pub fn symbolicate(&self, addr: u64) -> Option<Symbolication> {
-        self.symbol_map.as_ref()?.symbolicate(addr)
+        self.symbol_map()?.symbolicate(addr)
+    }
+
+    fn symbol_map(&self) -> Option<&SymbolMap> {
+        self.symbol_map
+            .get_or_init(|| {
+                let load = || {
+                    let cache_file = File::open(&self.cache_path)?;
+                    let cache_header: dyld_cache_header = read_at(&cache_file, 0)?;
+                    load_symbol_map(&cache_file, &cache_header, self.slide)
+                };
+                load().unwrap_or_else(|err| {
+                    warn!("failed to load dyld symbols: {}", err);
+                    None
+                })
+            })
+            .as_ref()
     }
 
     fn map_single_cache(&mut self, path: &Path) -> Result<()> {
@@ -1040,7 +1054,7 @@ mod tests {
         const RTLD_DEFAULT: *mut std::ffi::c_void = -2isize as _;
 
         let cache = SharedCache::new_system_cache()?;
-        let symbol_map = cache.symbol_map.as_ref().expect("no dyld symbols loaded");
+        let symbol_map = cache.symbol_map().expect("no dyld symbols loaded");
 
         let mut host_cache_len = 0;
         let host_cache_base = unsafe { _dyld_get_shared_cache_range(&mut host_cache_len) };
@@ -1093,7 +1107,7 @@ mod tests {
         assert!(!cache.mappings.is_empty());
         assert!(cache.contains_addr(cache.base_address() as u64));
 
-        if let Some(symbol_map) = cache.symbol_map.as_ref() {
+        if let Some(symbol_map) = cache.symbol_map() {
             let first_symbol = symbol_map
                 .symbols
                 .iter()
