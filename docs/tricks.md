@@ -119,7 +119,7 @@ ends (see below).
 
 ### Or a vCPU each, in parallel (opt-in)
 
-`DefaultTrapHandler::new(ThreadingModel::Parallel)` gives each guest thread a vCPU of its own, on
+`GuestBuilder::threading(ThreadingModel::Parallel)` gives each guest thread a vCPU of its own, on
 a host thread of its own, so threads really run at once. The cost is determinism: no
 record/replay and no checkpoints. Processes a guest spawns get the same model whatever their
 embedder asks for: it's passed down in their environment (`APPBOX_THREADING`). An exec keeps the
@@ -136,9 +136,8 @@ The two models share nearly all their code:
   thread's mailbox; one that can't runs directly on the caller.
 - A small pump thread handles workqueue kevents, since no scheduler polls for them.
 
-The embedder writes one loop for a guest thread's vCPU (a `ThreadRunner`), and
-`DefaultTrapHandler::run` runs it for every thread. `SharedVm::stop` kicks all the vCPUs out when
-one thread ends the process.
+The same loop runs each thread's vCPU, calling the embedder's hooks either way.
+`SharedVm::stop` kicks all the vCPUs out when one thread ends the process.
 
 Two things surfaced that time-sharing had hidden:
 - Every vCPU needs the same system registers. `TCR_EL1.TBI0` (without which libobjc crashes) used
@@ -170,7 +169,8 @@ There's no guest PMU on M1. (Hypervisor.framework can emulate one with EL2, whic
 later.) Two things stand in for it:
 
 - **Kicking the guest:** the vCPU's own virtual timer (`CNTV_CVAL`/`CTL`) interrupts the guest
-  every 1 ms slice when another thread could run. It fires on the vCPU's core, so it's far more
+  when its scheduler's slice ends (every 1 ms, with the default scheduler, when another thread
+  could run). It fires on the vCPU's core, so it's far more
   punctual than `hv_vcpus_exit` from another thread, whose latency tail reached hundreds of
   microseconds. Threads are only preempted at EL0: in appbox's exception vectors, part of their
   state is in EL1 registers.
@@ -192,7 +192,9 @@ order so later mappings land in the same places.
 ### Replaying preemptions: coarse, then fine
 
 A preemption is recorded as the preempted thread's registers plus the guest instructions retired
-since the previous event. Replay finds that point again in two phases:
+since the previous event. Replay's scheduler asks appbox to run the thread exactly there
+(`Slice::At`, which reverse execution uses for other positions too), and appbox finds it in two
+phases:
 
 1. **Coarse:** run the guest in timer-bounded slices sized as if it retired 26 instructions/ns,
    faster than any Apple core can, so a slice can't overshoot. Stop 150k instructions short of

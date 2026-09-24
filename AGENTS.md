@@ -9,12 +9,11 @@ When a syscall is executed by the target application, the VM traps out to the Ap
 * We must also setup the initial stack, argv, thread-local storage, etc. that the kernel would for a normal program ourselves.
 
 ## Exports/Intended flow
-* AppBox's main library export is the `VmManager` which wraps the VM the program runs in. See [vm/mod.rs](./src/vm/mod.rs)
-* MachO's are loaded via `appbox::loader::load_macho` which configures the VM, maps in the MachO, shared cache, configures stack/etc. See [loader.rs](./src/loader.rs)
-* Once loaded, `VmManager.run()` is called in a loop to run the VM until syscall/trap exit.
-    * The result of this is then switched on and handled as necessary for the intended use.
-    * AppBox provides a `DefaultTrapHandler` which can be instantiated along with the VM and then invoked on every trap to handle syscalls formemory mappings to ensure these stay in-sync between the VM and host process and similar. See [trap.rs](./src/trap.rs).
-* Embedders normally write that loop as a `ThreadRunner` (one guest thread's vCPU, trapping through a `GuestThread`) and hand it to `DefaultTrapHandler::run`, which runs it for every guest thread: time-shared on one vCPU by default, or each on its own vCPU and host thread with `ThreadingModel::Parallel` passed to `DefaultTrapHandler::new` (nondeterministic, so no record/replay). See [runner.rs](./src/runner.rs) and [threading.rs](./src/threading.rs).
-* AppBox also includes the base code required for a GDB stub. Similar to the trap handler, this is expected to be extended by library users with the code in AppBox as the default/fallthrough case for core operations like memory read/write, CPU register introspection, breakpoint management, etc. See [gdb.rs](./src/gdb.rs).
+* The public API is [`appbox::guest`](./src/guest/mod.rs). `Guest::builder(program)` loads a Mach-O (mapping the binary and shared cache, setting up the stack, argv, TLS, etc.) and `run()`s it, handling its syscalls, threads, exec, and the processes it spawns.
+    * `appbox::guest::prepare()` must come first in `main`: it re-runs the process with an address space layout that leaves the guest room, and runs guests that a guest spawned.
+    * Embedders observe and steer the guest through `Hooks` callbacks: before/after syscalls, preemptions, stops (hardware breakpoints, watchpoints, steps), faults, exec, and the guest ending. Each gets a `ThreadCx` with the thread's registers, memory, breakpoints/watchpoints, and checkpoints.
+    * With time-shared threads (the default), a `Scheduler` decides which thread runs and for how long, down to exact points in its execution (`Slice::At`); `RoundRobin` is the default. `ThreadingModel::Parallel` gives each guest thread a vCPU and host thread of its own instead (no scheduler, so no record/replay).
+* [gdb.rs](./src/gdb.rs) has `GdbHooks`, a ready-made GDB stub, and `GdbServer`, the connection itself for embedders with their own debugger logic (e.g. warpspeed's reverse debugging).
+* The rest is internal: the VM and vCPUs ([vm/mod.rs](./src/vm/mod.rs)), loading ([loader.rs](./src/loader.rs)), syscall handling ([trap.rs](./src/trap.rs)), guest threads ([threads.rs](./src/threads.rs), [runner.rs](./src/runner.rs)), and the loop running each vCPU that calls the hooks and scheduler ([guest/drive.rs](./src/guest/drive.rs)).
 
-For more specifics of the intended public interface/usage, see the [strace example implementation](./examples/strace/src/main.rs) which contains a full instantiation + run loop.
+For usage, see the [strace](./examples/strace/src/main.rs), [gdb\_stub](./examples/gdb_stub/src/main.rs) and [ebpf\_syscall\_guard](./examples/ebpf_syscall_guard/) examples, and warpspeed (record/replay, with its own scheduler).
