@@ -230,7 +230,7 @@ fn main() -> Result<()> {
     let mut argv = Vec::new();
     argv.push(args.executable.clone());
     argv.extend(args.arguments.iter().cloned());
-    let loader = appbox::loader::load_macho(
+    let mut loader = appbox::loader::load_macho(
         &mut vm,
         &PathBuf::from(args.executable.clone()),
         argv,
@@ -315,6 +315,10 @@ fn main() -> Result<()> {
 
         match exit {
             ExitKind::Continue => continue,
+            ExitKind::Exec(request) => {
+                println!("exec {:?} {:?}", request.path, request.argv);
+                (vm, loader) = appbox::exec::exec(vm, loader, &mut handler, &request)?;
+            }
             _ => {
                 println!("VM exited: {:?}", exit);
                 break;

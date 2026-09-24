@@ -2,7 +2,7 @@ use crate::dyld;
 use crate::layout::GuestMallocPlacement;
 use crate::symbols::{self, MachOSymbolMap, Symbolication};
 use crate::vm::VmManager;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use log::{debug, trace, warn};
 use mach_object::{LoadCommand, MachCommand, MachHeader, OFile};
 use mmap_fixed_fixed::{MapOption, MemoryMap};
@@ -54,6 +54,32 @@ pub struct Loader {
 
     pub entry_point: u64,
     pub stack_pointer: u64,
+}
+
+/// The arm64 slice of a thin or fat Mach-O: its file offset, header and load commands.
+pub(crate) fn arm64_slice(data: &[u8]) -> Result<(u64, MachHeader, Vec<MachCommand>)> {
+    let ofile = OFile::parse(&mut Cursor::new(data))
+        .map_err(|e| anyhow::anyhow!("not a mach file: {e:?}"))?;
+    match ofile {
+        OFile::MachFile { header, commands } => match header {
+            MachHeader {
+                cputype: mach_object::CPU_TYPE_ARM64,
+                filetype: mach_object::MH_EXECUTE,
+                ..
+            } => Ok((0, header, commands)),
+            _ => bail!("not an arm64 executable"),
+        },
+        OFile::FatFile { files, .. } => files
+            .iter()
+            .find_map(|(arch, file)| match (arch.cputype, file) {
+                (mach_object::CPU_TYPE_ARM64, OFile::MachFile { header, commands }) => {
+                    Some((arch.offset as u64, header.clone(), commands.clone()))
+                }
+                _ => None,
+            })
+            .context("no arm64 slice"),
+        _ => bail!("not a mach file"),
+    }
 }
 
 impl Loader {
@@ -167,29 +193,8 @@ impl Loader {
 
         let mut executable_file = File::open(path)?;
         let mut executable_data = Vec::new();
-        let size = executable_file.read_to_end(&mut executable_data)?;
-        let mut cur = Cursor::new(&executable_data[..size]);
-
-        let (arch_file_offset, mach_header, mach_commands) = match OFile::parse(&mut cur).unwrap() {
-            OFile::MachFile { header, commands } => match header {
-                MachHeader {
-                    cputype: mach_object::CPU_TYPE_ARM64,
-                    filetype: mach_object::MH_EXECUTE,
-                    ..
-                } => Ok((0, header, commands)),
-                _ => bail!("not an arm64 executable"),
-            },
-            OFile::FatFile { files, .. } => files
-                .iter()
-                .find_map(|(arch, file)| match (arch.cputype, file) {
-                    (mach_object::CPU_TYPE_ARM64, OFile::MachFile { header, commands }) => {
-                        Some(Ok((arch.offset, header.clone(), commands.clone())))
-                    }
-                    _ => None,
-                })
-                .unwrap_or(Err(anyhow::anyhow!("no arm64 slice"))),
-            _ => bail!("not a mach file"),
-        }?;
+        executable_file.read_to_end(&mut executable_data)?;
+        let (arch_file_offset, mach_header, mach_commands) = arm64_slice(&executable_data)?;
 
         let segment_ranges: Vec<(u64, u64)> = mach_commands
             .iter()

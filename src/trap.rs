@@ -1,4 +1,5 @@
 use crate::applevisor as av;
+use crate::exec::ExecRequest;
 use crate::hyperpom::crash::ExitKind;
 use crate::hyperpom::memory::VirtMemAllocator;
 use crate::layout::AddressSpaceConflict;
@@ -251,13 +252,33 @@ impl DefaultTrapHandler {
     }
 
     fn remove_mapping(&mut self, addr: u64, size: u64) {
-        if let Some(idx) = self
-            .mappings
-            .iter()
-            .position(|&(va, len)| va == addr && len as u64 == size)
-        {
-            self.mappings.remove(idx);
+        let end = addr + size;
+        self.mappings = std::mem::take(&mut self.mappings)
+            .into_iter()
+            .flat_map(|(va, len)| {
+                let va_end = va + len as u64;
+                if va_end <= addr || end <= va {
+                    return vec![(va, len)];
+                }
+                let mut remaining = vec![];
+                if va < addr {
+                    remaining.push((va, (addr - va) as usize));
+                }
+                if end < va_end {
+                    remaining.push((end, (va_end - end) as usize));
+                }
+                remaining
+            })
+            .collect();
+    }
+
+    /// Releases the host memory backing everything the guest has mapped through this handler,
+    /// e.g. when replacing it on exec.
+    pub fn release_guest_memory(&mut self) {
+        for (addr, size) in self.mappings.drain(..) {
+            unsafe { mach_vm_deallocate(nix::libc::mach_task_self(), addr, size as u64) };
         }
+        self.tsd = 0;
     }
 
     fn align_size(size: u64) -> u64 {
@@ -397,6 +418,21 @@ impl TrapHandler for DefaultTrapHandler {
         // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/arm64/sleh.c#L1686
         // for dispatch code.
         match num {
+            syscalls::SYS_execve | syscalls::SYS___mac_execve => {
+                let request = read_exec_args(vma, args[0], args[1], args[2])
+                    .map_or(Err(nix::libc::EFAULT), |(path, argv, envp)| {
+                        ExecRequest::resolve(path, argv, envp)
+                    });
+                match request {
+                    Ok(request) => return Ok(SyscallResult::exit(ExitKind::Exec(request))),
+                    Err(errno) => {
+                        ret0 = errno as u64;
+                        ret1 = 0;
+                        cflags = 1 << 29;
+                        handled = true;
+                    }
+                }
+            }
             syscalls::SYS_exit => {
                 return Ok(SyscallResult::exit(ExitKind::Exit));
             }
@@ -805,23 +841,87 @@ fn readable_page(
     page: u64,
     readable_pages: &mut HashMap<u64, bool>,
 ) -> bool {
-    *readable_pages.entry(page).or_insert_with(|| {
-        let Ok(host_addr) = vma.host_addr(page) else {
-            return false;
-        };
-        let mut byte = 0u8;
+    *readable_pages
+        .entry(page)
+        .or_insert_with(|| read_guest(vma, page, &mut [0u8]).is_some())
+}
+
+/// Copies guest memory at `addr` into `buf`, translating through the guest's page tables and
+/// without risking a fault on the host. `None` if any of it isn't mapped into the guest or isn't
+/// readable on the host.
+fn read_guest(vma: &VirtMemAllocator, addr: u64, buf: &mut [u8]) -> Option<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        let cur = addr.checked_add(done as u64)?;
+        let page_end = (cur | 0xfff).checked_add(1)?;
+        let len = ((page_end - cur) as usize).min(buf.len() - done);
+        let host_addr = vma.host_addr(cur).ok()?;
         let mut read = 0u64;
         let kr = unsafe {
             mach_vm_read_overwrite(
                 nix::libc::mach_task_self(),
                 host_addr as u64,
-                1,
-                &mut byte as *mut u8 as u64,
+                len as u64,
+                buf[done..].as_mut_ptr() as u64,
                 &mut read,
             )
         };
-        kr == KERN_SUCCESS as i32
-    })
+        if kr != KERN_SUCCESS as i32 {
+            return None;
+        }
+        done += len;
+    }
+    Some(())
+}
+
+// Same as the kernel's ARG_MAX.
+const GUEST_STRINGS_MAX: usize = 1 << 20;
+
+fn read_guest_cstring(vma: &VirtMemAllocator, addr: u64) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut cur = addr;
+    while bytes.len() < GUEST_STRINGS_MAX {
+        let mut chunk = vec![0u8; ((cur | 0xfff) + 1 - cur) as usize];
+        read_guest(vma, cur, &mut chunk)?;
+        if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+            bytes.extend_from_slice(&chunk[..nul]);
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.extend_from_slice(&chunk);
+        cur += chunk.len() as u64;
+    }
+    None
+}
+
+/// Reads a NULL-terminated array of C strings like `argv`. A NULL array is empty.
+fn read_guest_cstring_array(vma: &VirtMemAllocator, addr: u64) -> Option<Vec<String>> {
+    let mut strings = Vec::new();
+    if addr == 0 {
+        return Some(strings);
+    }
+    for index in 0..GUEST_STRINGS_MAX / 8 {
+        let mut ptr = [0u8; 8];
+        read_guest(vma, addr.checked_add(index as u64 * 8)?, &mut ptr)?;
+        let ptr = u64::from_le_bytes(ptr);
+        if ptr == 0 {
+            return Some(strings);
+        }
+        strings.push(read_guest_cstring(vma, ptr)?);
+    }
+    None
+}
+
+fn read_exec_args(
+    vma: &VirtMemAllocator,
+    path: u64,
+    argv: u64,
+    envp: u64,
+) -> Option<(std::path::PathBuf, Vec<String>, Vec<String>)> {
+    Some((
+        read_guest_cstring(vma, path)?.into(),
+        read_guest_cstring_array(vma, argv)?,
+        read_guest_cstring_array(vma, envp)?,
+    ))
 }
 
 #[cfg(test)]
@@ -842,16 +942,22 @@ mod tests {
     }
 
     #[test]
-    fn remove_mapping_only_removes_exact_matches() {
+    fn remove_mapping_handles_partial_unmaps() {
         let mut handler = DefaultTrapHandler::new().unwrap();
-        handler.record_mapping(0x1000, 0x2000);
-        handler.record_mapping(0x4000, 0x1000);
+        handler.record_mapping(0x1000, 0x4000);
+        handler.record_mapping(0x8000, 0x1000);
 
-        handler.remove_mapping(0x1000, 0x1000);
-        assert_eq!(handler.mappings, vec![(0x1000, 0x2000), (0x4000, 0x1000)]);
+        handler.remove_mapping(0x2000, 0x1000);
+        assert_eq!(
+            handler.mappings,
+            vec![(0x1000, 0x1000), (0x3000, 0x2000), (0x8000, 0x1000)]
+        );
 
-        handler.remove_mapping(0x1000, 0x2000);
-        assert_eq!(handler.mappings, vec![(0x4000, 0x1000)]);
+        handler.remove_mapping(0x0, 0x4000);
+        assert_eq!(handler.mappings, vec![(0x4000, 0x1000), (0x8000, 0x1000)]);
+
+        handler.remove_mapping(0x4000, 0x5000);
+        assert!(handler.mappings.is_empty());
     }
 
     #[test]
@@ -892,6 +998,15 @@ mod tests {
         vm.vma.write_qword(page, guard.data() as u64)?;
 
         assert_eq!(explore_pointers(&vm.vma, &[page]), HashSet::from([page]));
+        Ok(())
+    }
+
+    #[test]
+    fn explore_pointers_ignores_values_at_the_top_of_the_address_space() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let vm = VmManager::new()?;
+        assert!(explore_pointers(&vm.vma, &[u64::MAX, u64::MAX - 0x800]).is_empty());
         Ok(())
     }
 }

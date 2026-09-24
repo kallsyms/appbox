@@ -6,4 +6,6 @@ pub enum ExitKind {
     Crash(String),
     Timeout,
     Exit,
+    /// The guest called `execve()`; see [`crate::exec`].
+    Exec(crate::exec::ExecRequest),
 }

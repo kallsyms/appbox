@@ -2,6 +2,7 @@ pub mod commpage;
 pub mod debug;
 pub mod dyld;
 pub mod dyld_cache_format;
+pub mod exec;
 pub mod gdb;
 pub mod layout;
 pub mod loader;
