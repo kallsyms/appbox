@@ -2321,9 +2321,13 @@ impl VirtMemAllocator {
         //  - HD: Hardware management of dirty state in stage 1 translations from EL0 and EL1.
         //      1  -> Stage 1 hardware management of dirty state enabled, only if the HA bit is
         //            also set to 1.
+        //  - TBI0: Top Byte Ignore for the lower VA range, because PAC breaks us otherwise. It's
+        //    not clear why exactly, since we don't rely on pointers already signed with a key we
+        //    don't have, but libobjc dies without it, on a heap data pointer authenticated with
+        //    the B key of all things, which should be process-specific anyway.
         vcpu.set_sys_reg(
             av::SysReg::TCR_EL1,
-            0x10 | (0x10 << 16) | (0b10 << 30) | (0b110 << 32) | (1 << 39) | (1 << 40),
+            0x10 | (0x10 << 16) | (0b10 << 30) | (0b110 << 32) | (1 << 37) | (1 << 39) | (1 << 40),
         )?;
         // TTBRX_EL1
         //  - BADDR: stage 1 translation table base address
