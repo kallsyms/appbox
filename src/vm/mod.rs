@@ -10,6 +10,7 @@ use mmap_fixed_fixed::MemoryMap;
 use std::rc::Rc;
 use std::time::Duration;
 
+mod exclusive;
 pub mod hooks;
 
 pub enum VmRunResult {
@@ -429,6 +430,10 @@ impl VmManager {
     fn run_to_exit(&mut self) -> Result<VmRunResult> {
         let mut stepped_through_handler = false;
         loop {
+            // A step can't run a whole exclusive sequence, so steps through one may fail.
+            if self.stepping.is_none() {
+                self.rewind_exclusive_sequence()?;
+            }
             self.run_once()?;
             let exit_info = self.vcpu.get_exit_info();
             if exit_info.reason == av::ExitReason::VTIMER_ACTIVATED {
@@ -501,12 +506,32 @@ impl VmManager {
         }
     }
 
+    /// See [`exclusive`].
+    fn rewind_exclusive_sequence(&mut self) -> Result<()> {
+        if self.vcpu.get_reg(av::Reg::CPSR)? & PSTATE_MODE != 0 {
+            return Ok(());
+        }
+        let pc = self.vcpu.get_reg(av::Reg::PC)?;
+        self.vcpu.set_reg(av::Reg::PC, self.resume_address(pc))?;
+        Ok(())
+    }
+
+    /// Where to resume the guest at EL0 to have it continue from `pc`; see [`exclusive`].
+    fn resume_address(&self, pc: u64) -> u64 {
+        let read = |addr| {
+            let mut insn = [0; 4];
+            self.vma.read(addr, &mut insn).ok()?;
+            Some(u32::from_le_bytes(insn))
+        };
+        exclusive::rewind_target(read, pc).unwrap_or(pc)
+    }
+
     fn handle_dirty_fault(&mut self) -> Result<bool> {
         let far = self.vcpu.get_sys_reg(av::SysReg::FAR_EL1)?;
         match self.vma.page_fault_dirty_state_handler(far) {
             Ok(true) => {
                 let elr = self.vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
-                self.vcpu.set_reg(av::Reg::PC, elr)?;
+                self.vcpu.set_reg(av::Reg::PC, self.resume_address(elr))?;
                 Caches::tlbi_vaae1_on_fault(&mut self.vcpu, &mut self.vma)?;
                 Ok(true)
             }
@@ -748,6 +773,20 @@ mod tests {
         assert!(matches!(vm.run()?, VmRunResult::Step));
         assert_eq!(vm.vcpu.get_reg(av::Reg::PC)?, code.data() as u64 + 4);
         assert_eq!(unsafe { (data.data() as *const u64).read() }, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn exclusive_sequences_survive_faults() -> Result<()> {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // ldxr x8, [x1]; add x8, x8, #1; stxr w9, x8, [x1]; brk #0
+        let (mut vm, _code) = vm_running(&[0xc85f7c28, 0x91000508, 0xc8097c28, BRK_0])?;
+        let data = clean_data_page(&mut vm)?;
+        vm.vcpu.set_reg(av::Reg::X1, data.data() as u64)?;
+        vm.vcpu.set_reg(av::Reg::X9, 0xff)?;
+        assert!(matches!(vm.run()?, VmRunResult::Brk));
+        assert_eq!(vm.vcpu.get_reg(av::Reg::X9)?, 0, "the store-exclusive failed");
+        assert_eq!(unsafe { (data.data() as *const u64).read() }, 1);
         Ok(())
     }
 
