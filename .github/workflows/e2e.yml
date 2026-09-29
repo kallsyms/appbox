@@ -1,0 +1,94 @@
+name: Integration and e2e tests
+
+# Runs everything (unit, integration and end-to-end tests, including the examples) on the
+# self-hosted runner, which, unlike hosted ones, can run VMs.
+#
+# The runner executes whatever code it's given, so nothing from a fork may reach it without a
+# maintainer's approval:
+# - Pull requests trigger this through pull_request_target, so the workflow that runs is always
+#   the base branch's copy of this file, never one a pull request edited.
+# - For a pull request from a fork, the `approve` job waits (on a GitHub-hosted runner) for a
+#   reviewer of the `fork-pr` environment to approve, for each push. Only then does `test` check
+#   out that exact commit on the self-hosted runner.
+# - No secrets are used, and the token can only read.
+#
+# A pull request can still add a workflow of its own with `on: pull_request` that asks for the
+# self-hosted runner. Only the repository setting requiring approval for fork pull request
+# workflows from all external contributors stops that (Settings > Actions > General).
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
+jobs:
+  approve:
+    if: >-
+      github.repository == 'kallsyms/appbox'
+      && github.event_name == 'pull_request_target'
+      && github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    environment: fork-pr
+    steps:
+      # A missing environment gets created on first use, without protection, and wouldn't have
+      # waited for anyone.
+      - name: Check that approval was required
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          reviewers=$(gh api "repos/${{ github.repository }}/environments/fork-pr" \
+            --jq '[.protection_rules[] | select(.type == "required_reviewers") | .reviewers[]] | length')
+          if [ "$reviewers" -eq 0 ]; then
+            echo "::error::The fork-pr environment has no required reviewers, so nothing was approved."
+            exit 1
+          fi
+          echo "Approved running ${{ github.event.pull_request.head.sha }} on the self-hosted runner"
+
+  test:
+    needs: approve
+    # Fork pull requests only once approved; anything else (pushes to main, manual runs, pull
+    # requests from branches here) is from someone with write access already. Checking for the
+    # fork again, rather than trusting a skipped `approve`, keeps this closed if `approve`'s
+    # condition were ever wrong.
+    if: >-
+      !cancelled()
+      && github.repository == 'kallsyms/appbox'
+      && (
+        needs.approve.result == 'success'
+        || (
+          needs.approve.result == 'skipped'
+          && !(
+            github.event_name == 'pull_request_target'
+            && github.event.pull_request.head.repo.full_name != github.repository
+          )
+        )
+      )
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commit that was approved, not whatever the branch has since become.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Show host
+        run: |
+          sw_vers
+          sysctl -n machdep.cpu.brand_string
+
+      - name: Install toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Test
+        run: ./scripts/cargo-test-signed.sh
