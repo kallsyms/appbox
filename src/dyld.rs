@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::macos::fs::MetadataExt;
@@ -385,6 +385,13 @@ fn private_copy(system_path: &Path) -> Result<PathBuf> {
     let copies = private_copies_dir()?;
     let dir = copies.join(&uuid);
     let copy = dir.join(file_name);
+    if copy.exists() {
+        return Ok(copy);
+    }
+    // One copy at a time within a process: they'd share the partial directory below (and it's
+    // a lot to copy twice).
+    static COPYING: Mutex<()> = Mutex::new(());
+    let _copying = COPYING.lock().unwrap_or_else(|e| e.into_inner());
     if copy.exists() {
         return Ok(copy);
     }
