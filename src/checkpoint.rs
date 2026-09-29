@@ -331,6 +331,7 @@ mod tests {
     use crate::test_support::VM_TEST_LOCK;
     use crate::trap::{read_syscall_context, write_syscall_result, TrapHandler};
     use crate::vm::VmRunResult;
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     /// Each syscall's number and results.
@@ -386,30 +387,164 @@ mod tests {
         Ok(trace)
     }
 
-    fn memory_dump(vm: &VmManager) -> std::collections::BTreeMap<u64, Vec<u8>> {
+    /// A page mapped 1:1 into the VM, as far as a test comparing them needs to know.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Page {
+        /// Still just its file's page at `offset`, i.e. never written: its contents are the
+        /// file's.
+        File { offset: u64 },
+        Hash(u64),
+        Unreadable,
+    }
+
+    /// vm_page_info_basic, from mach/vm_region.h.
+    #[repr(C)]
+    #[derive(Default)]
+    struct PageInfo {
+        disposition: i32,
+        ref_count: i32,
+        object_id: u64,
+        /// In the object the page is in (its file, if it's still the file's).
+        offset: u64,
+        depth: i32,
+        pad: i32,
+    }
+
+    const VM_PAGE_INFO_BASIC: i32 = 1;
+
+    extern "C" {
+        fn mach_vm_page_info(
+            task: nix::libc::mach_port_t,
+            addr: u64,
+            flavor: i32,
+            info: *mut PageInfo,
+            count: *mut u32,
+        ) -> i32;
+    }
+
+    /// Every page mapped 1:1 into the VM. Guests map the whole shared cache, gigabytes, of which
+    /// they touch little, so the pages that are still their file's (resident or not) aren't
+    /// read; the rest are hashed rather than kept.
+    fn memory_dump(vm: &VmManager) -> BTreeMap<u64, Page> {
+        let mut contents = vec![0u8; 0x4000];
         vm.vma()
             .lower_table
             .mapped_one_to_one_host_pages()
             .into_iter()
             .map(|page| {
-                let mut contents = vec![0u8; 0x4000];
+                let task = unsafe { nix::libc::mach_task_self() };
+                let mut info = PageInfo::default();
+                let mut count = (std::mem::size_of::<PageInfo>() / 4) as u32;
+                let kr = unsafe {
+                    mach_vm_page_info(task, page, VM_PAGE_INFO_BASIC, &mut info, &mut count)
+                };
+                if kr == KERN_SUCCESS
+                    && info.disposition & nix::libc::VM_PAGE_QUERY_PAGE_EXTERNAL != 0
+                {
+                    return (page, Page::File { offset: info.offset });
+                }
                 // Pages not yet (lazily) mapped into the VM are read from the host directly.
                 let mut read = 0u64;
                 let kr = unsafe {
                     crate::mach::mach_vm_read_overwrite(
-                        nix::libc::mach_task_self(),
+                        task,
                         page,
-                        contents.len() as u64,
+                        0x4000,
                         contents.as_mut_ptr() as u64,
                         &mut read,
                     )
                 };
-                if kr != KERN_SUCCESS {
-                    contents.clear();
-                }
+                let contents = match kr {
+                    KERN_SUCCESS => Page::Hash(hash_page(&contents)),
+                    _ => Page::Unreadable,
+                };
                 (page, contents)
             })
             .collect()
+    }
+
+    /// FxHash, word by word: position-dependent, and fast enough for gigabytes.
+    fn hash_page(contents: &[u8]) -> u64 {
+        contents.chunks_exact(8).fold(0, |hash: u64, word| {
+            let word = u64::from_ne_bytes(word.try_into().unwrap());
+            (hash.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95)
+        })
+    }
+
+    /// `page`'s contents at `offset` in the file mapped there, hashed like [`hash_page`].
+    fn file_page(page: u64, offset: u64) -> Result<Page> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileExt;
+
+        // From sys/proc_info.h.
+        const PROC_PIDREGIONPATHINFO: i32 = 8;
+        // proc_regionwithpathinfo
+        #[repr(C)]
+        struct RegionWithPath {
+            protection: [u32; 4],
+            object_offset: u64,
+            counts: [u32; 14],
+            address: u64,
+            size: u64,
+            vnode: nix::libc::vnode_info_path,
+        }
+        let mut region: RegionWithPath = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<RegionWithPath>() as i32;
+        let got = unsafe {
+            nix::libc::proc_pidinfo(
+                std::process::id() as i32,
+                PROC_PIDREGIONPATHINFO,
+                page,
+                &mut region as *mut _ as *mut nix::libc::c_void,
+                size,
+            )
+        };
+        ensure!(got == size, "no region info for {page:#x}");
+        ensure!(
+            region.address <= page && page < region.address + region.size,
+            "no region at {page:#x}"
+        );
+        let path = unsafe { std::ffi::CStr::from_ptr(region.vnode.vip_path.as_ptr() as _) };
+        let file = std::fs::File::open(std::ffi::OsStr::from_bytes(path.to_bytes()))
+            .with_context(|| format!("opening {path:?}, mapped at {page:#x}"))?;
+        let mut contents = vec![0u8; 0x4000];
+        file.read_exact_at(&mut contents, offset)?;
+        Ok(Page::Hash(hash_page(&contents)))
+    }
+
+    /// The pages whose contents differ between two dumps (of the same pages).
+    fn differing(
+        before: &BTreeMap<u64, Page>,
+        after: &BTreeMap<u64, Page>,
+    ) -> Result<Vec<u64>> {
+        let mut differing = Vec::new();
+        for (&page, &was) in before {
+            let now = after.get(&page).copied();
+            let same = match (was, now) {
+                (was, Some(now)) if was == now => true,
+                // Written since (or unmapped then mapped from the file again): compare with the
+                // file.
+                (Page::File { offset }, Some(now)) => file_page(page, offset)? == now,
+                (was, Some(Page::File { offset })) => file_page(page, offset)? == was,
+                _ => false,
+            };
+            if !same {
+                differing.push(page);
+            }
+        }
+        Ok(differing)
+    }
+
+    /// The file (device and inode) descriptor `fd` refers to, if it's open.
+    fn file_of(fd: i32) -> Option<(u64, u64)> {
+        let stat = nix::sys::stat::fstat(fd).ok()?;
+        Some((stat.st_dev as u64, stat.st_ino))
+    }
+
+    /// The files the guest's descriptors refer to. Only the guest's: tests running alongside open
+    /// and close their own.
+    fn guest_files(handler: &DefaultTrapHandler) -> BTreeMap<i32, Option<(u64, u64)>> {
+        handler.fds.owned().into_iter().map(|fd| (fd, file_of(fd))).collect()
     }
 
     /// A live guest also changes host state a checkpoint doesn't cover (e.g. mach ports it
@@ -434,13 +569,18 @@ mod tests {
         let checkpoint = handler.checkpoint(&mut vm)?;
         let memory = memory_dump(&vm);
         let mappings = handler.mappings.clone();
-        let fds = crate::fds::open_fds();
+        let files = guest_files(&handler);
         let pc = vm.vcpu.get_reg(av::Reg::PC)?;
 
         // Maps and unmaps memory, opens and closes files...
         let first =
             run_syscalls(&mut vm, &mut handler, &loader, usize::MAX).context("first run")?;
         assert!(first.len() > 100, "{}", first.len());
+        let opened: Vec<_> = guest_files(&handler)
+            .into_iter()
+            .filter(|(fd, _)| !files.contains_key(fd))
+            .collect();
+        assert!(!opened.is_empty());
         assert!(vm.checkpointed_bytes() > 0);
         let created: Vec<(u64, usize)> = handler
             .mappings
@@ -452,11 +592,7 @@ mod tests {
 
         handler.restore(&mut vm, &checkpoint)?;
         let restored = memory_dump(&vm);
-        let differing: Vec<_> = memory
-            .iter()
-            .filter(|(page, contents)| restored.get(page) != Some(contents))
-            .map(|(page, _)| *page)
-            .collect();
+        let differing = differing(&memory, &restored)?;
         assert!(
             differing.is_empty(),
             "{} of {} pages differ: {differing:x?}",
@@ -480,7 +616,11 @@ mod tests {
             );
         }
         assert_eq!(handler.mappings, mappings);
-        assert_eq!(crate::fds::open_fds(), fds);
+        assert_eq!(guest_files(&handler), files);
+        for (fd, file) in opened {
+            // Closed (or since reused, by another test).
+            assert_ne!(file_of(fd), file, "descriptor {fd}, opened since, is still open");
+        }
         assert_eq!(vm.vcpu.get_reg(av::Reg::PC)?, pc);
 
         let second =

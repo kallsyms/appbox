@@ -185,6 +185,11 @@ impl GuestFds {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn owned(&self) -> BTreeSet<i32> {
+        self.fds.clone()
+    }
+
     pub(crate) fn contains_fd(&self, fd: i32) -> bool {
         self.fds.contains(&fd)
     }
