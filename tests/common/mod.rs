@@ -9,12 +9,6 @@ use std::time::Duration;
 
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 
-fn target_dir() -> PathBuf {
-    // target/<profile>/deps/<this test>
-    let exe = std::env::current_exe().unwrap();
-    exe.parent().unwrap().parent().unwrap().to_path_buf()
-}
-
 /// The example `name`, signed with the entitlements appbox needs.
 pub fn example(name: &str) -> PathBuf {
     static BUILT: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
@@ -23,15 +17,15 @@ pub fn example(name: &str) -> PathBuf {
     if let Some(path) = built.get(name) {
         return path.clone();
     }
-    // Only a full `cargo test` builds examples.
-    let status = Command::new(std::env::var("CARGO").unwrap_or("cargo".into()))
-        .args(["build", "--example", name])
+    // Only a full `cargo test` builds examples. Where it puts them depends on cargo's version.
+    let output = Command::new(std::env::var("CARGO").unwrap_or("cargo".into()))
+        .args(["build", "--message-format=json", "--example", name])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
+        .stderr(Stdio::inherit())
+        .output()
         .unwrap();
-    assert!(status.success(), "building the {name} example failed");
-    let path = target_dir().join("examples").join(name);
-    assert!(path.exists(), "{} not built", path.display());
+    assert!(output.status.success(), "building the {name} example failed");
+    let path = PathBuf::from(example_executable(&String::from_utf8_lossy(&output.stdout), name));
     let entitlements = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/entitlements.xml");
     let status = Command::new("codesign")
         .arg("--entitlements")
@@ -44,6 +38,18 @@ pub fn example(name: &str) -> PathBuf {
     assert!(status.success(), "codesign failed");
     built.insert(name.to_string(), path.clone());
     path
+}
+
+/// The path of example `name`'s executable, from `cargo build --message-format=json`'s messages.
+fn example_executable(messages: &str, name: &str) -> String {
+    let target = format!(r#""kind":["example"],"crate_types":["bin"],"name":"{name}""#);
+    let message = messages
+        .lines()
+        .find(|line| line.contains(&target) && line.contains(r#""executable":""#))
+        .unwrap_or_else(|| panic!("cargo didn't say where the {name} example is"));
+    let start = message.find(r#""executable":""#).unwrap() + r#""executable":""#.len();
+    let end = start + message[start..].find('"').unwrap();
+    message[start..end].to_string()
 }
 
 /// Compiles `tests/guests/<name>.c`.
