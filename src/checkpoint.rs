@@ -94,26 +94,6 @@ fn host_pages(addr: u64, size: u64) -> (u64, u64) {
 /// stay as they were.
 const STASH_FD_MIN: i32 = 4096;
 
-/// Makes room for stashed descriptors above [`STASH_FD_MIN`].
-fn raise_fd_limit() -> Result<()> {
-    let mut limit = nix::libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut limit) };
-    let wanted = (2 * STASH_FD_MIN) as u64;
-    if limit.rlim_cur < wanted {
-        limit.rlim_cur = wanted.min(limit.rlim_max);
-        let ret = unsafe { nix::libc::setrlimit(nix::libc::RLIMIT_NOFILE, &limit) };
-        ensure!(
-            ret == 0,
-            "raising the descriptor limit: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
 impl DefaultTrapHandler {
     pub(crate) fn checkpointing(&self) -> bool {
         !self.checkpoints.is_empty()
@@ -133,7 +113,7 @@ impl DefaultTrapHandler {
             "checkpoints need a single-threaded guest without a workqueue"
         );
         if !self.checkpointing() {
-            raise_fd_limit()?;
+            crate::fds::make_room_from(STASH_FD_MIN)?;
         }
         let memory = vm.checkpoint_memory()?;
         let id = self.next_checkpoint;

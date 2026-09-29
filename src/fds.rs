@@ -17,6 +17,28 @@ use crate::hyperpom::memory::VirtMemAllocator;
 use crate::syscalls;
 use crate::threads::{SyscallReturn, ThreadId};
 
+/// Raises the soft descriptor limit (as far as the hard one allows) so that descriptors fit from
+/// `min` up, e.g. appbox's own, out of the way of the guest's (whose numbers must stay as they
+/// were). A launchd job's default soft limit is only 256.
+pub(crate) fn make_room_from(min: i32) -> anyhow::Result<()> {
+    let mut limit = nix::libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut limit) };
+    let wanted = 2 * min as u64;
+    if limit.rlim_cur < wanted {
+        limit.rlim_cur = wanted.min(limit.rlim_max);
+        let ret = unsafe { nix::libc::setrlimit(nix::libc::RLIMIT_NOFILE, &limit) };
+        anyhow::ensure!(
+            ret == 0,
+            "raising the descriptor limit: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
 // See sys/proc_info.h.
 const PROC_PIDLISTFDS: i32 = 1;
 const PROC_FDINFO_SIZE: usize = 8;

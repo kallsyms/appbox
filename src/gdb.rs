@@ -557,13 +557,14 @@ pub enum GdbNotification {
 const HOST_FD_MIN: i32 = 1000;
 
 /// Moves `socket`'s descriptor up out of the guest's way (see [`HOST_FD_MIN`]).
-fn move_fd_high<T: std::os::fd::IntoRawFd + std::os::fd::FromRawFd>(socket: T) -> std::io::Result<T> {
+fn move_fd_high<T: std::os::fd::IntoRawFd + std::os::fd::FromRawFd>(socket: T) -> Result<T> {
+    crate::fds::make_room_from(HOST_FD_MIN)?;
     let fd = socket.into_raw_fd();
     let high = unsafe { nix::libc::fcntl(fd, nix::libc::F_DUPFD_CLOEXEC, HOST_FD_MIN) };
     let error = std::io::Error::last_os_error();
     unsafe { nix::libc::close(fd) };
     if high < 0 {
-        return Err(error);
+        return Err(error.into());
     }
     Ok(unsafe { T::from_raw_fd(high) })
 }
