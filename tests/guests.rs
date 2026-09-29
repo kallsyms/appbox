@@ -1,90 +1,21 @@
 //! End-to-end tests: guest programs run under the strace example, which does everything a real
 //! embedder does (respawning with a pinned host layout, handling exec and spawned processes).
 
-use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::{mpsc, Mutex, OnceLock};
-use std::time::Duration;
+mod common;
 
-const TIMEOUT: Duration = Duration::from_secs(60);
+use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
+use std::process::{Command, Output};
 
-fn target_dir() -> PathBuf {
-    // target/<profile>/deps/<this test>
-    let exe = std::env::current_exe().unwrap();
-    exe.parent().unwrap().parent().unwrap().to_path_buf()
-}
-
-/// The strace example, signed with the entitlements appbox needs.
-fn strace() -> &'static Path {
-    static STRACE: OnceLock<PathBuf> = OnceLock::new();
-    STRACE.get_or_init(|| {
-        // Only a full `cargo test` builds examples.
-        let status = Command::new(std::env::var("CARGO").unwrap_or("cargo".into()))
-            .args(["build", "--example", "strace"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .status()
-            .unwrap();
-        assert!(status.success(), "building the strace example failed");
-        let path = target_dir().join("examples/strace");
-        assert!(path.exists(), "{} not built", path.display());
-        let entitlements = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/entitlements.xml");
-        let status = Command::new("codesign")
-            .arg("--entitlements")
-            .arg(entitlements)
-            .args(["--force", "-s", "-"])
-            .arg(&path)
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "codesign failed");
-        path
-    })
-}
-
-/// Compiles `tests/guests/<name>.c`.
-fn guest(name: &str) -> PathBuf {
-    // Tests sharing a guest mustn't compile it over each other.
-    static COMPILING: Mutex<()> = Mutex::new(());
-    let _compiling = COMPILING.lock().unwrap_or_else(|e| e.into_inner());
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/guests/{name}.c"));
-    let binary = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("guest-{name}"));
-    let status = Command::new("xcrun")
-        .args(["clang", "-O1", "-o"])
-        .arg(&binary)
-        .arg(source)
-        .status()
-        .unwrap();
-    assert!(status.success(), "compiling {name} failed");
-    binary
-}
+use common::guest;
 
 fn run(args: &[&Path]) -> Output {
     run_strace(&[], args)
 }
 
 fn run_strace(strace_args: &[&str], args: &[&Path]) -> Output {
-    // Its own process group, so a timeout also kills the respawned child and anything the guest
-    // spawned.
-    let child = Command::new(strace())
-        .args(strace_args)
-        .args(args)
-        .process_group(0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let pgid = child.id() as i32;
-    let (done, output) = mpsc::channel();
-    // Collecting output while waiting keeps the child from blocking on a full pipe.
-    std::thread::spawn(move || done.send(child.wait_with_output()));
-    match output.recv_timeout(TIMEOUT) {
-        Ok(output) => output.unwrap(),
-        Err(_) => {
-            unsafe { nix::libc::killpg(pgid, nix::libc::SIGKILL) };
-            panic!("{:?} timed out", args);
-        }
-    }
+    let child = common::spawn(Command::new(common::example("strace")).args(strace_args).args(args));
+    common::wait_with_timeout(child)
 }
 
 /// Checks the guest's exit status, its output, and strace's trace (on stderr).
@@ -95,13 +26,10 @@ fn assert_output(
     expected: &[&str],
     expected_trace: &[&str],
 ) {
+    common::assert_stdout(output, expected_status, expected);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let context = || format!("stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert_eq!(output.status.code(), Some(expected_status), "{}", context());
-    for line in expected {
-        assert!(stdout.contains(line), "missing {line:?}\n{}", context());
-    }
     for line in expected_trace {
         assert!(
             stderr.contains(line),
